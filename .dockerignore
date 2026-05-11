@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.claude
+.env
+.env.local
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+LICENSE
+tinfoil-config.yml

@@ -1,0 +1,14 @@
+shim-version: v0.3.18@sha256:7d9f98be78c91ede89f43c948a12d084fae34312effe9395ca7ed572991cb561
+cvm-version: 0.7.5
+cpus: 2
+memory: 2048
+
+containers:
+  - name: "sync-enclave"
+    image: "ghcr.io/tinfoilsh/confidential-sync-enclave:replace-on-release"
+
+shim:
+  listen-port: 443
+  upstream-port: 8089
+  paths:
+    - /health

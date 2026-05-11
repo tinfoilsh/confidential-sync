@@ -1,0 +1,9 @@
+.idea/
+.claude/
+.env
+.env.local
+confidential-sync-enclave
+sync-enclave
+ext.yml
+tuf-repo-cdn.sigstore.dev.json
+.gocache/
