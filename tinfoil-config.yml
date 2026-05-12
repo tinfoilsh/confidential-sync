@@ -12,3 +12,11 @@ shim:
   upstream-port: 8089
   paths:
     - /health
+    - /v1/health
+    - /v1/sync/push
+    - /v1/sync/pull
+    - /v1/sync/list-status
+    - /v1/sync/delete
+    - /v1/key/register
+    - /v1/key/add-bundle
+    - /v1/blobs/migrate
