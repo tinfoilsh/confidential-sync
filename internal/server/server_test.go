@@ -687,7 +687,7 @@ func TestDeleteForwardsHeaders(t *testing.T) {
 		IdempotencyKey: "i1",
 	}, tok)
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{
-		Scope: "chat", ID: "c", IdempotencyKey: "del-1",
+		Scope: "chat", ID: "c", IdempotencyKey: "del-1", Key: f.userKeyB64,
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d %s", resp.StatusCode, body)

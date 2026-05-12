@@ -2,10 +2,7 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -103,7 +100,14 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	opHash := operationHashPush(req, kidHex, metaHash)
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, envBlob)
+	if err != nil {
+		return nil, err
+	}
+	// metaHash is no longer mixed into the op-hash directly: it travels
+	// inside the AAD and therefore inside the encrypted envelope, which
+	// is itself the BODY of the canonical tuple.
+	_ = metaHash
 
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          req.Scope,
@@ -206,7 +210,11 @@ func autoResolve(
 	newIfMatch := remote.ETag
 	retryReq.IfMatch = &newIfMatch
 	retryReq.IdempotencyKey = req.IdempotencyKey + ":resolved"
-	opHash := operationHashPush(retryReq, kidHex, metaHash)
+	_ = metaHash
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, newIfMatch, retryReq.IdempotencyKey, envBlob)
+	if err != nil {
+		return nil, err
+	}
 
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          req.Scope,
@@ -227,37 +235,32 @@ func autoResolve(
 	return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
 }
 
-func operationHashPush(req PushRequest, kid, metaHash string) string {
-	canon := map[string]any{
-		"op":              "push",
-		"scope":           req.Scope,
-		"id":              req.ID,
-		"kid":             kid,
-		"if_match":        nullableString(req.IfMatch),
-		"plaintext_sha":   plaintextHashFromBase64(req.Plaintext),
-		"metadata_sha":    metaHash,
-		"conflict_policy": req.ConflictPolicy,
-		"idempotency":     req.IdempotencyKey,
-	}
-	b, _ := json.Marshal(canon)
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
-
-func plaintextHashFromBase64(s string) string {
-	b, err := base64.StdEncoding.DecodeString(s)
+// operationHashForBlob derives X-Operation-Hash for a blob mutation
+// according to syncplan.md §7.0. The canonical tuple matches exactly
+// what the controlplane will see on the wire (METHOD, PATH, KEY_ID,
+// IF_MATCH, IDEMPOTENCY_KEY, BODY).
+func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, body []byte) (string, error) {
+	path, err := controlplane.PathFor(scope, id)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
-}
-
-func nullableString(s *string) any {
-	if s == nil {
-		return nil
+	canonicalIfMatch := ifMatch
+	if canonicalIfMatch == "" {
+		canonicalIfMatch = "0"
 	}
-	return *s
+	opKey, err := cryptopkg.DeriveOpHashKey(cek)
+	if err != nil {
+		return "", err
+	}
+	defer cryptopkg.Zero(opKey)
+	return cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         method,
+		Path:           path,
+		KeyIDHex:       keyIDHex,
+		IfMatch:        canonicalIfMatch,
+		IdempotencyKey: idempotencyKey,
+		Body:           body,
+	}), nil
 }
 
 // Pull fetches one or more blobs and decrypts them. Each item is
@@ -410,13 +413,28 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		return nil, badRequest("id is required")
 	}
 
+	key, err := decodeKey(req.Key)
+	if err != nil {
+		return nil, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(key)
+
+	kidBytes, err := cryptopkg.DeriveKeyID(key)
+	if err != nil {
+		return nil, err
+	}
+	kidHex := cryptopkg.KeyIDHex(kidBytes)
+
 	ifMatch := ""
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
 
-	opHash := operationHashDelete(req)
-	err := deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
+	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil)
+	if err != nil {
+		return nil, err
+	}
+	err = deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
 		JWT:            sess.RawJWT,
@@ -428,19 +446,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		return nil, err
 	}
 	return &OKResponse{OK: true}, nil
-}
-
-func operationHashDelete(req DeleteRequest) string {
-	canon := map[string]any{
-		"op":          "delete",
-		"scope":       req.Scope,
-		"id":          req.ID,
-		"if_match":    nullableString(req.IfMatch),
-		"idempotency": req.IdempotencyKey,
-	}
-	b, _ := json.Marshal(canon)
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
 }
 
 func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRequest) (*KeyRegisterResponse, error) {
@@ -475,40 +480,36 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 			EncryptedKeys: req.InitialBundle.EncryptedKeys,
 		}
 	}
-	opHash := operationHashRegisterKey(req, kidHex)
-	err = deps.Controlplane.RegisterKey(ctx, controlplane.RegisterKeyRequest{
+	cpReq := controlplane.RegisterKeyRequest{
 		JWT:            sess.RawJWT,
 		KeyIDHex:       kidHex,
 		IfMatch:        req.IfMatch,
 		CreatedVia:     req.CreatedVia,
 		IdempotencyKey: req.IdempotencyKey,
-		OperationHash:  opHash,
 		InitialBundle:  bundle,
-	})
+	}
+	body, err := controlplane.RegisterKeyBody(cpReq)
 	if err != nil {
 		return nil, err
 	}
-	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
-}
+	opKey, err := cryptopkg.DeriveOpHashKey(key)
+	if err != nil {
+		return nil, err
+	}
+	defer cryptopkg.Zero(opKey)
+	cpReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         http.MethodPost,
+		Path:           controlplane.RegisterKeyPath,
+		KeyIDHex:       kidHex,
+		IfMatch:        req.IfMatch,
+		IdempotencyKey: req.IdempotencyKey,
+		Body:           body,
+	})
 
-func operationHashRegisterKey(req KeyRegisterRequest, kid string) string {
-	bundleDigest := ""
-	if req.InitialBundle != nil {
-		b, _ := json.Marshal(req.InitialBundle)
-		h := sha256.Sum256(b)
-		bundleDigest = hex.EncodeToString(h[:])
+	if err := deps.Controlplane.RegisterKey(ctx, cpReq); err != nil {
+		return nil, err
 	}
-	canon := map[string]any{
-		"op":           "register_key",
-		"kid":          kid,
-		"if_match":     req.IfMatch,
-		"created_via":  req.CreatedVia,
-		"bundle_sha":   bundleDigest,
-		"idempotency":  req.IdempotencyKey,
-	}
-	b, _ := json.Marshal(canon)
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
+	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
 }
 
 func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleRequest) (*OKResponse, error) {
@@ -636,15 +637,18 @@ func migrateOne(
 	if err != nil {
 		return false
 	}
-	opHashBuf := sha256.Sum256(envBlob)
-	opHash := hex.EncodeToString(opHashBuf[:])
+	idem := "migrate:" + targetKIDHex + ":" + id + ":" + blob.ETag
+	opHash, err := operationHashForBlob(targetKey, http.MethodPut, string(scope), id, targetKIDHex, blob.ETag, idem, envBlob)
+	if err != nil {
+		return false
+	}
 	_, err = deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          string(scope),
 		ID:             id,
 		JWT:            sess.RawJWT,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        blob.ETag,
-		IdempotencyKey: "migrate:" + targetKIDHex + ":" + id + ":" + blob.ETag,
+		IdempotencyKey: idem,
 		OperationHash:  opHash,
 		Rewrap:         true,
 		Ciphertext:     envBlob,

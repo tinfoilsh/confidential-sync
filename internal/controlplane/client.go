@@ -133,19 +133,31 @@ func (c *Client) addAuth(req *http.Request, rawJWT string) {
 }
 
 func (c *Client) urlFor(scope, id string) (string, error) {
+	path, err := PathFor(scope, id)
+	if err != nil {
+		return "", err
+	}
+	return c.baseURL + path, nil
+}
+
+// PathFor returns the controlplane path (no scheme/host) for a given
+// scope+id. Exported so callers — most importantly the operation-hash
+// builder — can produce a canonical tuple that exactly matches what
+// will be sent on the wire.
+func PathFor(scope, id string) (string, error) {
 	switch scope {
 	case "chat":
-		return c.baseURL + "/api/storage/conversation/" + url.PathEscape(id), nil
+		return "/api/storage/conversation/" + url.PathEscape(id), nil
 	case "profile":
-		return c.baseURL + "/api/profile/", nil
+		return "/api/profile/", nil
 	case "project":
-		return c.baseURL + "/api/projects/" + url.PathEscape(id), nil
+		return "/api/projects/" + url.PathEscape(id), nil
 	case "project_document":
 		parent, doc, ok := splitProjectDocID(id)
 		if !ok {
 			return "", fmt.Errorf("controlplane: invalid project_document id %q", id)
 		}
-		return c.baseURL + "/api/projects/" + url.PathEscape(parent) + "/documents/" + url.PathEscape(doc), nil
+		return "/api/projects/" + url.PathEscape(parent) + "/documents/" + url.PathEscape(doc), nil
 	}
 	return "", fmt.Errorf("controlplane: unknown scope %q", scope)
 }
@@ -429,8 +441,10 @@ type RegisterKeyBundle struct {
 	EncryptedKeys string `json:"encrypted_keys"`
 }
 
-func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error {
-	endpoint := c.baseURL + "/api/keys"
+// RegisterKeyBody returns the JSON body bytes that will be sent for the
+// given RegisterKey request. Exported so callers can hash the exact
+// bytes that go on the wire as part of the §7.0 canonical tuple.
+func RegisterKeyBody(req RegisterKeyRequest) ([]byte, error) {
 	payload := map[string]any{
 		"key_id":      req.KeyIDHex,
 		"created_via": req.CreatedVia,
@@ -438,7 +452,15 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error 
 	if req.InitialBundle != nil {
 		payload["initial_bundle"] = req.InitialBundle
 	}
-	body, err := json.Marshal(payload)
+	return json.Marshal(payload)
+}
+
+// RegisterKeyPath is the controlplane path the RegisterKey call targets.
+const RegisterKeyPath = "/api/keys"
+
+func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error {
+	endpoint := c.baseURL + RegisterKeyPath
+	body, err := RegisterKeyBody(req)
 	if err != nil {
 		return err
 	}

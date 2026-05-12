@@ -83,6 +83,12 @@ type DeleteRequest struct {
 	ID             string  `json:"id"`
 	IfMatch        *string `json:"if_match"`
 	IdempotencyKey string  `json:"idempotency_key"`
+	// Key is the user's CEK (base64), required to derive the
+	// op-hash subkey per §7.0. Delete carries no body so the
+	// canonical tuple's BODY is empty, but the MAC keying still
+	// has to use the CEK so the controlplane cannot brute-force
+	// the (small) (METHOD, PATH, IF_MATCH, IDEM) space.
+	Key string `json:"key"`
 }
 
 type OKResponse struct {
