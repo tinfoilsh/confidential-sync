@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
@@ -596,6 +597,96 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 	} else {
 		out.RetryableRemaining = 0
 		out.BlockedUnmigrated = len(out.Blocked)
+	}
+
+	return out, nil
+}
+
+// MigrateAll drains every scope until empty or the wall-clock budget
+// is hit, then returns an aggregate report. Callers do not paginate:
+// the enclave loops internally so the client-side migration code is a
+// single one-shot call. We cap each call at MigrateAllBudget so the
+// HTTP write-timeout can never trip mid-stream; if work remains, the
+// response sets Partial=true and the client schedules a follow-up.
+//
+// Why scopes run sequentially instead of in parallel: every scope
+// targets the same set of user keys, and the controlplane Rewrap
+// query already CAS-protects each row. Sequential keeps the cost
+// profile predictable and avoids contention against a single user's
+// row set, which the controlplane indexes as one btree per scope.
+const (
+	MigrateAllBudget        = 4 * time.Minute
+	migrateAllScopeMaxBatch = 200
+)
+
+func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequest) (*MigrateAllResponse, error) {
+	if len(req.Keys) == 0 {
+		return nil, badRequest("keys is required and must not be empty")
+	}
+	if req.Target.Key == "" {
+		return nil, badRequest("target.key is required")
+	}
+
+	deadline := time.Now().Add(MigrateAllBudget)
+	scopes := []envelope.Scope{
+		envelope.ScopeProfile,
+		envelope.ScopeChat,
+		envelope.ScopeProject,
+		envelope.ScopeProjectDocument,
+	}
+
+	out := &MigrateAllResponse{Scopes: make([]MigrateAllScopeReport, 0, len(scopes))}
+
+	for _, scope := range scopes {
+		report := MigrateAllScopeReport{Scope: string(scope)}
+
+		for {
+			if time.Now().After(deadline) {
+				out.Partial = true
+				break
+			}
+			budgetLeft := time.Until(deadline)
+			if budgetLeft <= 0 {
+				out.Partial = true
+				break
+			}
+
+			subCtx, cancel := context.WithTimeout(ctx, budgetLeft)
+			page, err := Migrate(subCtx, deps, sess, MigrateRequest{
+				Scope:  string(scope),
+				Limit:  migrateAllScopeMaxBatch,
+				Keys:   req.Keys,
+				Target: req.Target,
+			})
+			cancel()
+			if err != nil {
+				return nil, err
+			}
+
+			report.Migrated += page.Migrated
+			if len(page.Blocked) > 0 {
+				report.Blocked = append(report.Blocked, page.Blocked...)
+			}
+			report.RetryableRemaining = page.RetryableRemaining
+			report.BlockedUnmigrated = page.BlockedUnmigrated
+
+			// Stop draining this scope when nothing migrated and nothing
+			// retryable is left. RetryableRemaining can plateau if every
+			// remaining row keeps failing — page.Migrated == 0 catches
+			// that and lets the loop fall through to the next scope.
+			if page.Migrated == 0 || page.RetryableRemaining == 0 {
+				break
+			}
+		}
+
+		out.Migrated += report.Migrated
+		out.RetryableRemaining += report.RetryableRemaining
+		out.BlockedUnmigrated += report.BlockedUnmigrated
+		out.Scopes = append(out.Scopes, report)
+
+		if out.Partial {
+			break
+		}
 	}
 
 	return out, nil

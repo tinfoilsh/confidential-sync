@@ -140,6 +140,31 @@ type MigrateResponse struct {
 	Blocked            []string `json:"blocked"`
 }
 
+// MigrateAllRequest tells the enclave to drain every scope under the
+// supplied target CEK in one call. The enclave loops over scopes and
+// pages internally; callers do not paginate. A wall-clock budget caps
+// each call so it stays within the HTTP write-timeout.
+type MigrateAllRequest struct {
+	Keys   []PullKey     `json:"keys"`
+	Target MigrateTarget `json:"target"`
+}
+
+type MigrateAllScopeReport struct {
+	Scope              string   `json:"scope"`
+	Migrated           int      `json:"migrated"`
+	RetryableRemaining int      `json:"retryable_remaining"`
+	BlockedUnmigrated  int      `json:"blocked_unmigrated"`
+	Blocked            []string `json:"blocked,omitempty"`
+}
+
+type MigrateAllResponse struct {
+	Migrated           int                     `json:"migrated"`
+	RetryableRemaining int                     `json:"retryable_remaining"`
+	BlockedUnmigrated  int                     `json:"blocked_unmigrated"`
+	Partial            bool                    `json:"partial"`
+	Scopes             []MigrateAllScopeReport `json:"scopes"`
+}
+
 type HealthResponse struct {
 	Status string `json:"status"`
 	GitSHA string `json:"git_sha,omitempty"`

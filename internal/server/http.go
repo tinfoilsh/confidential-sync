@@ -43,6 +43,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.Handle("POST /v1/key/add-bundle", h.authMiddleware(h.addBundle))
 
 	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
+	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddleware(h.migrateAll))
 
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /health", h.health)
@@ -196,6 +197,20 @@ func (h *Handler) migrate(w http.ResponseWriter, r *http.Request, sess Session) 
 		return
 	}
 	resp, err := Migrate(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) migrateAll(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req MigrateAllRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := MigrateAll(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

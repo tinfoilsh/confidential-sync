@@ -58,12 +58,18 @@ func main() {
 	deps := server.Deps{Controlplane: cpClient, GitSHA: gitSHA}
 	handler := server.NewHandler(deps, verifier, stdLogger{})
 
+	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
+	// every legacy blob scope under a wall-clock budget capped to
+	// server.MigrateAllBudget (4m). A 5-minute server WriteTimeout
+	// gives the handler 60s of margin to finalize its response. All
+	// other routes complete in well under a second; ReadHeaderTimeout
+	// stays strict so slowloris cannot exploit the longer write side.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
