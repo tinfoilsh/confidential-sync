@@ -3,12 +3,14 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -37,28 +39,28 @@ const (
 	HeaderIfMatch       = "If-Match"
 	HeaderIdempotency   = "X-Idempotency-Key"
 	HeaderOperationHash = "X-Operation-Hash"
-	HeaderRewrap        = "X-Rewrap"
+	HeaderMessageCount  = "X-Message-Count"
 	HeaderETag          = "ETag"
 	HeaderContentType   = "Content-Type"
 )
 
 const (
-	StatusStaleKey                    = "STALE_KEY"
-	StatusStaleBlob                   = "STALE_BLOB"
-	StatusExistingDataUnderOtherKey   = "EXISTING_DATA_UNDER_OTHER_KEY"
-	StatusIdempotencyConflict         = "IDEMPOTENCY_CONFLICT"
-	StatusLegacyBlobNotMigrated       = "LEGACY_BLOB_NOT_MIGRATED"
+	StatusStaleKey                  = "STALE_KEY"
+	StatusStaleBlob                 = "STALE_BLOB"
+	StatusExistingDataUnderOtherKey = "EXISTING_DATA_UNDER_OTHER_KEY"
+	StatusIdempotencyConflict       = "IDEMPOTENCY_CONFLICT"
+	StatusLegacyBlobNotMigrated     = "LEGACY_BLOB_NOT_MIGRATED"
 )
 
 // Error is a structured error returned from the controlplane. It contains
 // the parsed error code plus any contextual fields the controlplane sent.
 type Error struct {
-	StatusCode    int             `json:"-"`
-	Code          string          `json:"code"`
-	Message       string          `json:"message,omitempty"`
-	CurrentKeyID  string          `json:"current_key_id,omitempty"`
-	CurrentETag   string          `json:"current_etag,omitempty"`
-	Raw           json.RawMessage `json:"-"`
+	StatusCode   int             `json:"-"`
+	Code         string          `json:"code"`
+	Message      string          `json:"message,omitempty"`
+	CurrentKeyID string          `json:"current_key_id,omitempty"`
+	CurrentETag  string          `json:"current_etag,omitempty"`
+	Raw          json.RawMessage `json:"-"`
 }
 
 func (e *Error) Error() string {
@@ -107,6 +109,10 @@ type PutBlobRequest struct {
 	OperationHash  string
 	Rewrap         bool
 	Ciphertext     []byte
+	// MessageCount is forwarded as X-Message-Count for chat scope so
+	// the controlplane can persist the legacy column. Nil for scopes
+	// other than chat and for rewrap.
+	MessageCount *int
 }
 
 type PutBlobResponse struct {
@@ -144,20 +150,24 @@ func (c *Client) urlFor(scope, id string) (string, error) {
 // scope+id. Exported so callers — most importantly the operation-hash
 // builder — can produce a canonical tuple that exactly matches what
 // will be sent on the wire.
+//
+// All blob traffic lives under /api/sync/blob/* — a dedicated surface
+// for the enclave that does not overlap with the legacy /api/storage/*
+// and /api/profile/* endpoints the webapp drives directly today.
 func PathFor(scope, id string) (string, error) {
 	switch scope {
 	case "chat":
-		return "/api/storage/conversation/" + url.PathEscape(id), nil
+		return "/api/sync/blob/chat/" + url.PathEscape(id), nil
 	case "profile":
-		return "/api/profile/", nil
+		return "/api/sync/blob/profile", nil
 	case "project":
-		return "/api/projects/" + url.PathEscape(id), nil
+		return "/api/sync/blob/project/" + url.PathEscape(id), nil
 	case "project_document":
 		parent, doc, ok := splitProjectDocID(id)
 		if !ok {
 			return "", fmt.Errorf("controlplane: invalid project_document id %q", id)
 		}
-		return "/api/projects/" + url.PathEscape(parent) + "/documents/" + url.PathEscape(doc), nil
+		return "/api/sync/blob/project_document/" + url.PathEscape(parent) + "/" + url.PathEscape(doc), nil
 	}
 	return "", fmt.Errorf("controlplane: unknown scope %q", scope)
 }
@@ -171,6 +181,9 @@ func splitProjectDocID(id string) (parent, doc string, ok bool) {
 }
 
 func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobResponse, error) {
+	if req.Rewrap {
+		return c.rewrapBlob(ctx, req)
+	}
 	endpoint, err := c.urlFor(req.Scope, req.ID)
 	if err != nil {
 		return nil, err
@@ -191,8 +204,8 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	if req.OperationHash != "" {
 		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
 	}
-	if req.Rewrap {
-		httpReq.Header.Set(HeaderRewrap, "true")
+	if req.MessageCount != nil {
+		httpReq.Header.Set(HeaderMessageCount, strconv.Itoa(*req.MessageCount))
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
@@ -217,6 +230,73 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 		out.KeyID = req.KeyIDHex
 	}
 	return out, nil
+}
+
+// rewrapBlob targets the dedicated /api/sync/rewrap endpoint. Unlike
+// PutBlob's primary path, rewrap is a JSON POST with the ciphertext
+// base64-encoded inside the body. The controlplane handler updates
+// the row's `data` + `key_id` + `etag` without bumping `sync_version`
+// or `updated_at` — a rewrap is invisible to user-facing sync.
+// RewrapPath is the controlplane path for the dedicated rewrap
+// endpoint. Exported so the enclave can hash the same canonical path
+// when computing X-Operation-Hash.
+const RewrapPath = "/api/sync/rewrap"
+
+// RewrapBody marshals the body the rewrap call sends to the
+// controlplane. Exported so the enclave can compute X-Operation-Hash
+// over exactly the bytes that will hit the wire.
+func RewrapBody(req PutBlobRequest) ([]byte, error) {
+	return json.Marshal(map[string]string{
+		"scope":          req.Scope,
+		"id":             req.ID,
+		"key_id":         req.KeyIDHex,
+		"if_match":       req.IfMatch,
+		"ciphertext_b64": base64.StdEncoding.EncodeToString(req.Ciphertext),
+	})
+}
+
+func (c *Client) rewrapBlob(ctx context.Context, req PutBlobRequest) (*PutBlobResponse, error) {
+	body, err := RewrapBody(req)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.baseURL + RewrapPath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, req.JWT)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
+	}
+	if req.OperationHash != "" {
+		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, respBody)
+	}
+	var out struct {
+		OK    bool   `json:"ok"`
+		ETag  string `json:"etag"`
+		KeyID string `json:"key_id"`
+	}
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode rewrap: %w", err)
+	}
+	if out.ETag == "" {
+		return nil, errors.New("controlplane: missing etag in rewrap response")
+	}
+	if out.KeyID == "" {
+		out.KeyID = req.KeyIDHex
+	}
+	return &PutBlobResponse{ETag: out.ETag, KeyID: out.KeyID}, nil
 }
 
 func (c *Client) GetBlob(ctx context.Context, scope, id, jwt string) (*GetBlobResponse, error) {
@@ -324,9 +404,9 @@ func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int
 }
 
 type ListNeedsMigrationResponse struct {
-	IDs                 []string `json:"ids"`
-	RetryableRemaining  int      `json:"retryable_remaining"`
-	BlockedUnmigrated   int      `json:"blocked_unmigrated"`
+	IDs                []string `json:"ids"`
+	RetryableRemaining int      `json:"retryable_remaining"`
+	BlockedUnmigrated  int      `json:"blocked_unmigrated"`
 }
 
 func (c *Client) ListNeedsMigration(ctx context.Context, scope string, limit int, jwt string) (*ListNeedsMigrationResponse, error) {
@@ -387,15 +467,16 @@ func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt stri
 // --- key registry ----------------------------------------------------------
 
 type CurrentKeyResponse struct {
-	KeyID     string                          `json:"key_id"`
-	Bundles   map[string]CurrentKeyBundle     `json:"bundles"`
-	CreatedAt time.Time                       `json:"created_at"`
+	KeyID      string                      `json:"key_id"`
+	Bundles    map[string]CurrentKeyBundle `json:"bundles"`
+	CreatedVia string                      `json:"created_via"`
+	CreatedAt  time.Time                   `json:"created_at"`
 }
 
 type CurrentKeyBundle struct {
-	CredentialID  string `json:"credential_id"`
-	KEKIV         string `json:"kek_iv"`
-	EncryptedKeys string `json:"encrypted_keys"`
+	CredentialID  string    `json:"credential_id"`
+	KEKIV         string    `json:"kek_iv"`
+	EncryptedKeys string    `json:"encrypted_keys"`
 	RegisteredAt  time.Time `json:"registered_at"`
 }
 
@@ -492,20 +573,36 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error 
 }
 
 type AddBundleRequest struct {
-	JWT           string
-	KeyIDHex      string
-	CredentialID  string
-	KEKIV         string
-	EncryptedKeys string
+	JWT            string
+	KeyIDHex       string
+	CredentialID   string
+	KEKIV          string
+	EncryptedKeys  string
+	IdempotencyKey string
+	OperationHash  string
 }
 
-func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
-	endpoint := c.baseURL + "/api/keys/" + url.PathEscape(req.KeyIDHex) + "/bundles"
-	body, err := json.Marshal(map[string]string{
+// AddBundleBody marshals the body of an add-bundle request. Exposed so
+// the enclave can hash exactly what will hit the wire when computing
+// X-Operation-Hash.
+func AddBundleBody(req AddBundleRequest) ([]byte, error) {
+	return json.Marshal(map[string]string{
 		"credential_id":  req.CredentialID,
 		"kek_iv":         req.KEKIV,
 		"encrypted_keys": req.EncryptedKeys,
 	})
+}
+
+// AddBundlePath is the controlplane path for the add-bundle endpoint.
+// Used by the enclave to keep the op-hash canonical path aligned
+// with the actual wire path.
+func AddBundlePath(keyIDHex string) string {
+	return "/api/keys/" + url.PathEscape(keyIDHex) + "/bundles"
+}
+
+func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
+	endpoint := c.baseURL + AddBundlePath(req.KeyIDHex)
+	body, err := AddBundleBody(req)
 	if err != nil {
 		return err
 	}
@@ -515,6 +612,51 @@ func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
 	}
 	c.addAuth(httpReq, req.JWT)
 	httpReq.Header.Set(HeaderContentType, "application/json")
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
+	}
+	if req.OperationHash != "" {
+		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return parseError(resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+type RemoveBundleRequest struct {
+	JWT            string
+	KeyIDHex       string
+	CredentialID   string
+	IdempotencyKey string
+	OperationHash  string
+}
+
+// RemoveBundlePath returns the canonical wire path for a remove-bundle
+// request so callers can compute the op-hash over the same string.
+func RemoveBundlePath(keyIDHex, credentialID string) string {
+	return "/api/keys/" + url.PathEscape(keyIDHex) + "/bundles/" + url.PathEscape(credentialID)
+}
+
+func (c *Client) RemoveBundle(ctx context.Context, req RemoveBundleRequest) error {
+	endpoint := c.baseURL + RemoveBundlePath(req.KeyIDHex, req.CredentialID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, req.JWT)
+	if req.IdempotencyKey != "" {
+		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
+	}
+	if req.OperationHash != "" {
+		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return err

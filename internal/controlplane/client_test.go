@@ -69,7 +69,7 @@ func (s *stub) handle1(method, path string, h http.HandlerFunc) {
 
 func TestPutBlobSuccess(t *testing.T) {
 	st := newStub(t)
-	st.handle1("PUT", "/api/storage/conversation/chat_1", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-jwt" {
 			t.Errorf("auth header: %q", got)
 		}
@@ -111,7 +111,7 @@ func TestPutBlobSuccess(t *testing.T) {
 
 func TestPutBlobStaleBlob(t *testing.T) {
 	st := newStub(t)
-	st.handle1("PUT", "/api/storage/conversation/chat_1", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		json.NewEncoder(w).Encode(map[string]string{
 			"code":         StatusStaleBlob,
@@ -158,7 +158,7 @@ func TestRegisterKeyExistingDataConflict(t *testing.T) {
 
 func TestGetBlobReturnsCiphertextAndHeaders(t *testing.T) {
 	st := newStub(t)
-	st.handle1("GET", "/api/storage/conversation/chat_1", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("GET", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", "7")
 		w.Header().Set("X-Key-Id", strings.Repeat("c", 32))
 		w.Write([]byte("opaque-bytes"))
@@ -205,7 +205,7 @@ func TestListStatusEncodesQuery(t *testing.T) {
 
 func TestProjectDocumentRouting(t *testing.T) {
 	st := newStub(t)
-	st.handle1("GET", "/api/projects/proj_1/documents/doc_2", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("GET", "/api/sync/blob/project_document/proj_1/doc_2", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", "1")
 		w.Header().Set("X-Key-Id", strings.Repeat("d", 32))
 		w.Write([]byte("doc-blob"))
@@ -223,7 +223,7 @@ func TestProjectDocumentRouting(t *testing.T) {
 func TestDeleteBlobSendsHeaders(t *testing.T) {
 	st := newStub(t)
 	called := false
-	st.handle1("DELETE", "/api/projects/proj_1", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("DELETE", "/api/sync/blob/project/proj_1", func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		if r.Header.Get("If-Match") != "3" {
 			t.Errorf("if-match: %q", r.Header.Get("If-Match"))

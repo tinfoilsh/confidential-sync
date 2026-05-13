@@ -61,7 +61,7 @@ type chatResolver struct{}
 // (anywhere), it is immutable. Messages do not yet have explicit IDs in
 // production, so the resolver uses a deterministic synthetic identity:
 //
-//   synthetic_id = sha256(role || "\x1f" || content || "\x1f" || timestamp)
+//	synthetic_id = sha256(role || "\x1f" || content || "\x1f" || timestamp)
 //
 // Two devices that independently composed the same text at the same
 // instant collide on synthetic ID and dedupe. The resolver:
@@ -305,9 +305,9 @@ type profileResolver struct{}
 // LWW fields are the small set of cosmetic settings where two devices
 // disagreeing produces UX noise rather than data loss.
 var profileLastWriterWins = map[string]bool{
-	"theme":          true,
+	"theme":             true,
 	"sidebar_collapsed": true,
-	"sidebar_width":  true,
+	"sidebar_width":     true,
 }
 
 func (profileResolver) Merge(local, remote []byte) (Result, error) {
@@ -463,6 +463,13 @@ func sameString(a, b map[string]any, key string) bool {
 	return av == bv
 }
 
+// lastWriterWinsString resolves divergent string fields by comparing
+// the *containing chat row's* `updatedAt` timestamp. We do not track
+// per-field write times, so this is a best-effort approximation: a
+// later overall write wins even if the specific field hadn't actually
+// been touched on that side. That is acceptable because LWW only
+// triggers when both sides explicitly disagree on the field, and the
+// row-level timestamp is the closest signal available.
 func lastWriterWinsString(local, remote map[string]any, key string) (string, bool) {
 	r, rok := remote[key].(string)
 	l, lok := local[key].(string)
@@ -471,6 +478,12 @@ func lastWriterWinsString(local, remote map[string]any, key string) (string, boo
 	}
 	if rok && lok && r == l {
 		return l, true
+	}
+	if rok && lok {
+		if timestampKey(local["updatedAt"]) > timestampKey(remote["updatedAt"]) {
+			return l, true
+		}
+		return r, true
 	}
 	if rok {
 		return r, true

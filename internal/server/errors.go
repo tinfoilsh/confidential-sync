@@ -25,6 +25,7 @@ const (
 	CodeAuth                      = "AUTH"
 	CodeForbidden                 = "FORBIDDEN"
 	CodeBadRequest                = "BAD_REQUEST"
+	CodeNotFound                  = "NOT_FOUND"
 	CodeNetwork                   = "NETWORK"
 	CodeInternal                  = "INTERNAL"
 )

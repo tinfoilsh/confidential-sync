@@ -46,19 +46,19 @@ type fixture struct {
 }
 
 type cpStub struct {
-	t           *testing.T
-	mu          sync.Mutex
-	blobs       map[string]*cpBlob // scope/id → blob
-	keys        map[string]struct{} // hex KeyIDs registered
-	currentKID  string
-	bundles     map[string]map[string]controlplane.CurrentKeyBundle
-	registeredOps map[string]bool
+	t                 *testing.T
+	mu                sync.Mutex
+	blobs             map[string]*cpBlob  // scope/id → blob
+	keys              map[string]struct{} // hex KeyIDs registered
+	currentKID        string
+	bundles           map[string]map[string]controlplane.CurrentKeyBundle
+	registeredOps     map[string]bool
 	migrationFailures map[string]int
-	needsMigration  []cpNeedsMigration
-	mux         *http.ServeMux
-	server      *httptest.Server
-	registerHandler func(w http.ResponseWriter, r *http.Request)
-	captureHeaders  func(r *http.Request)
+	needsMigration    []cpNeedsMigration
+	mux               *http.ServeMux
+	server            *httptest.Server
+	registerHandler   func(w http.ResponseWriter, r *http.Request)
+	captureHeaders    func(r *http.Request)
 }
 
 type cpNeedsMigration struct {
@@ -66,9 +66,9 @@ type cpNeedsMigration struct {
 }
 
 type cpBlob struct {
-	ETag   int64
-	KeyID  string
-	Body   []byte
+	ETag  int64
+	KeyID string
+	Body  []byte
 }
 
 func newCPStub(t *testing.T) *cpStub {
@@ -104,32 +104,35 @@ func (s *cpStub) putBlobKey(scope, id string) string {
 
 func (s *cpStub) installHandlers() {
 	// PUT blobs
-	s.mux.HandleFunc("PUT /api/storage/conversation/", s.handlePutBlob("chat"))
-	s.mux.HandleFunc("PUT /api/profile/", s.handlePutBlob("profile"))
-	s.mux.HandleFunc("PUT /api/projects/{id}", s.handlePutBlob("project"))
-	s.mux.HandleFunc("PUT /api/projects/{pid}/documents/{did}", s.handlePutBlob("project_document"))
+	s.mux.HandleFunc("PUT /api/sync/blob/chat/{id}", s.handlePutBlob("chat"))
+	s.mux.HandleFunc("PUT /api/sync/blob/profile", s.handlePutBlob("profile"))
+	s.mux.HandleFunc("PUT /api/sync/blob/project/{id}", s.handlePutBlob("project"))
+	s.mux.HandleFunc("PUT /api/sync/blob/project_document/{pid}/{did}", s.handlePutBlob("project_document"))
 	// GET blobs
-	s.mux.HandleFunc("GET /api/storage/conversation/", s.handleGetBlob("chat"))
-	s.mux.HandleFunc("GET /api/profile/", s.handleGetBlob("profile"))
-	s.mux.HandleFunc("GET /api/projects/{id}", s.handleGetBlob("project"))
-	s.mux.HandleFunc("GET /api/projects/{pid}/documents/{did}", s.handleGetBlob("project_document"))
+	s.mux.HandleFunc("GET /api/sync/blob/chat/{id}", s.handleGetBlob("chat"))
+	s.mux.HandleFunc("GET /api/sync/blob/profile", s.handleGetBlob("profile"))
+	s.mux.HandleFunc("GET /api/sync/blob/project/{id}", s.handleGetBlob("project"))
+	s.mux.HandleFunc("GET /api/sync/blob/project_document/{pid}/{did}", s.handleGetBlob("project_document"))
 	// DELETE blobs
-	s.mux.HandleFunc("DELETE /api/storage/conversation/", s.handleDeleteBlob("chat"))
-	s.mux.HandleFunc("DELETE /api/projects/{id}", s.handleDeleteBlob("project"))
-	// list-status
+	s.mux.HandleFunc("DELETE /api/sync/blob/chat/{id}", s.handleDeleteBlob("chat"))
+	s.mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.handleDeleteBlob("project"))
+	// rewrap (separate JSON endpoint; not the PUT blob path)
+	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
+	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
 	s.mux.HandleFunc("GET /api/sync/needs-migration", s.handleNeedsMigration)
 	s.mux.HandleFunc("POST /api/sync/migration-failure", s.handleMigrationFailure)
 	// key registry
 	s.mux.HandleFunc("POST /api/keys", s.handleRegisterKey)
 	s.mux.HandleFunc("POST /api/keys/{kid}/bundles", s.handleAddBundle)
+	s.mux.HandleFunc("DELETE /api/keys/{kid}/bundles/{cid}", s.handleRemoveBundle)
 	s.mux.HandleFunc("GET /api/keys/current", s.handleCurrentKey)
 }
 
 func (s *cpStub) extractID(scope string, r *http.Request) string {
 	switch scope {
 	case "chat":
-		return strings.TrimPrefix(r.URL.Path, "/api/storage/conversation/")
+		return r.PathValue("id")
 	case "profile":
 		return "profile"
 	case "project":
@@ -238,9 +241,9 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		KeyID         string                              `json:"key_id"`
-		CreatedVia    string                              `json:"created_via"`
-		InitialBundle *controlplane.CurrentKeyBundle      `json:"initial_bundle,omitempty"`
+		KeyID         string                         `json:"key_id"`
+		CreatedVia    string                         `json:"created_via"`
+		InitialBundle *controlplane.CurrentKeyBundle `json:"initial_bundle,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -301,6 +304,67 @@ func (s *cpStub) handleCurrentKey(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(controlplane.CurrentKeyResponse{
 		KeyID:   s.currentKID,
 		Bundles: s.bundles[s.currentKID],
+	})
+}
+
+func (s *cpStub) handleRemoveBundle(w http.ResponseWriter, r *http.Request) {
+	kid := r.PathValue("kid")
+	cid := r.PathValue("cid")
+	if m, ok := s.bundles[kid]; ok {
+		delete(m, cid)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRewrap mirrors the controlplane's /api/sync/rewrap endpoint:
+// JSON body in, replaces the blob ciphertext + key_id, bumps etag,
+// returns {ok, etag, key_id}. Mid-test rewrap CAS mismatches are
+// surfaced via the same STALE_BLOB code the controlplane uses.
+func (s *cpStub) handleRewrap(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Scope         string `json:"scope"`
+		ID            string `json:"id"`
+		KeyID         string `json:"key_id"`
+		IfMatch       string `json:"if_match"`
+		CiphertextB64 string `json:"ciphertext_b64"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ct, err := base64.StdEncoding.DecodeString(req.CiphertextB64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	id := req.ID
+	if req.Scope == "profile" {
+		id = "profile"
+	}
+	key := s.putBlobKey(req.Scope, id)
+	blob, ok := s.blobs[key]
+	if !ok {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":         controlplane.StatusStaleBlob,
+			"current_etag": "0",
+		})
+		return
+	}
+	if req.IfMatch != formatETag(blob.ETag) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":         controlplane.StatusStaleBlob,
+			"current_etag": formatETag(blob.ETag),
+		})
+		return
+	}
+	nextETag := blob.ETag + 1
+	s.blobs[key] = &cpBlob{ETag: nextETag, KeyID: req.KeyID, Body: ct}
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":     true,
+		"etag":   formatETag(nextETag),
+		"key_id": req.KeyID,
 	})
 }
 
@@ -509,7 +573,7 @@ func TestInvalidScope(t *testing.T) {
 	f := newFixture(t)
 	resp, body := f.post("/v1/sync/push", PushRequest{
 		Scope: "bogus", ID: "x", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte("x")),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte("x")),
 		IdempotencyKey: "i1",
 	}, f.jwt())
 	if resp.StatusCode != http.StatusBadRequest {
@@ -525,7 +589,7 @@ func TestStaleBlobAutoMerge(t *testing.T) {
 	v1 := []byte(`{"id":"c","title":"t","messages":[{"role":"user","content":"a","timestamp":"2026-05-01T00:00:00Z"}]}`)
 	resp, _ := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString(v1),
+		Plaintext:      base64.StdEncoding.EncodeToString(v1),
 		IdempotencyKey: "init",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
@@ -547,7 +611,7 @@ func TestStaleBlobAutoMerge(t *testing.T) {
 	]}`)
 	resp2, body2 := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString(other),
+		Plaintext:      base64.StdEncoding.EncodeToString(other),
 		IdempotencyKey: "remote-1",
 	}, tok)
 	if resp2.StatusCode != http.StatusOK {
@@ -563,7 +627,7 @@ func TestStaleBlobAutoMerge(t *testing.T) {
 	resp3, body3 := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
 		Plaintext: base64.StdEncoding.EncodeToString(local),
-		IfMatch: &staleETag, IdempotencyKey: "local-1",
+		IfMatch:   &staleETag, IdempotencyKey: "local-1",
 		ConflictPolicy: "auto_merge",
 	}, tok)
 	if resp3.StatusCode != http.StatusOK {
@@ -594,7 +658,7 @@ func TestStaleBlobRejectPolicy(t *testing.T) {
 
 	resp, _ := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte(`{"id":"c","messages":[]}`)),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"c","messages":[]}`)),
 		IdempotencyKey: "i1",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
@@ -605,7 +669,7 @@ func TestStaleBlobRejectPolicy(t *testing.T) {
 	resp2, body2 := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
 		Plaintext: base64.StdEncoding.EncodeToString([]byte(`{"id":"c","messages":[]}`)),
-		IfMatch: &stale, IdempotencyKey: "i2", ConflictPolicy: "reject",
+		IfMatch:   &stale, IdempotencyKey: "i2", ConflictPolicy: "reject",
 	}, tok)
 	if resp2.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("expected 412, got %d %s", resp2.StatusCode, body2)
@@ -636,7 +700,7 @@ func TestRegisterKeyExistingDataConflict(t *testing.T) {
 	// data under that KeyID.
 	if r, _ := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c1", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte("x")),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte("x")),
 		IdempotencyKey: "i1",
 	}, tok); r.StatusCode != http.StatusOK {
 		t.Fatalf("seed push: %d", r.StatusCode)
@@ -664,10 +728,12 @@ func TestAddBundleForwards(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
 	resp, body := f.post("/v1/key/add-bundle", AddBundleRequest{
-		KeyID:         f.userKeyID,
-		CredentialID:  "cred-x",
-		KEKIV:         "iv",
-		EncryptedKeys: "ct",
+		KeyID:          f.userKeyID,
+		Key:            f.userKeyB64,
+		CredentialID:   "cred-x",
+		KEKIV:          "iv",
+		EncryptedKeys:  "ct",
+		IdempotencyKey: "idem-add-1",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("add-bundle: %d %s", resp.StatusCode, body)
@@ -681,13 +747,17 @@ func TestDeleteForwardsHeaders(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
 	// seed
-	f.post("/v1/sync/push", PushRequest{
+	_, pushBody := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte("x")),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte("x")),
 		IdempotencyKey: "i1",
 	}, tok)
+	var push PushResponse
+	json.Unmarshal(pushBody, &push)
+	etag := push.ETag
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{
 		Scope: "chat", ID: "c", IdempotencyKey: "del-1", Key: f.userKeyB64,
+		IfMatch: &etag,
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d %s", resp.StatusCode, body)
@@ -757,7 +827,7 @@ func TestMigrateBlobBumpsAttemptsOnFailure(t *testing.T) {
 	f.cp.mu.Unlock()
 
 	resp, body := f.post("/v1/blobs/migrate", MigrateRequest{
-		Scope:  "chat", Limit: 5,
+		Scope: "chat", Limit: 5,
 		Keys:   []PullKey{{Key: f.userKeyB64}}, // wrong key
 		Target: MigrateTarget{Key: f.userKeyB64},
 	}, tok)
@@ -803,7 +873,7 @@ func TestAADProtectsAcrossScope(t *testing.T) {
 	pt := []byte("hello")
 	resp, _ := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "x", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString(pt),
+		Plaintext:      base64.StdEncoding.EncodeToString(pt),
 		IdempotencyKey: "i",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
@@ -851,7 +921,7 @@ func TestIdempotencyHeaderForwarded(t *testing.T) {
 
 	resp, _ := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "newc", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte("x")),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte("x")),
 		IdempotencyKey: "my-idem-1",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {

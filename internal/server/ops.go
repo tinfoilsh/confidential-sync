@@ -29,9 +29,15 @@ type Session struct {
 }
 
 const (
-	conflictPolicyAutoMerge      = "auto_merge"
-	conflictPolicyReject         = "reject"
-	conflictPolicyReplaceRemote  = "replace_remote"
+	conflictPolicyAutoMerge     = "auto_merge"
+	conflictPolicyReject        = "reject"
+	conflictPolicyReplaceRemote = "replace_remote"
+
+	// createIfMatchSentinel is the wire value the controlplane uses
+	// to mean "create-only" when a caller doesn't have an etag yet.
+	// Must match controlplane/handlers/sync_blob_handler.go
+	// (createIfMatch = "0").
+	createIfMatchSentinel = "0"
 )
 
 // Push encrypts plaintext into a v2 envelope and uploads it to the
@@ -97,7 +103,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		return nil, err
 	}
 
-	ifMatch := ""
+	ifMatch := createIfMatchSentinel
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
@@ -110,6 +116,12 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// is itself the BODY of the canonical tuple.
 	_ = metaHash
 
+	// messageCount is metadata-only (the chat-list UI uses it for the
+	// "empty chat" predicate). It is NOT mixed into the op-hash: the
+	// controlplane is the authority on that column and could tamper
+	// with it post-write regardless. Mixing it in would only force
+	// retries to recompute the hash without changing the threat
+	// model.
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
@@ -119,6 +131,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		IdempotencyKey: req.IdempotencyKey,
 		OperationHash:  opHash,
 		Ciphertext:     envBlob,
+		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
 	})
 	if err == nil {
 		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
@@ -209,6 +222,9 @@ func autoResolve(
 	}
 	retryReq := req
 	newIfMatch := remote.ETag
+	if newIfMatch == "" {
+		newIfMatch = createIfMatchSentinel
+	}
 	retryReq.IfMatch = &newIfMatch
 	retryReq.IdempotencyKey = req.IdempotencyKey + ":resolved"
 	_ = metaHash
@@ -226,6 +242,7 @@ func autoResolve(
 		IdempotencyKey: retryReq.IdempotencyKey,
 		OperationHash:  opHash,
 		Ciphertext:     envBlob,
+		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
 	})
 	if err != nil {
 		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
@@ -245,10 +262,6 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 	if err != nil {
 		return "", err
 	}
-	canonicalIfMatch := ifMatch
-	if canonicalIfMatch == "" {
-		canonicalIfMatch = "0"
-	}
 	opKey, err := cryptopkg.DeriveOpHashKey(cek)
 	if err != nil {
 		return "", err
@@ -258,7 +271,7 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 		Method:         method,
 		Path:           path,
 		KeyIDHex:       keyIDHex,
-		IfMatch:        canonicalIfMatch,
+		IfMatch:        ifMatch,
 		IdempotencyKey: idempotencyKey,
 		Body:           body,
 	}), nil
@@ -426,10 +439,10 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	ifMatch := ""
-	if req.IfMatch != nil {
-		ifMatch = *req.IfMatch
+	if req.IfMatch == nil || *req.IfMatch == "" {
+		return nil, badRequest("if_match is required for delete")
 	}
+	ifMatch := *req.IfMatch
 
 	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil)
 	if err != nil {
@@ -520,17 +533,121 @@ func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleReques
 	if req.CredentialID == "" || req.KEKIV == "" || req.EncryptedKeys == "" {
 		return nil, badRequest("credential_id, kek_iv, encrypted_keys are required")
 	}
-	err := deps.Controlplane.AddBundle(ctx, controlplane.AddBundleRequest{
-		JWT:           sess.RawJWT,
-		KeyIDHex:      req.KeyID,
-		CredentialID:  req.CredentialID,
-		KEKIV:         req.KEKIV,
-		EncryptedKeys: req.EncryptedKeys,
-	})
+	if req.IdempotencyKey == "" {
+		return nil, badRequest("idempotency_key is required")
+	}
+	cpReq := controlplane.AddBundleRequest{
+		JWT:            sess.RawJWT,
+		KeyIDHex:       req.KeyID,
+		CredentialID:   req.CredentialID,
+		KEKIV:          req.KEKIV,
+		EncryptedKeys:  req.EncryptedKeys,
+		IdempotencyKey: req.IdempotencyKey,
+	}
+	body, err := controlplane.AddBundleBody(cpReq)
+	if err != nil {
+		return nil, err
+	}
+	key, err := decodeKey(req.Key)
+	if err != nil {
+		return nil, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(key)
+	opHash, err := operationHashForKey(key, http.MethodPost, controlplane.AddBundlePath(req.KeyID), req.KeyID, req.IdempotencyKey, body)
+	if err != nil {
+		return nil, err
+	}
+	cpReq.OperationHash = opHash
+	err = deps.Controlplane.AddBundle(ctx, cpReq)
 	if err != nil {
 		return nil, err
 	}
 	return &OKResponse{OK: true}, nil
+}
+
+func RemoveBundle(ctx context.Context, deps Deps, sess Session, req RemoveBundleRequest) (*OKResponse, error) {
+	if len(req.KeyID) != 32 || !isLowerHex(req.KeyID) {
+		return nil, badRequest("invalid key_id")
+	}
+	if req.CredentialID == "" {
+		return nil, badRequest("credential_id is required")
+	}
+	if req.IdempotencyKey == "" {
+		return nil, badRequest("idempotency_key is required")
+	}
+	cpReq := controlplane.RemoveBundleRequest{
+		JWT:            sess.RawJWT,
+		KeyIDHex:       req.KeyID,
+		CredentialID:   req.CredentialID,
+		IdempotencyKey: req.IdempotencyKey,
+	}
+	key, err := decodeKey(req.Key)
+	if err != nil {
+		return nil, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(key)
+	opHash, err := operationHashForKey(key, http.MethodDelete, controlplane.RemoveBundlePath(req.KeyID, req.CredentialID), req.KeyID, req.IdempotencyKey, nil)
+	if err != nil {
+		return nil, err
+	}
+	cpReq.OperationHash = opHash
+	err = deps.Controlplane.RemoveBundle(ctx, cpReq)
+	if err != nil {
+		return nil, err
+	}
+	return &OKResponse{OK: true}, nil
+}
+
+func operationHashForKey(cek []byte, method, path, keyIDHex, idempotencyKey string, body []byte) (string, error) {
+	opKey, err := cryptopkg.DeriveOpHashKey(cek)
+	if err != nil {
+		return "", err
+	}
+	defer cryptopkg.Zero(opKey)
+	return cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         method,
+		Path:           path,
+		KeyIDHex:       keyIDHex,
+		IfMatch:        "",
+		IdempotencyKey: idempotencyKey,
+		Body:           body,
+	}), nil
+}
+
+// KeyCurrent fetches the user's current KeyID + bundles from the
+// controlplane and re-shapes the response into the webapp's
+// expected envelope. Per the webapp SDK convention, a missing key
+// surfaces as KeyID=nil + empty bundles via a 404 from the
+// controlplane; we re-emit that 404 here.
+func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentRequest) (*KeyCurrentResponse, error) {
+	resp, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "no current key"}
+	}
+	out := &KeyCurrentResponse{
+		KeyID:      &resp.KeyID,
+		CreatedVia: resp.CreatedVia,
+		Bundles:    make(map[string]KeyCurrentBundle, len(resp.Bundles)),
+	}
+	if !resp.CreatedAt.IsZero() {
+		out.CreatedAt = resp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
+	}
+	for cid, b := range resp.Bundles {
+		out.Bundles[cid] = KeyCurrentBundle{
+			CredentialID:  b.CredentialID,
+			KEKIV:         b.KEKIV,
+			EncryptedKeys: b.EncryptedKeys,
+		}
+		if !b.RegisteredAt.IsZero() {
+			ent := out.Bundles[cid]
+			ent.UpdatedAt = b.RegisteredAt.Format("2006-01-02T15:04:05.000Z")
+			out.Bundles[cid] = ent
+		}
+	}
+	return out, nil
 }
 
 func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (*MigrateResponse, error) {
@@ -706,14 +823,18 @@ func migrateOne(
 	if err != nil {
 		return false
 	}
-	if envelope.Detect(blob.Ciphertext) == envelope.VersionV2 {
-		return true
-	}
-	dec, err := envelope.DecryptLegacy(blob.Ciphertext, keys)
-	if err != nil {
+	// ListNeedsMigration only returns rows with key_id IS NULL, so we
+	// re-seal and rewrap every row we see here — even V2 ones that
+	// decrypt cleanly today — so the controlplane's key_id column
+	// gets stamped and the row leaves the "needs migration" set
+	// permanently. Returning early on V2 (the old behavior) left
+	// key_id NULL forever, blocking future key rotation via
+	// HasAnyUserData.
+	plaintext, ok := decryptAnyVersion(blob.Ciphertext, keys, scope, id, sess.Claims.Subject)
+	if !ok {
 		return false
 	}
-	defer cryptopkg.Zero(dec.Plaintext)
+	defer cryptopkg.Zero(plaintext)
 
 	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
 		KeyIDHex:    targetKIDHex,
@@ -724,27 +845,99 @@ func migrateOne(
 	if err != nil {
 		return false
 	}
-	envBlob, err := envelope.Encrypt(targetKey, dec.Plaintext, aadBytes, targetKIDHex)
+	envBlob, err := envelope.Encrypt(targetKey, plaintext, aadBytes, targetKIDHex)
 	if err != nil {
 		return false
 	}
 	idem := "migrate:" + targetKIDHex + ":" + id + ":" + blob.ETag
-	opHash, err := operationHashForBlob(targetKey, http.MethodPut, string(scope), id, targetKIDHex, blob.ETag, idem, envBlob)
-	if err != nil {
-		return false
-	}
-	_, err = deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
+	rewrapReq := controlplane.PutBlobRequest{
 		Scope:          string(scope),
 		ID:             id,
 		JWT:            sess.RawJWT,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        blob.ETag,
 		IdempotencyKey: idem,
-		OperationHash:  opHash,
 		Rewrap:         true,
 		Ciphertext:     envBlob,
+	}
+	rewrapBody, err := controlplane.RewrapBody(rewrapReq)
+	if err != nil {
+		return false
+	}
+	opKey, err := cryptopkg.DeriveOpHashKey(targetKey)
+	if err != nil {
+		return false
+	}
+	defer cryptopkg.Zero(opKey)
+	rewrapReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         http.MethodPost,
+		Path:           controlplane.RewrapPath,
+		KeyIDHex:       targetKIDHex,
+		IfMatch:        blob.ETag,
+		IdempotencyKey: idem,
+		Body:           rewrapBody,
 	})
+	_, err = deps.Controlplane.PutBlob(ctx, rewrapReq)
 	return err == nil
+}
+
+// messageCountFromMetadata pulls the optional `messageCount` field
+// out of a chat push's metadata map. Returns nil for non-chat scopes
+// or when the metadata is missing/malformed; the controlplane treats
+// a missing X-Message-Count as "don't change the column" on update
+// and "0" on insert.
+func messageCountFromMetadata(scope string, metadata map[string]any) *int {
+	if scope != string(envelope.ScopeChat) {
+		return nil
+	}
+	raw, ok := metadata["messageCount"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case float64:
+		if v < 0 {
+			return nil
+		}
+		n := int(v)
+		return &n
+	case int:
+		if v < 0 {
+			return nil
+		}
+		return &v
+	default:
+		return nil
+	}
+}
+
+// decryptAnyVersion picks the right decrypt path for whichever
+// envelope version the ciphertext is in. Returns the plaintext (caller
+// owns the buffer and must zeroize) and ok=true on success.
+func decryptAnyVersion(ciphertext []byte, keys []envelope.Key, scope envelope.Scope, id, clerkUserID string) ([]byte, bool) {
+	switch envelope.Detect(ciphertext) {
+	case envelope.VersionV2:
+		dec, err := envelope.DecryptV2(ciphertext, keys, func(kid string) ([]byte, error) {
+			return envelope.CanonicalAAD(envelope.AAD{
+				KeyIDHex:    kid,
+				Scope:       scope,
+				ID:          id,
+				ClerkUserID: clerkUserID,
+			})
+		})
+		if err != nil {
+			return nil, false
+		}
+		return dec.Plaintext, true
+	case envelope.VersionV0, envelope.VersionV1:
+		dec, err := envelope.DecryptLegacy(ciphertext, keys)
+		if err != nil {
+			return nil, false
+		}
+		return dec.Plaintext, true
+	default:
+		return nil, false
+	}
 }
 
 func Health(deps Deps) HealthResponse {

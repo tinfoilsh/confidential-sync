@@ -41,6 +41,8 @@ func (h *Handler) Routes() http.Handler {
 
 	mux.Handle("POST /v1/key/register", h.authMiddleware(h.registerKey))
 	mux.Handle("POST /v1/key/add-bundle", h.authMiddleware(h.addBundle))
+	mux.Handle("POST /v1/key/remove-bundle", h.authMiddleware(h.removeBundle))
+	mux.Handle("POST /v1/key/current", h.authMiddleware(h.keyCurrent))
 
 	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
 	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddleware(h.migrateAll))
@@ -183,6 +185,34 @@ func (h *Handler) addBundle(w http.ResponseWriter, r *http.Request, sess Session
 		return
 	}
 	resp, err := AddBundle(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) removeBundle(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req RemoveBundleRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := RemoveBundle(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) keyCurrent(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req KeyCurrentRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := KeyCurrent(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

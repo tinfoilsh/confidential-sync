@@ -7,9 +7,9 @@ package server
 type PushRequest struct {
 	Scope          string         `json:"scope"`
 	ID             string         `json:"id,omitempty"`
-	Key            string         `json:"key"`         // base64 32-byte raw key
-	Plaintext      string         `json:"plaintext"`   // base64 plaintext bytes
-	IfMatch        *string        `json:"if_match"`    // ETag CAS; null = create
+	Key            string         `json:"key"`       // base64 32-byte raw key
+	Plaintext      string         `json:"plaintext"` // base64 plaintext bytes
+	IfMatch        *string        `json:"if_match"`  // ETag CAS; null = create
 	IdempotencyKey string         `json:"idempotency_key"`
 	ConflictPolicy string         `json:"conflict_policy,omitempty"` // auto_merge|reject|replace_remote
 	Metadata       map[string]any `json:"metadata,omitempty"`
@@ -115,18 +115,51 @@ type KeyRegisterResponse struct {
 }
 
 type AddBundleRequest struct {
-	KeyID         string `json:"key_id"`
+	KeyID          string `json:"key_id"`
+	Key            string `json:"key"`
+	CredentialID   string `json:"credential_id"`
+	KEKIV          string `json:"kek_iv"`
+	EncryptedKeys  string `json:"encrypted_keys"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type RemoveBundleRequest struct {
+	KeyID          string `json:"key_id"`
+	Key            string `json:"key"`
+	CredentialID   string `json:"credential_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// KeyCurrentRequest is an empty body POST; declared so the typed
+// decoder rejects unknown fields the way every other handler does.
+type KeyCurrentRequest struct{}
+
+type KeyCurrentBundle struct {
 	CredentialID  string `json:"credential_id"`
 	KEKIV         string `json:"kek_iv"`
 	EncryptedKeys string `json:"encrypted_keys"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+}
+
+// KeyCurrentResponse mirrors the webapp's KeyCurrentResponse: a
+// nullable KeyID plus a map of credential_id → bundle body. The
+// webapp normalizes a 404 from the enclave into the same shape with
+// KeyID=null at the SDK boundary, so we surface the missing-key
+// state as a 404 here.
+type KeyCurrentResponse struct {
+	KeyID      *string                     `json:"key_id"`
+	Bundles    map[string]KeyCurrentBundle `json:"bundles"`
+	CreatedVia string                      `json:"created_via,omitempty"`
+	CreatedAt  string                      `json:"created_at,omitempty"`
 }
 
 type MigrateRequest struct {
-	Scope  string         `json:"scope"`
-	IDs    []string       `json:"ids,omitempty"`
-	Limit  int            `json:"limit,omitempty"`
-	Keys   []PullKey      `json:"keys"`
-	Target MigrateTarget  `json:"target"`
+	Scope  string        `json:"scope"`
+	IDs    []string      `json:"ids,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+	Keys   []PullKey     `json:"keys"`
+	Target MigrateTarget `json:"target"`
 }
 
 type MigrateTarget struct {
