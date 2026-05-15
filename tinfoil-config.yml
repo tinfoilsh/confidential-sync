@@ -5,7 +5,7 @@ memory: 2048
 
 containers:
   - name: "sync-enclave"
-    image: "ghcr.io/tinfoilsh/confidential-sync:replace-on-release"
+    image: "ghcr.io/tinfoilsh/confidential-sync@sha256:8996e9728fe494c13835a6cce719a5810815c1ed493bffd34d3a9f16abcef8b0" # v0.0.1
 
 shim:
   listen-port: 443
