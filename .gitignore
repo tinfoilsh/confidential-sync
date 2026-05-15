@@ -4,6 +4,7 @@
 .env.local
 confidential-sync-enclave
 sync-enclave
+/local-stack
 ext.yml
 tuf-repo-cdn.sigstore.dev.json
 .gocache/
