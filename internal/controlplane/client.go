@@ -40,6 +40,8 @@ const (
 	HeaderIdempotency   = "X-Idempotency-Key"
 	HeaderOperationHash = "X-Operation-Hash"
 	HeaderMessageCount  = "X-Message-Count"
+	HeaderProjectID     = "X-Project-Id"
+	HeaderProjectIDSet  = "X-Project-Id-Set"
 	HeaderETag          = "ETag"
 	HeaderContentType   = "Content-Type"
 )
@@ -77,11 +79,14 @@ func (e *Error) Error() string {
 }
 
 // BlobMeta describes one row's controlplane-visible metadata. ETag is the
-// CAS token; KeyID is the row's last writer's KeyID.
+// CAS token; KeyID is the row's last writer's KeyID. ProjectID is a
+// chat-scope side-channel that lets clients observe cross-project moves
+// without decrypting the row.
 type BlobMeta struct {
 	ID        string    `json:"id"`
 	ETag      string    `json:"etag"`
 	KeyID     string    `json:"key_id"`
+	ProjectID *string   `json:"project_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Cursor    string    `json:"cursor,omitempty"`
 }
@@ -113,6 +118,12 @@ type PutBlobRequest struct {
 	// the controlplane can persist the legacy column. Nil for scopes
 	// other than chat and for rewrap.
 	MessageCount *int
+	// ProjectIDSet means "overwrite the controlplane's project_id
+	// column with ProjectID". When ProjectIDSet is false the column
+	// is left untouched. Nil ProjectID + ProjectIDSet=true clears
+	// the column. Only meaningful for chat scope.
+	ProjectIDSet bool
+	ProjectID    *string
 }
 
 type PutBlobResponse struct {
@@ -206,6 +217,12 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	}
 	if req.MessageCount != nil {
 		httpReq.Header.Set(HeaderMessageCount, strconv.Itoa(*req.MessageCount))
+	}
+	if req.ProjectIDSet {
+		httpReq.Header.Set(HeaderProjectIDSet, "1")
+		if req.ProjectID != nil {
+			httpReq.Header.Set(HeaderProjectID, *req.ProjectID)
+		}
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {

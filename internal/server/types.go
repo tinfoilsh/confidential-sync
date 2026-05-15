@@ -64,11 +64,12 @@ type ListStatusResponse struct {
 }
 
 type ListStatusUpdate struct {
-	ID        string `json:"id"`
-	ETag      string `json:"etag"`
-	KeyID     string `json:"key_id"`
-	UpdatedAt string `json:"updated_at"`
-	Cursor    string `json:"cursor,omitempty"`
+	ID        string  `json:"id"`
+	ETag      string  `json:"etag"`
+	KeyID     string  `json:"key_id"`
+	ProjectID *string `json:"project_id,omitempty"`
+	UpdatedAt string  `json:"updated_at"`
+	Cursor    string  `json:"cursor,omitempty"`
 }
 
 type ListStatusDelete struct {

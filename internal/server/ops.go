@@ -121,7 +121,10 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// controlplane is the authority on that column and could tamper
 	// with it post-write regardless. Mixing it in would only force
 	// retries to recompute the hash without changing the threat
-	// model.
+	// model. The same reasoning applies to projectId — it surfaces
+	// in list-status so cross-project moves propagate without
+	// decrypting the row.
+	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
@@ -132,6 +135,8 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		OperationHash:  opHash,
 		Ciphertext:     envBlob,
 		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
+		ProjectIDSet:   projectIDSet,
+		ProjectID:      projectID,
 	})
 	if err == nil {
 		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
@@ -233,6 +238,7 @@ func autoResolve(
 		return nil, err
 	}
 
+	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
@@ -243,6 +249,8 @@ func autoResolve(
 		OperationHash:  opHash,
 		Ciphertext:     envBlob,
 		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
+		ProjectIDSet:   projectIDSet,
+		ProjectID:      projectID,
 	})
 	if err != nil {
 		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
@@ -393,13 +401,18 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	}
 	out := &ListStatusResponse{NextCursor: resp.NextCursor}
 	for _, u := range resp.Updates {
-		out.Updates = append(out.Updates, ListStatusUpdate{
+		update := ListStatusUpdate{
 			ID:        u.ID,
 			ETag:      u.ETag,
 			KeyID:     u.KeyID,
 			UpdatedAt: u.UpdatedAt.UTC().Format(time.RFC3339Nano),
 			Cursor:    u.Cursor,
-		})
+		}
+		if u.ProjectID != nil {
+			pid := *u.ProjectID
+			update.ProjectID = &pid
+		}
+		out.Updates = append(out.Updates, update)
 	}
 	for _, d := range resp.Deletes {
 		out.Deletes = append(out.Deletes, ListStatusDelete{
@@ -917,6 +930,33 @@ func migrateOne(
 	})
 	_, err = deps.Controlplane.PutBlob(ctx, rewrapReq)
 	return err == nil
+}
+
+// projectIDFromMetadata pulls the optional `projectId` field out of
+// a chat push's metadata. Returns (false, nil) for non-chat scopes,
+// for chat pushes that don't mention projectId at all, and for
+// malformed values. A `projectId` set to nil or the empty string is
+// treated as an explicit clear (the row becomes unassigned).
+func projectIDFromMetadata(scope string, metadata map[string]any) (set bool, value *string) {
+	if scope != string(envelope.ScopeChat) {
+		return false, nil
+	}
+	raw, ok := metadata["projectId"]
+	if !ok {
+		return false, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			return true, nil
+		}
+		copy := v
+		return true, &copy
+	case nil:
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // messageCountFromMetadata pulls the optional `messageCount` field
