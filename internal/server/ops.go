@@ -397,7 +397,7 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 			ID:        u.ID,
 			ETag:      u.ETag,
 			KeyID:     u.KeyID,
-			UpdatedAt: u.UpdatedAt.Format("2006-01-02T15:04:05.000Z"),
+			UpdatedAt: u.UpdatedAt.UTC().Format(time.RFC3339Nano),
 			Cursor:    u.Cursor,
 		})
 	}
@@ -405,7 +405,7 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 		out.Deletes = append(out.Deletes, ListStatusDelete{
 			ID:        d.ID,
 			Scope:     d.Scope,
-			DeletedAt: d.DeletedAt.Format("2006-01-02T15:04:05.000Z"),
+			DeletedAt: d.DeletedAt.UTC().Format(time.RFC3339Nano),
 			Cursor:    d.Cursor,
 		})
 	}
@@ -439,24 +439,62 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	if req.IfMatch == nil || *req.IfMatch == "" {
-		return nil, badRequest("if_match is required for delete")
+	// If the caller passed a concrete ifMatch, run a single CAS-delete
+	// against that etag — a STALE_BLOB surfaces to the caller because
+	// they explicitly chose to race the etag they had.
+	if req.IfMatch != nil && *req.IfMatch != "" {
+		return deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
 	}
-	ifMatch := *req.IfMatch
 
+	// Otherwise the caller asked us to "just delete it" (`ifMatch=null`).
+	// Loop: fetch current etag, CAS-delete with it, retry on STALE_BLOB
+	// up to deleteMaxRetries times so a concurrent push from another
+	// tab can't strand the user's delete intent. The idempotency key
+	// is augmented with the retry counter so each attempt's cache row
+	// is independent — otherwise a replay of attempt 1 would echo
+	// "OK" even after attempt 2 actually deleted the row.
+	for attempt := 0; attempt < deleteMaxRetries; attempt++ {
+		blob, err := deps.Controlplane.GetBlob(ctx, req.Scope, req.ID, sess.RawJWT)
+		if err != nil {
+			var cpe *controlplane.Error
+			if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
+				return &OKResponse{OK: true}, nil
+			}
+			return nil, err
+		}
+		attemptReq := req
+		idem := req.IdempotencyKey
+		if attempt > 0 {
+			idem = fmt.Sprintf("%s:retry:%d", req.IdempotencyKey, attempt)
+		}
+		attemptReq.IdempotencyKey = idem
+		resp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
+		if err == nil {
+			return resp, nil
+		}
+		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
+			continue
+		}
+		return nil, err
+	}
+	return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "delete_exhausted_retries"}
+}
+
+const deleteMaxRetries = 3
+
+func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest, key []byte, kidHex, ifMatch string) (*OKResponse, error) {
 	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil)
 	if err != nil {
 		return nil, err
 	}
-	err = deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
+	if err := deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
 		JWT:            sess.RawJWT,
 		IfMatch:        ifMatch,
 		IdempotencyKey: req.IdempotencyKey,
 		OperationHash:  opHash,
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
 	return &OKResponse{OK: true}, nil
