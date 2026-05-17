@@ -158,6 +158,69 @@ func TestV2RoundTrip(t *testing.T) {
 	}
 }
 
+// TestV2EnvelopeIsGzippedBeforeEncrypt asserts that the v2 pipeline is
+// gzip-then-encrypt: AES-GCM-Open of the envelope ciphertext yields gzipped
+// bytes (gzip magic 0x1f 0x8b at offset 0), not the raw plaintext.
+// Compressing before encrypting is required because ciphertext is random and
+// cannot be compressed at any downstream layer.
+func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
+	k := newKey(t)
+	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
+	aadBytes, _ := CanonicalAAD(aad)
+	plaintext := bytes.Repeat([]byte("compress-me-"), 256)
+	blob, err := Encrypt(k.Bytes, plaintext, aadBytes, k.KeyIDHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env V2
+	if err := json.Unmarshal(blob, &env); err != nil {
+		t.Fatal(err)
+	}
+	iv, err := hex.DecodeString(env.IV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, err := base64.StdEncoding.DecodeString(env.CT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := cryptopkg.Open(k.Bytes, iv, ct, aadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inner) < 2 || inner[0] != 0x1f || inner[1] != 0x8b {
+		t.Fatalf("expected gzip header inside v2 ciphertext, got prefix %x", inner[:min(2, len(inner))])
+	}
+	if len(blob) >= len(plaintext) {
+		t.Logf("note: compressed blob (%d) is not smaller than plaintext (%d) — fine for tiny inputs", len(blob), len(plaintext))
+	}
+}
+
+func TestV2DecryptRejectsCorruptGzip(t *testing.T) {
+	k := newKey(t)
+	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
+	aadBytes, _ := CanonicalAAD(aad)
+	// Build a v2 envelope whose AES-GCM plaintext is NOT gzip (simulating an
+	// older v2-without-gzip blob produced before this change). The decrypt
+	// path must hard-fail per syncplan §X4.
+	nonce, ct, err := cryptopkg.Seal(k.Bytes, []byte(`{"hello":"world"}`), aadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := V2{
+		V:   int(VersionV2),
+		KID: k.KeyIDHex,
+		Alg: AlgAESGCM,
+		IV:  hex.EncodeToString(nonce),
+		CT:  base64.StdEncoding.EncodeToString(ct),
+	}
+	blob, _ := json.Marshal(env)
+	_, err = DecryptV2(blob, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+	if !errors.Is(err, ErrV2Malformed) {
+		t.Fatalf("expected ErrV2Malformed for non-gzip v2 payload, got %v", err)
+	}
+}
+
 func TestV2AADMismatchFails(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
@@ -195,12 +258,15 @@ func TestDetectAllFormats(t *testing.T) {
 		t.Fatalf("v0 detect failed")
 	}
 
-	var gzbuf bytes.Buffer
-	zw := gzip.NewWriter(&gzbuf)
-	zw.Write(bytes.Repeat([]byte{0}, cryptopkg.NonceSize+cryptopkg.TagSize))
-	zw.Close()
-	if Detect(gzbuf.Bytes()) != VersionV1 {
-		t.Fatalf("v1 detect failed")
+	// Production v1 wire format: random IV byte at offset 0 followed by
+	// AES-GCM ciphertext of gzipped JSON. Anything that is not JSON and
+	// is at least IV+TAG bytes long must register as v1.
+	v1 := make([]byte, cryptopkg.NonceSize+cryptopkg.TagSize+8)
+	for i := range v1 {
+		v1[i] = byte(i + 1)
+	}
+	if Detect(v1) != VersionV1 {
+		t.Fatalf("v1 detect (raw binary) failed")
 	}
 
 	v2 := []byte(`{"v":2,"kid":"` + strings.Repeat("a", 32) + `","alg":"AES-256-GCM","iv":"` + strings.Repeat("0", 24) + `","ct":""}`)
@@ -264,30 +330,126 @@ func TestDecryptLegacyV0HexIV(t *testing.T) {
 	}
 }
 
+// TestDecryptLegacyV1RoundTrip exercises the exact wire format the webapp's
+// `compressAndEncrypt` (src/utils/binary-codec.ts) produced for every v1
+// cloud blob in production: IV(12) || AES-GCM-ciphertext(gzip(JSON)). This is
+// the production-blob round-trip test required by syncplan.md §0 item 4.
 func TestDecryptLegacyV1RoundTrip(t *testing.T) {
 	k := newKey(t)
-	pt := []byte("legacy v1 plaintext")
-	nonce, ct, err := cryptopkg.Seal(k.Bytes, pt, nil)
+	payload := map[string]any{
+		"title":     "legacy v1 chat",
+		"createdAt": "2024-04-01T12:34:56.000Z",
+		"messages":  []any{"hello", "world"},
+	}
+	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	framed := append(nonce, ct...)
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	zw.Write(framed)
-	zw.Close()
-	res, err := DecryptLegacy(buf.Bytes(), []Key{k})
+	var gzbuf bytes.Buffer
+	zw := gzip.NewWriter(&gzbuf)
+	if _, err := zw.Write(jsonBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	nonce, ct, err := cryptopkg.Seal(k.Bytes, gzbuf.Bytes(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(res.Plaintext, pt) {
-		t.Fatalf("plaintext mismatch")
+	blob := append(nonce, ct...)
+	if Detect(blob) != VersionV1 {
+		t.Fatalf("Detect should classify IV||AES-GCM(gzip(JSON)) as v1")
+	}
+	res, err := DecryptLegacy(blob, []Key{k})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.Plaintext, jsonBytes) {
+		t.Fatalf("plaintext mismatch: got %s want %s", res.Plaintext, jsonBytes)
 	}
 	if res.Version != VersionV1 {
 		t.Fatalf("wrong version: %v", res.Version)
 	}
 	if !res.NeedsRewrap {
 		t.Fatalf("v1 must signal needs_rewrap")
+	}
+}
+
+// TestRewrapV1ProductionBlob round-trips a v1 blob through the full
+// decrypt → re-encrypt(v2) pipeline that the enclave's migrate handler
+// runs. This is the "captured production blob" guarantee from §0 item 4:
+// a v1 blob produced by exactly the bytes the webapp writes must decrypt,
+// re-seal under a current CEK with AAD, and decrypt again as v2.
+func TestRewrapV1ProductionBlob(t *testing.T) {
+	oldKey := newKey(t)
+	newKey := newKey(t)
+	chatID := "chat_prod_v1_blob"
+	clerkUserID := "user_prod_v1"
+
+	payload := map[string]any{
+		"title":      "prod v1 round trip",
+		"messages":   []any{"hello", "world"},
+		"isDeleted":  false,
+		"updatedAt":  "2024-05-15T10:00:00.000Z",
+	}
+	jsonBytes, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gzbuf bytes.Buffer
+	zw := gzip.NewWriter(&gzbuf)
+	if _, err := zw.Write(jsonBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	nonce, ct, err := cryptopkg.Seal(oldKey.Bytes, gzbuf.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Blob := append(nonce, ct...)
+
+	res, err := DecryptLegacy(v1Blob, []Key{oldKey})
+	if err != nil {
+		t.Fatalf("decrypt legacy v1: %v", err)
+	}
+	if !res.NeedsRewrap {
+		t.Fatalf("legacy v1 must signal needs_rewrap")
+	}
+
+	aad, err := CanonicalAAD(AAD{
+		KeyIDHex:    newKey.KeyIDHex,
+		Scope:       ScopeChat,
+		ID:          chatID,
+		ClerkUserID: clerkUserID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Blob, err := Encrypt(newKey.Bytes, res.Plaintext, aad, newKey.KeyIDHex)
+	if err != nil {
+		t.Fatalf("rewrap encrypt: %v", err)
+	}
+	if Detect(v2Blob) != VersionV2 {
+		t.Fatalf("rewrap output should be v2")
+	}
+
+	got, err := DecryptV2(v2Blob, []Key{newKey}, func(kid string) ([]byte, error) {
+		return CanonicalAAD(AAD{
+			KeyIDHex:    kid,
+			Scope:       ScopeChat,
+			ID:          chatID,
+			ClerkUserID: clerkUserID,
+		})
+	})
+	if err != nil {
+		t.Fatalf("decrypt v2: %v", err)
+	}
+	if !bytes.Equal(got.Plaintext, jsonBytes) {
+		t.Fatalf("rewrap plaintext mismatch")
 	}
 }
 
