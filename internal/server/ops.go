@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
@@ -18,6 +19,7 @@ import (
 // Deps bundles everything operations need from the surrounding process.
 type Deps struct {
 	Controlplane *controlplane.Client
+	Buckets      *buckets.Client
 	GitSHA       string
 }
 

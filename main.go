@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/server"
 )
@@ -55,7 +56,16 @@ func main() {
 		Timeout: 30 * time.Second,
 	})
 
-	deps := server.Deps{Controlplane: cpClient, GitSHA: gitSHA}
+	bucketsClient := buckets.NewClient(
+		os.Getenv("BUCKETS_URL"),
+		os.Getenv("BUCKETS_API_KEY"),
+		&http.Client{Timeout: 60 * time.Second},
+	)
+	if !bucketsClient.Configured() {
+		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / BUCKETS_API_KEY); attachment endpoints will return 503")
+	}
+
+	deps := server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: gitSHA}
 	handler := server.NewHandler(deps, verifier, stdLogger{})
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
