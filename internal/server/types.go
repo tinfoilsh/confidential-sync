@@ -32,7 +32,13 @@ type PullRequest struct {
 	All    bool      `json:"all,omitempty"`
 	Cursor string    `json:"cursor,omitempty"`
 	Limit  int       `json:"limit,omitempty"`
-	Keys   []PullKey `json:"keys"`
+	// Keys is the ordered list of candidate decryption keys. The
+	// first entry is treated as the caller's current primary CEK and
+	// is used as the rewrap target when the enclave finds a legacy
+	// v0/v1 row: re-sealing happens inline before the response is
+	// returned so the caller never has to issue a separate
+	// /v1/blobs/migrate call for routine pulls.
+	Keys []PullKey `json:"keys"`
 }
 
 type PullItem struct {
