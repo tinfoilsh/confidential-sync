@@ -327,15 +327,36 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 		return nil, badRequest("either ids[] or all=true is required")
 	}
 
+	// keys[0] is the caller's current primary CEK by convention
+	// (see cek-encoding.ts on the webapp). We use it as the rewrap
+	// target so legacy rows get promoted to v2 inline on first pull
+	// without the caller having to opt in. Deriving the key-id once
+	// keeps the per-item loop cheap.
+	targetKey := keys[0].Bytes
+	targetKIDBytes, err := cryptopkg.DeriveKeyID(targetKey)
+	if err != nil {
+		return nil, err
+	}
+	targetKIDHex := cryptopkg.KeyIDHex(targetKIDBytes)
+
 	out := &PullResponse{NextCursor: nextCursor}
 	for _, id := range ids {
-		item := pullOne(ctx, deps, sess, scope, id, keys)
+		item := pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex)
 		out.Items = append(out.Items, item)
 	}
 	return out, nil
 }
 
-func pullOne(ctx context.Context, deps Deps, sess Session, scope envelope.Scope, id string, keys []envelope.Key) PullItem {
+func pullOne(
+	ctx context.Context,
+	deps Deps,
+	sess Session,
+	scope envelope.Scope,
+	id string,
+	keys []envelope.Key,
+	targetKey []byte,
+	targetKIDHex string,
+) PullItem {
 	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT)
 	if err != nil {
 		var cpe *controlplane.Error
@@ -378,6 +399,20 @@ func pullOne(ctx context.Context, deps Deps, sess Session, scope envelope.Scope,
 			return PullItem{ID: id, OK: false, Code: CodeUnknownKey, Reason: "no_key_decrypted_legacy"}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
+		if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
+			return PullItem{
+				ID: id, OK: true,
+				Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
+				KeyID:       targetKIDHex,
+				ETag:        newETag,
+				NeedsRewrap: false,
+			}
+		}
+		// rewrap is best-effort: if the controlplane PUT loses a CAS
+		// race or the buckets-cascade trips, surface the legacy
+		// plaintext so the caller can still render the row. The
+		// /v1/blobs/migrate endpoint stays available for a backstop
+		// pass that retries failed rewraps.
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -453,6 +488,17 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		return nil, err
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
+
+	// Before we tell controlplane to drop the chat row, walk the
+	// plaintext and delete any v2 attachments from buckets. The
+	// controlplane cascade (DeleteChatAttachmentsByChat in the same
+	// transaction as SyncDeleteChatBlob) takes care of the
+	// chat_attachments index rows; this pass is what stops the
+	// buckets objects from leaking. Best-effort: failures here must
+	// not block the user's delete intent.
+	if scope == envelope.ScopeChat {
+		deleteChatAttachmentsBestEffort(ctx, deps, sess, req.ID, key)
+	}
 
 	// If the caller passed a concrete ifMatch, run a single CAS-delete
 	// against that etag — a STALE_BLOB surfaces to the caller because
@@ -889,49 +935,10 @@ func migrateOne(
 	}
 	defer cryptopkg.Zero(plaintext)
 
-	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
-		KeyIDHex:    targetKIDHex,
-		Scope:       scope,
-		ID:          id,
-		ClerkUserID: sess.Claims.Subject,
-	})
-	if err != nil {
+	if _, err := rewrapBlob(ctx, deps, sess, scope, id, plaintext, blob.ETag, targetKey, targetKIDHex); err != nil {
 		return false
 	}
-	envBlob, err := envelope.Encrypt(targetKey, plaintext, aadBytes, targetKIDHex)
-	if err != nil {
-		return false
-	}
-	idem := "migrate:" + targetKIDHex + ":" + id + ":" + blob.ETag
-	rewrapReq := controlplane.PutBlobRequest{
-		Scope:          string(scope),
-		ID:             id,
-		JWT:            sess.RawJWT,
-		KeyIDHex:       targetKIDHex,
-		IfMatch:        blob.ETag,
-		IdempotencyKey: idem,
-		Rewrap:         true,
-		Ciphertext:     envBlob,
-	}
-	rewrapBody, err := controlplane.RewrapBody(rewrapReq)
-	if err != nil {
-		return false
-	}
-	opKey, err := cryptopkg.DeriveOpHashKey(targetKey)
-	if err != nil {
-		return false
-	}
-	defer cryptopkg.Zero(opKey)
-	rewrapReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
-		Method:         http.MethodPost,
-		Path:           controlplane.RewrapPath,
-		KeyIDHex:       targetKIDHex,
-		IfMatch:        blob.ETag,
-		IdempotencyKey: idem,
-		Body:           rewrapBody,
-	})
-	_, err = deps.Controlplane.PutBlob(ctx, rewrapReq)
-	return err == nil
+	return true
 }
 
 // projectIDFromMetadata pulls the optional `projectId` field out of

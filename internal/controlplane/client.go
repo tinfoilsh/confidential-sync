@@ -708,6 +708,41 @@ func IsCode(err error, code string) bool {
 	return e.Code == code
 }
 
+// GetLegacyAttachment fetches the raw ciphertext for a v0/v1
+// attachment from controlplane's BYTEA-backed storage. Used by the
+// rewrap path to migrate attachments into buckets.tinfoil.sh: the
+// enclave reads the ciphertext, decrypts it with the per-attachment
+// key embedded in the chat JSON, re-uploads through buckets, and
+// then registers a v2 index row (which nulls the BYTEA column).
+// A 404 surfaces as ErrLegacyAttachmentNotFound so the caller can
+// treat already-migrated rows as a no-op.
+var ErrLegacyAttachmentNotFound = errors.New("controlplane: legacy attachment not found")
+
+func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) ([]byte, error) {
+	if attachmentID == "" {
+		return nil, fmt.Errorf("controlplane: attachment id is required")
+	}
+	endpoint := c.baseURL + "/api/storage/attachment/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, jwt)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrLegacyAttachmentNotFound
+	}
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, parseError(resp.StatusCode, raw)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 // RegisterAttachmentIndex records ownership of a v2 attachment with
 // controlplane. The ciphertext itself lives in buckets.tinfoil.sh
 // under a path the enclave derived from (CEK, attachmentID); the

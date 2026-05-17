@@ -22,6 +22,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
@@ -38,6 +39,7 @@ type fixture struct {
 	verifier   auth.Verifier
 	cp         *cpStub
 	cpClient   *controlplane.Client
+	bk         *bucketsStub
 	server     *httptest.Server
 	userKey    []byte
 	userKeyID  string
@@ -55,6 +57,8 @@ type cpStub struct {
 	registeredOps     map[string]bool
 	migrationFailures map[string]int
 	needsMigration    []cpNeedsMigration
+	legacyAttachments map[string][]byte // attachmentID → ciphertext (set by tests)
+	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
 	mux               *http.ServeMux
 	server            *httptest.Server
 	registerHandler   func(w http.ResponseWriter, r *http.Request)
@@ -127,6 +131,9 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("POST /api/keys/{kid}/bundles", s.handleAddBundle)
 	s.mux.HandleFunc("DELETE /api/keys/{kid}/bundles/{cid}", s.handleRemoveBundle)
 	s.mux.HandleFunc("GET /api/keys/current", s.handleCurrentKey)
+	// legacy attachment fetch + new attachment ownership index
+	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
+	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
 }
 
 func (s *cpStub) extractID(scope string, r *http.Request) string {
@@ -316,6 +323,47 @@ func (s *cpStub) handleRemoveBundle(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleLegacyAttachment mirrors GET /api/storage/attachment/{id}.
+// Tests plant ciphertext into s.legacyAttachments before triggering
+// a rewrap to simulate the v1 BYTEA storage the rewrap path drains.
+func (s *cpStub) handleLegacyAttachment(w http.ResponseWriter, r *http.Request) {
+	aid := r.PathValue("aid")
+	if s.legacyAttachments == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	body, ok := s.legacyAttachments[aid]
+	if !ok || len(body) == 0 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(body)
+}
+
+// handleRegisterAttachmentIndex mirrors POST /api/sync/attachment-index/{id}.
+// On a successful call the legacy row is logically deleted (we drop
+// the bytes) so subsequent legacy GETs return 404, matching real
+// controlplane behavior where UpsertChatAttachmentIndex sets data=NULL.
+func (s *cpStub) handleRegisterAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	aid := r.PathValue("aid")
+	var body struct {
+		ChatID string `json:"chat_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if s.attachmentIndex == nil {
+		s.attachmentIndex = map[string]string{}
+	}
+	s.attachmentIndex[aid] = body.ChatID
+	if s.legacyAttachments != nil {
+		delete(s.legacyAttachments, aid)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleRewrap mirrors the controlplane's /api/sync/rewrap endpoint:
 // JSON body in, replaces the blob ciphertext + key_id, bumps etag,
 // returns {ok, etag, key_id}. Mid-test rewrap CAS mismatches are
@@ -410,7 +458,10 @@ func newFixture(t *testing.T) *fixture {
 	cp := newCPStub(t)
 	cpClient := controlplane.NewClient(cp.server.URL, nil)
 
-	deps := Deps{Controlplane: cpClient, GitSHA: "test-sha"}
+	bk := newBucketsStub(t)
+	bkClient := buckets.NewClient(bk.server.URL, "test-api-key", nil)
+
+	deps := Deps{Controlplane: cpClient, Buckets: bkClient, GitSHA: "test-sha"}
 	handler := NewHandler(deps, v, nil)
 	srv := httptest.NewServer(handler.Routes())
 	t.Cleanup(srv.Close)
@@ -431,6 +482,7 @@ func newFixture(t *testing.T) *fixture {
 		verifier:   v,
 		cp:         cp,
 		cpClient:   cpClient,
+		bk:         bk,
 		server:     srv,
 		userKey:    rawKey,
 		userKeyID:  kidHex,
