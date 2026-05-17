@@ -831,7 +831,7 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 // profile predictable and avoids contention against a single user's
 // row set, which the controlplane indexes as one btree per scope.
 const (
-	MigrateAllBudget        = 4 * time.Minute
+	MigrateAllBudget        = 10 * time.Minute
 	migrateAllScopeMaxBatch = 200
 )
 
