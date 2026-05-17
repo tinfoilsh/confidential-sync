@@ -47,6 +47,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
 	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddleware(h.migrateAll))
 
+	mux.Handle("POST /v1/attachment/put", h.authMiddleware(h.attachmentPut))
+	mux.Handle("POST /v1/attachment/get", h.authMiddleware(h.attachmentGet))
+	mux.Handle("POST /v1/attachment/delete", h.authMiddleware(h.attachmentDelete))
+
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /health", h.health)
 
@@ -241,6 +245,48 @@ func (h *Handler) migrateAll(w http.ResponseWriter, r *http.Request, sess Sessio
 		return
 	}
 	resp, err := MigrateAll(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentPut(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req AttachmentPutRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentPut(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentGet(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req AttachmentGetRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentGet(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req AttachmentDeleteRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentDelete(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

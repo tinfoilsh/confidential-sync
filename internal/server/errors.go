@@ -27,6 +27,7 @@ const (
 	CodeBadRequest                = "BAD_REQUEST"
 	CodeNotFound                  = "NOT_FOUND"
 	CodeNetwork                   = "NETWORK"
+	CodeUpstream                  = "UPSTREAM"
 	CodeInternal                  = "INTERNAL"
 )
 

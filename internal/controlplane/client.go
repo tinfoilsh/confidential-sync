@@ -707,3 +707,42 @@ func IsCode(err error, code string) bool {
 	}
 	return e.Code == code
 }
+
+// RegisterAttachmentIndex records ownership of a v2 attachment with
+// controlplane. The ciphertext itself lives in buckets.tinfoil.sh
+// under a path the enclave derived from (CEK, attachmentID); the
+// controlplane only learns "this attachment id exists for this chat,
+// owned by this user, in v2 format." JWT is forwarded so the
+// controlplane resolves the user from claims, exactly like every
+// other sync route.
+func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID, chatID string) error {
+	if attachmentID == "" {
+		return fmt.Errorf("controlplane: attachment id is required")
+	}
+	if chatID == "" {
+		return fmt.Errorf("controlplane: chat id is required")
+	}
+	body, err := json.Marshal(struct {
+		ChatID string `json:"chat_id"`
+	}{ChatID: chatID})
+	if err != nil {
+		return fmt.Errorf("controlplane: marshal attachment index: %w", err)
+	}
+	endpoint := c.baseURL + "/api/sync/attachment-index/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return parseError(resp.StatusCode, raw)
+	}
+	return nil
+}
