@@ -51,6 +51,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.Handle("POST /v1/attachment/get", h.authMiddleware(h.attachmentGet))
 	mux.Handle("POST /v1/attachment/delete", h.authMiddleware(h.attachmentDelete))
 
+	mux.Handle("POST /v1/share/seal", h.authMiddleware(h.shareSeal))
+	// /v1/share/open is intentionally unauthenticated. Knowing the
+	// share key in the URL fragment is the access proof — the same
+	// trust model the legacy in-browser share path uses today.
+	mux.HandleFunc("POST /v1/share/open", h.shareOpen)
+
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /health", h.health)
 
@@ -287,6 +293,35 @@ func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess 
 		return
 	}
 	resp, err := AttachmentDelete(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) shareSeal(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ShareSealRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := ShareSeal(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) shareOpen(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
+	var req ShareOpenRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := ShareOpen(r.Context(), h.deps, req)
 	if err != nil {
 		writeError(w, err)
 		return
