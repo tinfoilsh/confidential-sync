@@ -1,0 +1,106 @@
+package server
+
+import (
+	"context"
+	"encoding/base64"
+	"strings"
+	"testing"
+)
+
+func TestShareSealOpenRoundTrip(t *testing.T) {
+	plaintext := []byte("hello, this is a shared chat with some content")
+
+	sealResp, err := ShareSeal(context.Background(), Deps{}, Session{}, ShareSealRequest{
+		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
+	})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if !sealResp.OK {
+		t.Fatal("expected OK")
+	}
+	if len(sealResp.ShareKey) != shareKeySize*2 {
+		t.Fatalf("share key should be %d hex chars, got %d", shareKeySize*2, len(sealResp.ShareKey))
+	}
+
+	openResp, err := ShareOpen(context.Background(), Deps{}, ShareOpenRequest{
+		ShareKey:   sealResp.ShareKey,
+		Ciphertext: sealResp.Ciphertext,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	got, err := base64.StdEncoding.DecodeString(openResp.Plaintext)
+	if err != nil {
+		t.Fatalf("decode plaintext: %v", err)
+	}
+	if string(got) != string(plaintext) {
+		t.Fatalf("round-trip mismatch: got %q, want %q", got, plaintext)
+	}
+}
+
+func TestShareOpenRejectsWrongKey(t *testing.T) {
+	sealResp, err := ShareSeal(context.Background(), Deps{}, Session{}, ShareSealRequest{
+		Plaintext: base64.StdEncoding.EncodeToString([]byte("x")),
+	})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// Flip one nibble in the share key.
+	bad := []byte(sealResp.ShareKey)
+	if bad[0] == 'a' {
+		bad[0] = 'b'
+	} else {
+		bad[0] = 'a'
+	}
+	_, err = ShareOpen(context.Background(), Deps{}, ShareOpenRequest{
+		ShareKey:   string(bad),
+		Ciphertext: sealResp.Ciphertext,
+	})
+	if err == nil {
+		t.Fatal("expected open with wrong key to fail")
+	}
+	if appErr, ok := err.(*AppError); !ok || !strings.Contains(appErr.Message, "share decrypt failed") {
+		t.Fatalf("unexpected error: %T %v", err, err)
+	}
+}
+
+func TestShareOpenRejectsTamperedCiphertext(t *testing.T) {
+	sealResp, err := ShareSeal(context.Background(), Deps{}, Session{}, ShareSealRequest{
+		Plaintext: base64.StdEncoding.EncodeToString([]byte("payload to tamper with")),
+	})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	raw[len(raw)-1] ^= 0x01
+	tampered := base64.StdEncoding.EncodeToString(raw)
+	_, err = ShareOpen(context.Background(), Deps{}, ShareOpenRequest{
+		ShareKey:   sealResp.ShareKey,
+		Ciphertext: tampered,
+	})
+	if err == nil {
+		t.Fatal("expected tampered ciphertext to fail")
+	}
+}
+
+func TestShareSealGzipsPlaintext(t *testing.T) {
+	// Build a highly compressible input so we can be confident gzip
+	// is in the pipeline: a 2 KiB string of one repeating byte.
+	plaintext := make([]byte, 2048)
+	for i := range plaintext {
+		plaintext[i] = 'A'
+	}
+	sealResp, err := ShareSeal(context.Background(), Deps{}, Session{}, ShareSealRequest{
+		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
+	})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	// AES-GCM overhead is 12 (IV) + 16 (tag) = 28 bytes; if the
+	// inner stream were not compressed we'd see at least 2048+28.
+	if len(raw) > 256 {
+		t.Fatalf("expected gzip to compress a highly-redundant payload; got %d bytes", len(raw))
+	}
+}
