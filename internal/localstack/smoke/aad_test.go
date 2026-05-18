@@ -28,7 +28,7 @@ func TestT03_AADBindsScope(t *testing.T) {
 	f := newFixture(t)
 
 	plaintext := []byte(`{"secret":"chat-only"}`)
-	if status, resp := f.push("chat", "X1", plaintext, nil, "T03-push", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "X1", plaintext, nil, "T03-push"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("push failed: status=%d body=%s", status, resp.Raw)
 	}
 
@@ -79,7 +79,7 @@ func TestT04_AADBindsUserSub(t *testing.T) {
 
 	// User A (default fixture user) pushes a chat.
 	plaintext := []byte(`{"secret":"user-A-only"}`)
-	if status, resp := f.push("chat", "X2", plaintext, nil, "T04-push", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "X2", plaintext, nil, "T04-push"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("user A push failed: status=%d body=%s", status, resp.Raw)
 	}
 
@@ -134,10 +134,10 @@ func TestT05_AADBindsID(t *testing.T) {
 	// Push two different chats with distinguishable plaintexts.
 	plaintextX := []byte(`{"secret":"X-only"}`)
 	plaintextY := []byte(`{"secret":"Y-only"}`)
-	if status, _ := f.push("chat", "X3", plaintextX, nil, "T05-pushX", ""); status != http.StatusOK {
+	if status, _ := f.push("chat", "X3", plaintextX, nil, "T05-pushX"); status != http.StatusOK {
 		t.Fatalf("push X failed: %d", status)
 	}
-	if status, _ := f.push("chat", "Y3", plaintextY, nil, "T05-pushY", ""); status != http.StatusOK {
+	if status, _ := f.push("chat", "Y3", plaintextY, nil, "T05-pushY"); status != http.StatusOK {
 		t.Fatalf("push Y failed: %d", status)
 	}
 

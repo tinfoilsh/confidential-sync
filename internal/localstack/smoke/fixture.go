@@ -137,8 +137,10 @@ func (f *fixture) registerKey(idem, createdVia string) (int, []byte, error) {
 // push wraps POST /v1/sync/push with the fixture's CEK + jwt.
 // `plaintext` is the raw plaintext bytes; we base64 them on the wire.
 // `ifMatch` is the literal CAS token: pass nil for create, &"3" for
-// update with explicit etag, &"*" is not legal here.
-func (f *fixture) push(scope, id string, plaintext []byte, ifMatch *string, idem string, conflictPolicy string) (int, pushResponse) {
+// update with explicit etag, &"*" is not legal here. The enclave no
+// longer accepts a conflict policy — every stale-etag push surfaces
+// 409 SYNC_CONFLICT; resolution is a client-UI decision.
+func (f *fixture) push(scope, id string, plaintext []byte, ifMatch *string, idem string) (int, pushResponse) {
 	f.t.Helper()
 	payload := map[string]any{
 		"scope":           scope,
@@ -147,9 +149,6 @@ func (f *fixture) push(scope, id string, plaintext []byte, ifMatch *string, idem
 		"plaintext":       base64.StdEncoding.EncodeToString(plaintext),
 		"if_match":        ifMatch,
 		"idempotency_key": idem,
-	}
-	if conflictPolicy != "" {
-		payload["conflict_policy"] = conflictPolicy
 	}
 	status, body := f.post("/v1/sync/push", payload)
 	var resp pushResponse

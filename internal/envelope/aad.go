@@ -15,6 +15,15 @@ const (
 	BundleAADDomain = "tinfoil-key-bundle-v2"
 	EnvelopeVersion = 2
 	AlgAESGCM       = "AES-256-GCM"
+
+	// ProfileSingletonID is the canonical AAD `id` for a user's
+	// profile row. The controlplane keys profile blobs by
+	// clerk_user_id alone (no `:id` path segment on the wire), but
+	// the AAD layer requires an explicit id so the crypto contract
+	// is uniform across scopes. Callers writing/reading profile
+	// blobs MUST pass this value — the AAD builder no longer
+	// substitutes it silently.
+	ProfileSingletonID = "profile"
 )
 
 type Scope string
@@ -60,11 +69,7 @@ func CanonicalAAD(a AAD) ([]byte, error) {
 	if a.ClerkUserID == "" {
 		return nil, ErrAADInvalid
 	}
-	if a.Scope == ScopeProfile {
-		if a.ID == "" {
-			a.ID = "profile"
-		}
-	} else if a.ID == "" {
+	if a.ID == "" {
 		return nil, ErrAADInvalid
 	}
 

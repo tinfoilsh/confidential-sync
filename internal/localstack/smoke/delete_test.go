@@ -39,7 +39,7 @@ func TestT08_DeleteNullIfMatchRetriesOnRace(t *testing.T) {
 	f := newFixture(t)
 
 	// Push the row at etag=1.
-	if status, resp := f.push("chat", "D1", []byte(`{"v":"orig"}`), nil, "T08-init", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "D1", []byte(`{"v":"orig"}`), nil, "T08-init"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("init push failed: status=%d body=%s", status, resp.Raw)
 	}
 
@@ -55,7 +55,7 @@ func TestT08_DeleteNullIfMatchRetriesOnRace(t *testing.T) {
 	f.stack.CP.OnFirstDelete("chat", "D1", func() {
 		defer hookFired.Done()
 		etag1 := "1"
-		if status, resp := f.push("chat", "D1", []byte(`{"v":"raced"}`), &etag1, "T08-race", ""); status != http.StatusOK || !resp.OK {
+		if status, resp := f.push("chat", "D1", []byte(`{"v":"raced"}`), &etag1, "T08-race"); status != http.StatusOK || !resp.OK {
 			t.Errorf("racing push failed: status=%d body=%s", status, resp.Raw)
 		}
 	})

@@ -32,7 +32,7 @@ func TestT01_CiphertextHidesPlaintext(t *testing.T) {
 	needle := []byte("MARKER_d3a8f1c92b704e6c8a55_NEEDLE")
 	plaintext := []byte(`{"id":"chat_1","title":"hi","body":"` + string(needle) + `"}`)
 
-	if status, resp := f.push("chat", "chat_1", plaintext, nil, "T01-push", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "chat_1", plaintext, nil, "T01-push"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("push failed: status=%d body=%s", status, resp.Raw)
 	}
 
@@ -71,7 +71,7 @@ func TestT02_TamperedCiphertextRejected(t *testing.T) {
 	f := newFixture(t)
 
 	plaintext := []byte(`{"id":"chat_2","title":"original"}`)
-	if status, resp := f.push("chat", "chat_2", plaintext, nil, "T02-push", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "chat_2", plaintext, nil, "T02-push"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("push failed: status=%d body=%s", status, resp.Raw)
 	}
 

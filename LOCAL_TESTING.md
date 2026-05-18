@@ -26,7 +26,7 @@ and a helper that wires the real enclave handler against them.
 
 ## Layer 1 — Unit tests (`go test ./...`)
 
-The standard Go test suite under `internal/{auth,controlplane,crypto,envelope,resolver,server}`.
+The standard Go test suite under `internal/{auth,controlplane,crypto,envelope,server}`.
 Roughly 17 packages worth of in-memory tests covering AEAD primitives,
 envelope canonicalisation, AAD construction, JWT verification, op-hash
 binding, etc. These are the first line of defence; they run in ~1.5s
@@ -52,9 +52,9 @@ Every test is shaped around three questions:
    test fail?
 
 If a test cannot answer all three crisply, it is theatre and gets
-deleted. The smoke suite is intentionally small (14 tests) for this
+deleted. The smoke suite is intentionally small (13 tests) for this
 reason — adding more requires identifying a fresh invariant that
-isn't already exercised by either the unit tests or one of the 14.
+isn't already exercised by either the unit tests or one of the 13.
 
 ### Test inventory
 
@@ -65,8 +65,7 @@ isn't already exercised by either the unit tests or one of the 14.
 | T03 | AADBindsScope                       | AAD includes scope; cross-scope blob → fail       | DB write: move chat blob into project slot                   |
 | T04 | AADBindsUserSub                     | AAD includes clerk_user_id from verified JWT      | User B steals user A's CEK + presents own JWT                |
 | T05 | AADBindsID                          | AAD includes id; cross-id swap → fail             | DB write: overwrite blob Y with blob X's bytes               |
-| T06 | CASPreventsConcurrentOverwrite      | Stale if_match + reject → STALE_BLOB, no overwrite | Two tabs racing a chat update                                |
-| T07 | ReplaceRemoteOverwrites             | replace_remote intentionally overwrites           | "I know what I'm doing" path is not silently degraded         |
+| T06 | CASPreventsConcurrentOverwrite      | Stale if_match → 409 SYNC_CONFLICT, no overwrite  | Two tabs racing a chat update                                |
 | T08 | DeleteNullIfMatchRetriesOnRace      | §16.6 retry loop absorbs a concurrent push        | One-shot push lands between enclave's GET and DELETE         |
 | T09 | AuthMissingBearerRejected           | Auth middleware mandatory on /v1/sync             | Route wired without authMiddleware                           |
 | T10 | AuthExpiredJWTRejected              | exp claim enforced                                | Stolen-but-expired token                                     |
@@ -80,7 +79,7 @@ The mapping back to source files is one-to-one:
 ```
 smoke/crypto_test.go   T01 T02
 smoke/aad_test.go      T03 T04 T05
-smoke/cas_test.go      T06 T07
+smoke/cas_test.go      T06
 smoke/delete_test.go   T08
 smoke/auth_test.go     T09 T10 T11
 smoke/legacy_test.go   T12 T13

@@ -14,7 +14,6 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
-	"github.com/tinfoilsh/confidential-sync-enclave/internal/resolver"
 )
 
 // Deps bundles everything operations need from the surrounding process.
@@ -32,10 +31,6 @@ type Session struct {
 }
 
 const (
-	conflictPolicyAutoMerge     = "auto_merge"
-	conflictPolicyReject        = "reject"
-	conflictPolicyReplaceRemote = "replace_remote"
-
 	// createIfMatchSentinel is the wire value the controlplane uses
 	// to mean "create-only" when a caller doesn't have an etag yet.
 	// Must match controlplane/handlers/sync_blob_handler.go
@@ -44,29 +39,21 @@ const (
 )
 
 // Push encrypts plaintext into a v2 envelope and uploads it to the
-// controlplane with idempotent CAS semantics. On 412 STALE_BLOB it can
-// optionally invoke the per-scope resolver and retry once.
+// controlplane with idempotent CAS semantics. On 412 STALE_BLOB the
+// enclave surfaces 409 SYNC_CONFLICT with the controlplane's
+// current_etag; conflict resolution is a client-UI decision (keep
+// local, keep remote, or discard local edits). The enclave never
+// merges, never silently overwrites.
 func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushResponse, error) {
 	scope := envelope.Scope(req.Scope)
 	if !scope.Valid() {
 		return nil, badRequest("invalid scope")
 	}
-	if scope != envelope.ScopeProfile && req.ID == "" {
-		return nil, badRequest("id is required for scope " + req.Scope)
-	}
-	if scope == envelope.ScopeProfile && req.ID == "" {
-		req.ID = "profile"
+	if req.ID == "" {
+		return nil, badRequest("id is required")
 	}
 	if req.IdempotencyKey == "" {
 		return nil, badRequest("idempotency_key is required")
-	}
-	if req.ConflictPolicy == "" {
-		req.ConflictPolicy = conflictPolicyAutoMerge
-	}
-	switch req.ConflictPolicy {
-	case conflictPolicyAutoMerge, conflictPolicyReject, conflictPolicyReplaceRemote:
-	default:
-		return nil, badRequest("invalid conflict_policy")
 	}
 
 	key, err := decodeKey(req.Key)
@@ -146,127 +133,20 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
 	}
 
-	if controlplane.IsCode(err, controlplane.StatusStaleBlob) && req.ConflictPolicy != conflictPolicyReject {
-		merged, mergedErr := autoResolve(ctx, deps, sess, req, key, plaintext, aadBytes)
-		if mergedErr != nil {
-			return nil, mergedErr
+	if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
+		var cpe *controlplane.Error
+		currentETag := ""
+		if errors.As(err, &cpe) {
+			currentETag = cpe.CurrentETag
 		}
-		return merged, nil
+		return nil, &AppError{
+			Status:      http.StatusConflict,
+			Code:        CodeSyncConflict,
+			Reason:      "stale_blob",
+			CurrentETag: currentETag,
+		}
 	}
 	return nil, err
-}
-
-func autoResolve(
-	ctx context.Context,
-	deps Deps,
-	sess Session,
-	req PushRequest,
-	key, plaintext, _ []byte,
-) (*PushResponse, error) {
-	remote, err := deps.Controlplane.GetBlob(ctx, req.Scope, req.ID, sess.RawJWT)
-	if err != nil {
-		return nil, err
-	}
-	remoteKey := envelope.Key{Bytes: key, KeyIDHex: ""}
-	kidBytes, _ := cryptopkg.DeriveKeyID(key)
-	remoteKey.KeyIDHex = cryptopkg.KeyIDHex(kidBytes)
-
-	var remotePT []byte
-	switch envelope.Detect(remote.Ciphertext) {
-	case envelope.VersionV2:
-		dec, err := envelope.DecryptV2(remote.Ciphertext, []envelope.Key{remoteKey}, func(kid string) ([]byte, error) {
-			return envelope.CanonicalAAD(envelope.AAD{
-				KeyIDHex:    kid,
-				Scope:       envelope.Scope(req.Scope),
-				ID:          req.ID,
-				ClerkUserID: sess.Claims.Subject,
-			})
-		})
-		if err != nil {
-			return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "remote_envelope_decrypt_failed"}
-		}
-		remotePT = dec.Plaintext
-		defer cryptopkg.Zero(remotePT)
-	case envelope.VersionV0, envelope.VersionV1:
-		dec, err := envelope.DecryptLegacy(remote.Ciphertext, []envelope.Key{remoteKey})
-		if err != nil {
-			return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "remote_legacy_decrypt_failed"}
-		}
-		remotePT = dec.Plaintext
-		defer cryptopkg.Zero(remotePT)
-	default:
-		return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "remote_unknown_format"}
-	}
-
-	var mergedPT []byte
-	if req.ConflictPolicy == conflictPolicyReplaceRemote {
-		mergedPT = plaintext
-	} else {
-		r, err := resolver.For(req.Scope)
-		if err != nil {
-			return nil, err
-		}
-		out, err := r.Merge(plaintext, remotePT)
-		if err != nil {
-			return nil, err
-		}
-		mergedPT = out.Plaintext
-		defer cryptopkg.Zero(mergedPT)
-	}
-
-	kidHex := remoteKey.KeyIDHex
-	metaHash, _ := envelope.MetadataHash(req.Metadata)
-	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
-		KeyIDHex:    kidHex,
-		Scope:       envelope.Scope(req.Scope),
-		ID:          req.ID,
-		ClerkUserID: sess.Claims.Subject,
-	})
-	if err != nil {
-		return nil, err
-	}
-	envBlob, err := envelope.Encrypt(key, mergedPT, aadBytes, kidHex)
-	if err != nil {
-		return nil, err
-	}
-	retryReq := req
-	newIfMatch := remote.ETag
-	if newIfMatch == "" {
-		newIfMatch = createIfMatchSentinel
-	}
-	retryReq.IfMatch = &newIfMatch
-	retryReq.IdempotencyKey = req.IdempotencyKey + ":resolved"
-	_ = metaHash
-	hashBody, err := stableBlobOperationBody(req.Scope, req.ID, mergedPT, req.Metadata)
-	if err != nil {
-		return nil, err
-	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, newIfMatch, retryReq.IdempotencyKey, hashBody)
-	if err != nil {
-		return nil, err
-	}
-
-	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
-	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
-		Scope:          req.Scope,
-		ID:             req.ID,
-		JWT:            sess.RawJWT,
-		KeyIDHex:       kidHex,
-		IfMatch:        newIfMatch,
-		IdempotencyKey: retryReq.IdempotencyKey,
-		OperationHash:  opHash,
-		Ciphertext:     envBlob,
-		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
-		ProjectIDSet:   projectIDSet,
-		ProjectID:      projectID,
-	})
-	if err != nil {
-		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
-			return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "rerace_after_resolve"}
-		}
-		return nil, err
-	}
-	return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
 }
 
 // operationHashForBlob derives X-Operation-Hash for a blob mutation
@@ -492,9 +372,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	if req.IdempotencyKey == "" {
 		return nil, badRequest("idempotency_key is required")
 	}
-	if scope == envelope.ScopeProfile && req.ID == "" {
-		req.ID = "profile"
-	}
 	if req.ID == "" {
 		return nil, badRequest("id is required")
 	}
@@ -686,6 +563,13 @@ func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleReques
 		return nil, badRequest("invalid key: " + err.Error())
 	}
 	defer cryptopkg.Zero(key)
+	kidBytes, err := cryptopkg.DeriveKeyID(key)
+	if err != nil {
+		return nil, err
+	}
+	if kidHex := cryptopkg.KeyIDHex(kidBytes); kidHex != req.KeyID {
+		return nil, badRequest("key does not match key_id")
+	}
 	opHash, err := operationHashForKey(key, http.MethodPost, controlplane.AddBundlePath(req.KeyID), req.KeyID, req.IdempotencyKey, body)
 	if err != nil {
 		return nil, err
@@ -719,6 +603,13 @@ func RemoveBundle(ctx context.Context, deps Deps, sess Session, req RemoveBundle
 		return nil, badRequest("invalid key: " + err.Error())
 	}
 	defer cryptopkg.Zero(key)
+	kidBytes, err := cryptopkg.DeriveKeyID(key)
+	if err != nil {
+		return nil, err
+	}
+	if kidHex := cryptopkg.KeyIDHex(kidBytes); kidHex != req.KeyID {
+		return nil, badRequest("key does not match key_id")
+	}
 	opHash, err := operationHashForKey(key, http.MethodDelete, controlplane.RemoveBundlePath(req.KeyID, req.CredentialID), req.KeyID, req.IdempotencyKey, nil)
 	if err != nil {
 		return nil, err
