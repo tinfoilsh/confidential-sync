@@ -101,8 +101,10 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 // TestPullRewrapsAttachmentCascade exercises the lazy attachment
 // migration: a v1 chat whose plaintext references a legacy attachment
 // (with an embedded `encryptionKey`) should, after pull, produce a
-// buckets entry under the CEK-derived token AND a v2 chat envelope
-// whose plaintext no longer carries the encryption key.
+// buckets entry under the attachment id (with the per-attachment key
+// as the buckets slot key) AND a v2 chat envelope whose plaintext
+// still carries the same `encryptionKey` value so the webapp can use
+// it as the buckets slot key on future fetches.
 func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
@@ -201,8 +203,12 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	msg := newChat["messages"].([]any)[0].(map[string]any)
 	att := msg["attachments"].([]any)[0].(map[string]any)
-	if _, has := att["encryptionKey"]; has {
-		t.Fatalf("encryptionKey was not stripped after cascade: %#v", att)
+	gotKey, has := att["encryptionKey"].(string)
+	if !has {
+		t.Fatalf("encryptionKey must be preserved post-cascade: %#v", att)
+	}
+	if gotKey != base64.StdEncoding.EncodeToString(attKey) {
+		t.Fatalf("encryptionKey changed post-cascade: %q", gotKey)
 	}
 }
 
@@ -250,9 +256,10 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	f.cp.blobs["chat/c2"] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: v2blob}
 	f.cp.mu.Unlock()
 
-	// Pre-seed the buckets entry the cascade should remove. With
-	// the v2 attachment model the path is just the attachment id
-	// and the slot key is the published sentinel.
+	// Pre-seed the buckets entry the cascade should remove. The
+	// real put/get path uses a per-attachment key as the slot key,
+	// but Delete needs only the access token, so any slot key
+	// works for this fixture.
 	f.bk.mu.Lock()
 	f.bk.items[attID] = bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}}
 	f.bk.mu.Unlock()

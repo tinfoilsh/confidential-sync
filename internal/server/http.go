@@ -49,6 +49,12 @@ func (h *Handler) Routes() http.Handler {
 
 	mux.Handle("POST /v1/attachment/put", h.authMiddleware(h.attachmentPut))
 	mux.Handle("POST /v1/attachment/get", h.authMiddleware(h.attachmentGet))
+	// /v1/attachment/get-public is intentionally unauthenticated.
+	// Knowing the attachment id + per-attachment key is the access
+	// proof — the same trust model the legacy public attachment
+	// endpoint uses, and the only way share recipients can read v2
+	// attachments without holding the owner's JWT.
+	mux.HandleFunc("POST /v1/attachment/get-public", h.attachmentGetPublic)
 	mux.Handle("POST /v1/attachment/delete", h.authMiddleware(h.attachmentDelete))
 
 	mux.Handle("POST /v1/share/seal", h.authMiddleware(h.shareSeal))
@@ -276,13 +282,28 @@ func (h *Handler) attachmentPut(w http.ResponseWriter, r *http.Request, sess Ses
 	encode(w, http.StatusOK, resp)
 }
 
-func (h *Handler) attachmentGet(w http.ResponseWriter, r *http.Request, sess Session) {
+func (h *Handler) attachmentGet(w http.ResponseWriter, r *http.Request, _ Session) {
 	var req AttachmentGetRequest
 	if err := decode(r, &req); err != nil {
 		writeError(w, err)
 		return
 	}
-	resp, err := AttachmentGet(r.Context(), h.deps, sess, req)
+	resp, err := AttachmentGet(r.Context(), h.deps, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentGetPublic(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
+	var req AttachmentGetRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentGet(r.Context(), h.deps, req)
 	if err != nil {
 		writeError(w, err)
 		return
