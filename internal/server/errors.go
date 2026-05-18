@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
-	"github.com/tinfoilsh/confidential-sync-enclave/internal/resolver"
 )
 
 // Application error codes returned in JSON envelopes. These match the
@@ -97,13 +96,6 @@ func translate(err error) *AppError {
 			Message:      cpe.Message,
 			CurrentKeyID: cpe.CurrentKeyID,
 			CurrentETag:  cpe.CurrentETag,
-		}
-	}
-	if resolver.IsConflict(err) {
-		return &AppError{
-			Status: http.StatusConflict,
-			Code:   CodeSyncConflict,
-			Reason: resolver.ConflictReason(err),
 		}
 	}
 	return &AppError{

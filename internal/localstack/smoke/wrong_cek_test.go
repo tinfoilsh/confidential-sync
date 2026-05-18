@@ -36,7 +36,7 @@ func TestT14_PullWrongCEKReturnsOKFalseNoPlaintext(t *testing.T) {
 	f := newFixture(t)
 
 	plaintext := []byte(`{"secret":"sealed under fixture CEK"}`)
-	if status, resp := f.push("chat", "W1", plaintext, nil, "T14-push", ""); status != http.StatusOK || !resp.OK {
+	if status, resp := f.push("chat", "W1", plaintext, nil, "T14-push"); status != http.StatusOK || !resp.OK {
 		t.Fatalf("push failed: status=%d body=%s", status, resp.Raw)
 	}
 

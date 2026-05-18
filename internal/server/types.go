@@ -11,7 +11,6 @@ type PushRequest struct {
 	Plaintext      string         `json:"plaintext"` // base64 plaintext bytes
 	IfMatch        *string        `json:"if_match"`  // ETag CAS; null = create
 	IdempotencyKey string         `json:"idempotency_key"`
-	ConflictPolicy string         `json:"conflict_policy,omitempty"` // auto_merge|reject|replace_remote
 	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 

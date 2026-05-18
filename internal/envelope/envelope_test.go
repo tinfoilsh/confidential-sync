@@ -62,6 +62,9 @@ func TestCanonicalAADRejectsInvalid(t *testing.T) {
 		{Scope: "chat", KeyIDHex: "tooShort", ID: "x", ClerkUserID: "u"},
 		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: ""},
 		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
+		{Scope: "profile", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
+		{Scope: "project", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
+		{Scope: "project_document", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
 		{Scope: "bogus", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: "u"},
 		{Scope: "chat", KeyIDHex: strings.Repeat("A", 32), ID: "x", ClerkUserID: "u"},
 	}
@@ -72,18 +75,28 @@ func TestCanonicalAADRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestCanonicalAADProfileDefaultID(t *testing.T) {
+func TestCanonicalAADRequiresExplicitProfileID(t *testing.T) {
 	a := AAD{
 		KeyIDHex:    strings.Repeat("c", 32),
 		Scope:       ScopeProfile,
+		ID:          ProfileSingletonID,
 		ClerkUserID: "u",
 	}
 	out, err := CanonicalAAD(a)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("explicit profile id should succeed: %v", err)
 	}
 	if !strings.Contains(string(out), `"id":"profile"`) {
-		t.Fatalf("profile ID default missing: %s", out)
+		t.Fatalf("profile ID not present: %s", out)
+	}
+
+	missing := AAD{
+		KeyIDHex:    strings.Repeat("c", 32),
+		Scope:       ScopeProfile,
+		ClerkUserID: "u",
+	}
+	if _, err := CanonicalAAD(missing); err == nil {
+		t.Fatal("profile AAD without explicit id must fail")
 	}
 }
 

@@ -633,78 +633,12 @@ func TestInvalidScope(t *testing.T) {
 	}
 }
 
-func TestStaleBlobAutoMerge(t *testing.T) {
-	f := newFixture(t)
-	tok := f.jwt()
-
-	// Initial push.
-	v1 := []byte(`{"id":"c","title":"t","messages":[{"role":"user","content":"a","timestamp":"2026-05-01T00:00:00Z"}]}`)
-	resp, _ := f.post("/v1/sync/push", PushRequest{
-		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext:      base64.StdEncoding.EncodeToString(v1),
-		IdempotencyKey: "init",
-	}, tok)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("init push: %d", resp.StatusCode)
-	}
-	var first PushResponse
-	pullResp1, body := f.post("/v1/sync/pull", PullRequest{
-		Scope: "chat", IDs: []string{"c"}, Keys: []PullKey{{Key: f.userKeyB64}},
-	}, tok)
-	_ = pullResp1
-	var firstPull PullResponse
-	json.Unmarshal(body, &firstPull)
-	first.ETag = firstPull.Items[0].ETag
-
-	// Another device pushes a different update (no If-Match) — succeeds.
-	other := []byte(`{"id":"c","title":"t","messages":[
-		{"role":"user","content":"a","timestamp":"2026-05-01T00:00:00Z"},
-		{"role":"assistant","content":"remote","timestamp":"2026-05-01T00:00:01Z"}
-	]}`)
-	resp2, body2 := f.post("/v1/sync/push", PushRequest{
-		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext:      base64.StdEncoding.EncodeToString(other),
-		IdempotencyKey: "remote-1",
-	}, tok)
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("remote push: %d %s", resp2.StatusCode, body2)
-	}
-
-	// First device, still on the old ETag, pushes its own update with if_match.
-	local := []byte(`{"id":"c","title":"t","messages":[
-		{"role":"user","content":"a","timestamp":"2026-05-01T00:00:00Z"},
-		{"role":"user","content":"local","timestamp":"2026-05-01T00:00:02Z"}
-	]}`)
-	staleETag := first.ETag
-	resp3, body3 := f.post("/v1/sync/push", PushRequest{
-		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString(local),
-		IfMatch:   &staleETag, IdempotencyKey: "local-1",
-		ConflictPolicy: "auto_merge",
-	}, tok)
-	if resp3.StatusCode != http.StatusOK {
-		t.Fatalf("auto-merge push: %d %s", resp3.StatusCode, body3)
-	}
-
-	// Pull and verify both messages survived.
-	pullResp, pullBody := f.post("/v1/sync/pull", PullRequest{
-		Scope: "chat", IDs: []string{"c"}, Keys: []PullKey{{Key: f.userKeyB64}},
-	}, tok)
-	if pullResp.StatusCode != http.StatusOK {
-		t.Fatalf("pull: %d %s", pullResp.StatusCode, pullBody)
-	}
-	var pull PullResponse
-	json.Unmarshal(pullBody, &pull)
-	pt, _ := base64.StdEncoding.DecodeString(pull.Items[0].Plaintext)
-	var got map[string]any
-	json.Unmarshal(pt, &got)
-	msgs := got["messages"].([]any)
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 messages after merge, got %d: %s", len(msgs), pt)
-	}
-}
-
-func TestStaleBlobRejectPolicy(t *testing.T) {
+// TestStaleBlobSurfacesSyncConflict asserts a stale-etag push
+// surfaces 409 SYNC_CONFLICT with the controlplane's current_etag
+// instead of silently merging or overwriting. The enclave never
+// runs a conflict resolver; conflict resolution is a client-UI
+// decision.
+func TestStaleBlobSurfacesSyncConflict(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
 
@@ -720,11 +654,19 @@ func TestStaleBlobRejectPolicy(t *testing.T) {
 	stale := "999"
 	resp2, body2 := f.post("/v1/sync/push", PushRequest{
 		Scope: "chat", ID: "c", Key: f.userKeyB64,
-		Plaintext: base64.StdEncoding.EncodeToString([]byte(`{"id":"c","messages":[]}`)),
-		IfMatch:   &stale, IdempotencyKey: "i2", ConflictPolicy: "reject",
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"c","messages":[]}`)),
+		IfMatch:        &stale,
+		IdempotencyKey: "i2",
 	}, tok)
-	if resp2.StatusCode != http.StatusPreconditionFailed {
-		t.Fatalf("expected 412, got %d %s", resp2.StatusCode, body2)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d %s", resp2.StatusCode, body2)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body2, &parsed); err != nil {
+		t.Fatalf("parse body: %v %s", err, body2)
+	}
+	if parsed["code"] != "SYNC_CONFLICT" {
+		t.Fatalf("expected code=SYNC_CONFLICT, got %v in %s", parsed["code"], body2)
 	}
 }
 
@@ -792,6 +734,43 @@ func TestAddBundleForwards(t *testing.T) {
 	}
 	if got, ok := f.cp.bundles[f.userKeyID]; !ok || got["cred-x"].EncryptedKeys != "ct" {
 		t.Fatalf("bundle not stored: %+v", f.cp.bundles)
+	}
+}
+
+func TestAddBundleRejectsMismatchedKeyID(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	otherKey := make([]byte, cryptopkg.KeySize)
+	rand.Read(otherKey)
+	resp, body := f.post("/v1/key/add-bundle", AddBundleRequest{
+		KeyID:          f.userKeyID,
+		Key:            base64.StdEncoding.EncodeToString(otherKey),
+		CredentialID:   "cred-x",
+		KEKIV:          "iv",
+		EncryptedKeys:  "ct",
+		IdempotencyKey: "idem-add-1",
+	}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d %s", resp.StatusCode, body)
+	}
+	if got, ok := f.cp.bundles[f.userKeyID]; ok && got["cred-x"].EncryptedKeys == "ct" {
+		t.Fatalf("mismatched bundle was stored: %+v", f.cp.bundles)
+	}
+}
+
+func TestRemoveBundleRejectsMismatchedKeyID(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	otherKey := make([]byte, cryptopkg.KeySize)
+	rand.Read(otherKey)
+	resp, body := f.post("/v1/key/remove-bundle", RemoveBundleRequest{
+		KeyID:          f.userKeyID,
+		Key:            base64.StdEncoding.EncodeToString(otherKey),
+		CredentialID:   "cred-x",
+		IdempotencyKey: "idem-remove-1",
+	}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d %s", resp.StatusCode, body)
 	}
 }
 
