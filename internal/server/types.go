@@ -26,17 +26,17 @@ type PullKey struct {
 }
 
 type PullRequest struct {
-	Scope  string    `json:"scope"`
-	IDs    []string  `json:"ids,omitempty"`
-	All    bool      `json:"all,omitempty"`
-	Cursor string    `json:"cursor,omitempty"`
-	Limit  int       `json:"limit,omitempty"`
+	Scope  string   `json:"scope"`
+	IDs    []string `json:"ids,omitempty"`
+	All    bool     `json:"all,omitempty"`
+	Cursor string   `json:"cursor,omitempty"`
+	Limit  int      `json:"limit,omitempty"`
 	// Keys is the ordered list of candidate decryption keys. The
 	// first entry is treated as the caller's current primary CEK and
 	// is used as the rewrap target when the enclave finds a legacy
-	// v0/v1 row: re-sealing happens inline before the response is
-	// returned so the caller never has to issue a separate
-	// /v1/blobs/migrate call for routine pulls.
+	// v0/v1 row. Inline re-sealing is best-effort; if it cannot
+	// complete, the response keeps needs_rewrap=true so the caller can
+	// drive the migration path.
 	Keys []PullKey `json:"keys"`
 }
 
@@ -155,7 +155,7 @@ type KeyCurrentBundle struct {
 // state as a 404 here.
 type KeyCurrentResponse struct {
 	KeyID      *string                     `json:"key_id"`
-	Etag       string                      `json:"etag,omitempty"`
+	ETag       string                      `json:"etag,omitempty"`
 	Bundles    map[string]KeyCurrentBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via,omitempty"`
 	CreatedAt  string                      `json:"created_at,omitempty"`

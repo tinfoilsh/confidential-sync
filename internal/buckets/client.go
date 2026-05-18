@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -38,6 +39,9 @@ import (
 // ErrNotFound is returned when the requested access token is not
 // present in buckets. Callers map this to a 404.
 var ErrNotFound = errors.New("buckets: item not found")
+
+// ErrForbidden is returned when buckets rejects the supplied slot key.
+var ErrForbidden = errors.New("buckets: forbidden")
 
 // Client talks to buckets.tinfoil.sh on behalf of the enclave.
 // Authentication is a single static Tinfoil API key the enclave
@@ -105,7 +109,11 @@ func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []b
 		return fmt.Errorf("buckets: put request: %w", err)
 	}
 	defer resp.Body.Close()
-	return c.expectOK(resp)
+	if err := c.expectOK(resp); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 // Get fetches and returns the plaintext for the given access token.
@@ -129,7 +137,15 @@ func (c *Client) Get(ctx context.Context, accessToken string, key []byte) ([]byt
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
+		// Drain the 404 body so the HTTP/1.1 connection can be
+		// reused; otherwise repeated cache misses keep stacking
+		// new TCP connections.
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, ErrNotFound
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, ErrForbidden
 	}
 	if err := c.expectOK(resp); err != nil {
 		return nil, err
@@ -163,13 +179,18 @@ func (c *Client) Delete(ctx context.Context, accessToken string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	return c.expectOK(resp)
+	if err := c.expectOK(resp); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 func (c *Client) itemURL(accessToken string) string {
-	return c.baseURL + "/items/" + accessToken
+	return c.baseURL + "/items/" + url.PathEscape(accessToken)
 }
 
 func (c *Client) setAuth(req *http.Request) {

@@ -31,21 +31,23 @@ func injectV0(t *testing.T, f *fixture, scope, id string, plaintext []byte) {
 	f.stack.CP.SetBlob(scope, id, f.cekKID, envBody)
 }
 
-// T12: pulling a legacy v0 blob returns plaintext with
-// needs_rewrap=true. This is the v2-path's "I can read it but it
-// needs migration" signal — NOT a silent failure, NOT a fake
-// "Encrypted" placeholder.
+// T12: pulling a legacy v0 blob returns plaintext and promotes the
+// row to v2 inline. This is the v2-path's "I can read it and make
+// future reads use authenticated AAD" path — NOT a silent failure,
+// NOT a fake "Encrypted" placeholder.
 //
 // Adversary model: not strictly an attack — this is the user-journey
 // where a pre-cutover blob still lives in the controlplane and the
 // post-cutover client needs to read it without crashing.
 //
 // Invariant: the enclave's Pull path delegates to DecryptLegacy on
-// non-v2 envelope shapes; success returns plaintext + needs_rewrap=true.
+// non-v2 envelope shapes; success returns plaintext and, when the
+// controlplane rewrap succeeds, needs_rewrap=false.
 //
 // Regression caught: removing the DecryptLegacy fallback (e.g.
 // because someone "cleaned up" v0/v1 support) would surface as
-// ok:false for users who haven't yet migrated.
+// ok:false for users who haven't yet migrated; losing inline rewrap
+// would leave needs_rewrap=true.
 func TestT12_LegacyV0BlobReturnsNeedsRewrap(t *testing.T) {
 	t.Helper()
 	f := newFixture(t)
@@ -60,8 +62,8 @@ func TestT12_LegacyV0BlobReturnsNeedsRewrap(t *testing.T) {
 	if !item.OK {
 		t.Fatalf("legacy v0 pull failed: %+v", item)
 	}
-	if !item.NeedsRewrap {
-		t.Fatalf("legacy v0 pull must set needs_rewrap=true, got %+v", item)
+	if item.NeedsRewrap {
+		t.Fatalf("legacy v0 pull should inline-rewrap, got %+v", item)
 	}
 	gotPT, err := base64.StdEncoding.DecodeString(item.Plaintext)
 	if err != nil {

@@ -16,6 +16,13 @@ import (
 // of decoded data, which exceeds any reasonable chat or document size.
 const MaxRequestBytes = 64 << 20
 
+// attachmentRequestTimeout is the deadline for attachment + share
+// transfers. The default 30s auth timeout is fine for sync blobs but
+// can prematurely cancel large bucket uploads/downloads on slow
+// network paths; this gives the buckets hop room to breathe while
+// still bounding worst-case latency.
+const attachmentRequestTimeout = 5 * time.Minute
+
 type Handler struct {
 	deps     Deps
 	verifier auth.Verifier
@@ -47,21 +54,22 @@ func (h *Handler) Routes() http.Handler {
 	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
 	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllBudget+time.Minute))
 
-	mux.Handle("POST /v1/attachment/put", h.authMiddleware(h.attachmentPut))
-	mux.Handle("POST /v1/attachment/get", h.authMiddleware(h.attachmentGet))
+	mux.Handle("POST /v1/attachment/put", h.authMiddlewareWithTimeout(h.attachmentPut, attachmentRequestTimeout))
+	mux.Handle("POST /v1/attachment/get", h.authMiddlewareWithTimeout(h.attachmentGet, attachmentRequestTimeout))
 	// /v1/attachment/get-public is intentionally unauthenticated.
 	// Knowing the attachment id + per-attachment key is the access
 	// proof — the same trust model the legacy public attachment
 	// endpoint uses, and the only way share recipients can read v2
-	// attachments without holding the owner's JWT.
-	mux.HandleFunc("POST /v1/attachment/get-public", h.attachmentGetPublic)
-	mux.Handle("POST /v1/attachment/delete", h.authMiddleware(h.attachmentDelete))
+	// attachments without holding the owner's JWT. Wrapped in a
+	// request timeout so the missing authMiddleware doesn't also
+	// drop the per-request deadline.
+	mux.Handle("POST /v1/attachment/get-public", withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), attachmentRequestTimeout))
 
 	mux.Handle("POST /v1/share/seal", h.authMiddleware(h.shareSeal))
 	// /v1/share/open is intentionally unauthenticated. Knowing the
 	// share key in the URL fragment is the access proof — the same
 	// trust model the legacy in-browser share path uses today.
-	mux.HandleFunc("POST /v1/share/open", h.shareOpen)
+	mux.Handle("POST /v1/share/open", withRequestTimeout(http.HandlerFunc(h.shareOpen), attachmentRequestTimeout))
 
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /health", h.health)
@@ -90,6 +98,17 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			return
 		}
 		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
+	})
+}
+
+// withRequestTimeout attaches a context deadline to the request so
+// unauthenticated handlers (which don't run through authMiddleware)
+// still get a bounded per-request lifetime.
+func withRequestTimeout(next http.Handler, timeout time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -304,20 +323,6 @@ func (h *Handler) attachmentGetPublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := AttachmentGet(r.Context(), h.deps, req)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	encode(w, http.StatusOK, resp)
-}
-
-func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess Session) {
-	var req AttachmentDeleteRequest
-	if err := decode(r, &req); err != nil {
-		writeError(w, err)
-		return
-	}
-	resp, err := AttachmentDelete(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

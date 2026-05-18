@@ -12,6 +12,7 @@
 package localstack
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -45,6 +46,12 @@ type StubCP struct {
 	bundles    map[string]map[string]controlplane.CurrentKeyBundle
 	deletes    map[string]time.Time
 
+	// bucketItems mirrors the very small subset of buckets.tinfoil.sh
+	// the enclave talks to: per-token value + slot keys. Without it
+	// localstack attachment round-trips return 404 on GET no matter
+	// what was uploaded.
+	bucketItems map[string]*stubBucketItem
+
 	// onFirstDelete maps "scope/id" to a callback that fires exactly
 	// once, at the very start of the first DELETE handled for that
 	// key. The callback runs with the stub's mutex RELEASED so it
@@ -56,6 +63,11 @@ type StubCP struct {
 	onFirstDelete map[string]func()
 }
 
+type stubBucketItem struct {
+	Value          []byte
+	EncryptionKeys [][]byte
+}
+
 // NewStubCP returns a stub controlplane ready to serve.
 func NewStubCP() *StubCP {
 	s := &StubCP{
@@ -63,6 +75,7 @@ func NewStubCP() *StubCP {
 		keys:          map[string]struct{}{},
 		bundles:       map[string]map[string]controlplane.CurrentKeyBundle{},
 		deletes:       map[string]time.Time{},
+		bucketItems:   map[string]*stubBucketItem{},
 		onFirstDelete: map[string]func(){},
 	}
 	mux := http.NewServeMux()
@@ -86,6 +99,9 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/sync/keys/current", s.currentKey)
 	mux.HandleFunc("POST /api/sync/keys/{kid}/bundles", s.addBundle)
 	mux.HandleFunc("DELETE /api/sync/keys/{kid}/bundles/{cid}", s.removeBundle)
+	mux.HandleFunc("PUT /items/{token}", s.putBucketItem)
+	mux.HandleFunc("GET /items/{token}", s.getBucketItem)
+	mux.HandleFunc("DELETE /items/{token}", s.deleteBucketItem)
 	s.mux = mux
 	return s
 }
@@ -93,6 +109,78 @@ func NewStubCP() *StubCP {
 func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
+
+func (s *StubCP) putBucketItem(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	var body struct {
+		Value          string   `json:"value"`
+		EncryptionKeys []string `json:"encryption_keys"`
+		Format         int      `json:"format"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	value, err := base64.StdEncoding.DecodeString(body.Value)
+	if err != nil {
+		http.Error(w, "bad value", http.StatusBadRequest)
+		return
+	}
+	keys := make([][]byte, 0, len(body.EncryptionKeys))
+	for _, k := range body.EncryptionKeys {
+		kb, err := base64.StdEncoding.DecodeString(k)
+		if err != nil {
+			http.Error(w, "bad key", http.StatusBadRequest)
+			return
+		}
+		keys = append(keys, kb)
+	}
+	s.mu.Lock()
+	s.bucketItems[token] = &stubBucketItem{Value: value, EncryptionKeys: keys}
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *StubCP) getBucketItem(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	s.mu.Lock()
+	item, ok := s.bucketItems[token]
+	s.mu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	supplied, err := base64.StdEncoding.DecodeString(r.Header.Get("X-Encryption-Key"))
+	if err != nil {
+		http.Error(w, "bad key", http.StatusBadRequest)
+		return
+	}
+	match := false
+	for _, k := range item.EncryptionKeys {
+		if bytes.Equal(k, supplied) {
+			match = true
+			break
+		}
+	}
+	if !match {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Value string `json:"value"`
+	}{Value: base64.StdEncoding.EncodeToString(item.Value)})
+}
+
+func (s *StubCP) deleteBucketItem(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	s.mu.Lock()
+	delete(s.bucketItems, token)
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+
 
 // -----------------------------------------------------------------------------
 // Test-facing poke API. Holding the stub's mutex while calling these is
@@ -405,7 +493,7 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		// so the returned `wiped_v2_attachments` is intentionally
 		// empty; production controlplane returns the real ids.
 		for k, b := range s.blobs {
-			if b.KeyID != "" && b.KeyID != body.KeyID {
+			if b.KeyID != body.KeyID {
 				delete(s.blobs, k)
 			}
 		}

@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -74,10 +73,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	metaHash, err := envelope.MetadataHash(req.Metadata)
-	if err != nil {
-		return nil, badRequest("invalid metadata: " + err.Error())
-	}
 	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
 		KeyIDHex:    kidHex,
 		Scope:       scope,
@@ -97,15 +92,10 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	hashBody, err := stableBlobOperationBody(req.Scope, req.ID, plaintext, req.Metadata)
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, aadBytes, envBlob)
 	if err != nil {
 		return nil, err
 	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, hashBody)
-	if err != nil {
-		return nil, err
-	}
-	_ = metaHash
 
 	// messageCount is metadata-only (the chat-list UI uses it for the
 	// "empty chat" predicate). It is NOT mixed into the op-hash: the
@@ -152,8 +142,12 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 // operationHashForBlob derives X-Operation-Hash for a blob mutation
 // according to syncplan.md §7.0. The canonical tuple matches exactly
 // what the controlplane will see on the wire (METHOD, PATH, KEY_ID,
-// IF_MATCH, IDEMPOTENCY_KEY, BODY).
-func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, body []byte) (string, error) {
+// IF_MATCH, IDEMPOTENCY_KEY) plus the AAD and the v2 envelope bytes.
+// Because the envelope already authenticates the plaintext under the
+// user's CEK, MACing the envelope here transitively commits the MAC
+// to the plaintext without ever letting a plaintext-derived digest
+// reach the wire.
+func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, aad, env []byte) (string, error) {
 	path, err := controlplane.PathFor(scope, id)
 	if err != nil {
 		return "", err
@@ -169,23 +163,8 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 		KeyIDHex:       keyIDHex,
 		IfMatch:        ifMatch,
 		IdempotencyKey: idempotencyKey,
-		Body:           body,
-	}), nil
-}
-
-func stableBlobOperationBody(scope, id string, plaintext []byte, metadata map[string]any) ([]byte, error) {
-	metaHash, err := envelope.MetadataHash(metadata)
-	if err != nil {
-		return nil, badRequest("invalid metadata: " + err.Error())
-	}
-	plainHash := sha256.Sum256(plaintext)
-	return cryptopkg.AppendCanonical(nil, cryptopkg.CanonicalInput{
-		Method:         "PLAINTEXT",
-		Path:           scope + "/" + id,
-		KeyIDHex:       metaHash[:32],
-		IfMatch:        metaHash[32:],
-		IdempotencyKey: "",
-		Body:           plainHash[:],
+		AAD:            aad,
+		Envelope:       env,
 	}), nil
 }
 
@@ -388,22 +367,29 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	// Before we tell controlplane to drop the chat row, walk the
-	// plaintext and delete any v2 attachments from buckets. The
-	// controlplane cascade (DeleteChatAttachmentsByChat in the same
-	// transaction as SyncDeleteChatBlob) takes care of the
-	// chat_attachments index rows; this pass is what stops the
-	// buckets objects from leaking. Best-effort: failures here must
-	// not block the user's delete intent.
+	// Snapshot the chat's attachment ids before the controlplane row
+	// is gone. We can only resolve them by decrypting the v2 envelope
+	// in-enclave, and that envelope disappears with the row. The
+	// actual buckets cascade fires after the chat row drop has
+	// committed so a STALE_BLOB does not orphan-delete attachments
+	// that still belong to a surviving chat.
+	var attachmentIDs []string
 	if scope == envelope.ScopeChat {
-		deleteChatAttachmentsBestEffort(ctx, deps, sess, req.ID, key)
+		attachmentIDs = collectChatAttachmentIDs(ctx, deps, sess, req.ID, key)
 	}
 
 	// If the caller passed a concrete ifMatch, run a single CAS-delete
 	// against that etag — a STALE_BLOB surfaces to the caller because
 	// they explicitly chose to race the etag they had.
 	if req.IfMatch != nil && *req.IfMatch != "" {
-		return deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
+		resp, err := deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
+		if err != nil {
+			return nil, err
+		}
+		if scope == envelope.ScopeChat {
+			deleteBucketAttachments(ctx, deps, attachmentIDs)
+		}
+		return resp, nil
 	}
 
 	// Otherwise the caller asked us to "just delete it" (`ifMatch=null`).
@@ -430,6 +416,9 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		attemptReq.IdempotencyKey = idem
 		resp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
 		if err == nil {
+			if scope == envelope.ScopeChat {
+				deleteBucketAttachments(ctx, deps, attachmentIDs)
+			}
 			return resp, nil
 		}
 		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
@@ -443,7 +432,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 const deleteMaxRetries = 3
 
 func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest, key []byte, kidHex, ifMatch string) (*OKResponse, error) {
-	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil)
+	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -653,7 +642,7 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 	}
 	out := &KeyCurrentResponse{
 		KeyID:      &resp.KeyID,
-		Etag:       resp.Etag,
+		ETag:       resp.ETag,
 		CreatedVia: resp.CreatedVia,
 		Bundles:    make(map[string]KeyCurrentBundle, len(resp.Bundles)),
 	}

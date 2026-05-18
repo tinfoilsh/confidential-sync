@@ -54,6 +54,11 @@ const (
 	StatusLegacyBlobNotMigrated     = "LEGACY_BLOB_NOT_MIGRATED"
 )
 
+// maxLegacyAttachmentBytes caps the body read for legacy attachment
+// downloads. var (not const) so package tests can shrink it to keep
+// oversized-body regressions cheap to exercise.
+var maxLegacyAttachmentBytes = 64 << 20
+
 // Error is a structured error returned from the controlplane. It contains
 // the parsed error code plus any contextual fields the controlplane sent.
 type Error struct {
@@ -485,7 +490,7 @@ func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt stri
 
 type CurrentKeyResponse struct {
 	KeyID      string                      `json:"key_id"`
-	Etag       string                      `json:"etag"`
+	ETag       string                      `json:"etag"`
 	Bundles    map[string]CurrentKeyBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via"`
 	CreatedAt  time.Time                   `json:"created_at"`
@@ -564,7 +569,7 @@ const RegisterKeyPath = "/api/sync/keys"
 type RegisterKeyResponse struct {
 	OK                 bool     `json:"ok"`
 	KeyID              string   `json:"key_id"`
-	Etag               string   `json:"etag"`
+	ETag               string   `json:"etag"`
 	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
 }
 
@@ -758,7 +763,14 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID stri
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, parseError(resp.StatusCode, raw)
 	}
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxLegacyAttachmentBytes)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxLegacyAttachmentBytes {
+		return nil, fmt.Errorf("controlplane: legacy attachment exceeds %d bytes", maxLegacyAttachmentBytes)
+	}
+	return body, nil
 }
 
 // RegisterAttachmentIndex records ownership of a v2 attachment with
@@ -797,5 +809,7 @@ func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID,
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return parseError(resp.StatusCode, raw)
 	}
+	// Drain the success body so the HTTP/1.1 connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }

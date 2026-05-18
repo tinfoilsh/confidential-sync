@@ -59,6 +59,7 @@ func TestCanonical_LengthPrefixing(t *testing.T) {
 	in := CanonicalInput{
 		Method: "AB", Path: "C", KeyIDHex: "", IfMatch: "0",
 		IdempotencyKey: "I", Body: []byte("D"),
+		AAD: []byte("E"), Envelope: []byte("FG"),
 	}
 	got := AppendCanonical(nil, in)
 	want := []byte{
@@ -68,9 +69,34 @@ func TestCanonical_LengthPrefixing(t *testing.T) {
 		0, 0, 0, 1, '0',
 		0, 0, 0, 1, 'I',
 		0, 0, 0, 1, 'D',
+		0, 0, 0, 1, 'E',
+		0, 0, 0, 2, 'F', 'G',
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("canonical mismatch:\n got  %x\n want %x", got, want)
+	}
+}
+
+// TestCanonical_BodyOnlyOpsStable pins the body-only encoding so a
+// RegisterKey/AddBundle retry under the same idempotency key continues
+// to MAC to the exact same bytes after AAD/Envelope were added for
+// blob ops.
+func TestCanonical_BodyOnlyOpsStable(t *testing.T) {
+	in := CanonicalInput{
+		Method: "POST", Path: "/p", KeyIDHex: "",
+		IfMatch: "", IdempotencyKey: "i", Body: []byte("body"),
+	}
+	got := AppendCanonical(nil, in)
+	want := []byte{
+		0, 0, 0, 4, 'P', 'O', 'S', 'T',
+		0, 0, 0, 2, '/', 'p',
+		0, 0, 0, 0,
+		0, 0, 0, 0,
+		0, 0, 0, 1, 'i',
+		0, 0, 0, 4, 'b', 'o', 'd', 'y',
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("body-only canonical drift:\n got  %x\n want %x", got, want)
 	}
 }
 
@@ -135,6 +161,72 @@ func TestVerifyOperationHash(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("Verify accepted non-hex hash")
+	}
+}
+
+func TestOpHashChangesWhenEnvelopeChanges(t *testing.T) {
+	cek := mustHex(t, vectorCEKHex)
+	opKey, err := DeriveOpHashKey(cek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := CanonicalInput{
+		Method:         "PUT",
+		Path:           "/api/sync/blob/chat/c1",
+		KeyIDHex:       "00112233445566778899aabbccddeeff",
+		IfMatch:        "0",
+		IdempotencyKey: "i1",
+		AAD:            []byte("aad-bytes"),
+		Envelope:       []byte("envelope-bytes-A"),
+	}
+	a := ComputeOperationHash(opKey, base)
+	b := base
+	b.Envelope = []byte("envelope-bytes-B")
+	if got := ComputeOperationHash(opKey, b); got == a {
+		t.Fatal("op-hash did not change when envelope bytes differed")
+	}
+}
+
+func TestOpHashChangesWhenAADChanges(t *testing.T) {
+	cek := mustHex(t, vectorCEKHex)
+	opKey, err := DeriveOpHashKey(cek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := CanonicalInput{
+		Method:         "PUT",
+		Path:           "/api/sync/blob/chat/c1",
+		KeyIDHex:       "00112233445566778899aabbccddeeff",
+		IfMatch:        "0",
+		IdempotencyKey: "i1",
+		AAD:            []byte("aad-for-chat-c1"),
+		Envelope:       []byte("envelope-bytes"),
+	}
+	a := ComputeOperationHash(opKey, base)
+	b := base
+	b.AAD = []byte("aad-for-chat-c2")
+	if got := ComputeOperationHash(opKey, b); got == a {
+		t.Fatal("op-hash did not change when AAD differed")
+	}
+}
+
+func TestOpHashStableForByteIdenticalRetry(t *testing.T) {
+	cek := mustHex(t, vectorCEKHex)
+	opKey, err := DeriveOpHashKey(cek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := CanonicalInput{
+		Method:         "PUT",
+		Path:           "/api/sync/blob/chat/c1",
+		KeyIDHex:       "00112233445566778899aabbccddeeff",
+		IfMatch:        "0",
+		IdempotencyKey: "i1",
+		AAD:            []byte("aad"),
+		Envelope:       []byte("envelope"),
+	}
+	if ComputeOperationHash(opKey, in) != ComputeOperationHash(opKey, in) {
+		t.Fatal("op-hash is not deterministic for identical inputs")
 	}
 }
 

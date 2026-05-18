@@ -78,22 +78,26 @@ func rewrapBlob(
 		Rewrap:         true,
 		Ciphertext:     envBlob,
 	}
+	// /api/sync/rewrap is a JSON POST, so the controlplane MACs over
+	// the exact JSON body bytes that hit the wire (not the bare
+	// envelope). Pre-marshal here so the enclave hashes the same
+	// representation the controlplane will reconstruct.
+	rewrapBody, err := controlplane.RewrapBody(rewrapReq)
+	if err != nil {
+		return "", err
+	}
 	opKey, err := cryptopkg.DeriveOpHashKey(targetKey)
 	if err != nil {
 		return "", err
 	}
 	defer cryptopkg.Zero(opKey)
-	hashBody, err := stableBlobOperationBody(string(scope), id, finalPlaintext, nil)
-	if err != nil {
-		return "", err
-	}
 	rewrapReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
 		Method:         http.MethodPost,
 		Path:           controlplane.RewrapPath,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
-		Body:           hashBody,
+		Body:           rewrapBody,
 	})
 	resp, err := deps.Controlplane.PutBlob(ctx, rewrapReq)
 	if err != nil {
@@ -214,30 +218,28 @@ func promoteOneAttachment(
 	return true
 }
 
-// deleteChatAttachmentsBestEffort fetches the chat, decrypts with the
-// CEK the caller provided to the Delete op, parses out attachment
-// ids, and tells buckets to drop each one. Any failure aborts the
-// cascade silently — the caller's chat-delete must still proceed,
-// and orphans in buckets are unaddressable to anyone else because
-// the per-attachment slot key lives only inside the (now-deleted)
-// chat envelope.
-func deleteChatAttachmentsBestEffort(
+// collectChatAttachmentIDs fetches the chat, decrypts with the CEK
+// the caller provided to the Delete op, and returns the list of
+// attachment ids referenced by the chat envelope. Returns nil on
+// any failure: callers treat that as "no attachments to clean up"
+// rather than aborting the chat delete.
+func collectChatAttachmentIDs(
 	ctx context.Context,
 	deps Deps,
 	sess Session,
 	chatID string,
 	cek []byte,
-) {
+) []string {
 	if !deps.Buckets.Configured() {
-		return
+		return nil
 	}
 	blob, err := deps.Controlplane.GetBlob(ctx, string(envelope.ScopeChat), chatID, sess.RawJWT)
 	if err != nil {
-		return
+		return nil
 	}
 	cekIDBytes, err := cryptopkg.DeriveKeyID(cek)
 	if err != nil {
-		return
+		return nil
 	}
 	cekKIDHex := cryptopkg.KeyIDHex(cekIDBytes)
 	var plaintext []byte
@@ -252,7 +254,7 @@ func deleteChatAttachmentsBestEffort(
 			})
 		})
 		if err != nil {
-			return
+			return nil
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
 		plaintext = dec.Plaintext
@@ -260,19 +262,20 @@ func deleteChatAttachmentsBestEffort(
 		// Legacy chats can't have v2 attachments yet, so there's
 		// nothing in buckets to clean up. The controlplane row drop
 		// alone suffices.
-		return
+		return nil
 	default:
-		return
+		return nil
 	}
 
 	var parsed map[string]any
 	if err := json.Unmarshal(plaintext, &parsed); err != nil {
-		return
+		return nil
 	}
 	rawMessages, ok := parsed["messages"].([]any)
 	if !ok {
-		return
+		return nil
 	}
+	var ids []string
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -287,20 +290,36 @@ func deleteChatAttachmentsBestEffort(
 			if !ok {
 				continue
 			}
-			if att["type"] != "image" {
-				continue
-			}
+			// Every bucket-backed attachment carries an id; the
+			// type label is freeform UI metadata and may evolve
+			// (images, audio, video, generic files). Filtering
+			// on `type == "image"` here would orphan everything
+			// else, so we cascade by presence of an id instead.
 			attID, _ := att["id"].(string)
 			if attID == "" {
 				continue
 			}
-			// Buckets Delete is idempotent on 404 (legacy v1
-			// rows that were never promoted to buckets simply
-			// aren't there). Issuing the call is cheaper than
-			// figuring out per-attachment which generation
-			// it's on.
-			_ = deps.Buckets.Delete(ctx, attID)
+			ids = append(ids, attID)
 		}
+	}
+	return ids
+}
+
+// deleteBucketAttachments fires off best-effort Delete calls for each
+// attachment id. Failures are swallowed: the caller has already
+// committed (or is about to commit) the chat row delete and orphans
+// in buckets are unaddressable without the per-attachment slot key
+// that lived inside the chat envelope.
+func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
+	if !deps.Buckets.Configured() {
+		return
+	}
+	for _, attID := range ids {
+		// Buckets Delete is idempotent on 404 (legacy v1 rows that
+		// were never promoted to buckets simply aren't there).
+		// Issuing the call is cheaper than figuring out
+		// per-attachment which generation it's on.
+		_ = deps.Buckets.Delete(ctx, attID)
 	}
 }
 

@@ -62,7 +62,7 @@ func main() {
 		&http.Client{Timeout: 60 * time.Second},
 	)
 	if !bucketsClient.Configured() {
-		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / BUCKETS_API_KEY); attachment endpoints will return 503")
+		log.Fatal("BUCKETS_URL and BUCKETS_API_KEY are required")
 	}
 
 	deps := server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: gitSHA}
@@ -70,8 +70,8 @@ func main() {
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to
-	// server.MigrateAllBudget (10m). An 11-minute server WriteTimeout
-	// gives the handler 60s of margin to finalize its response. All
+	// server.MigrateAllBudget (10m). A 12-minute server WriteTimeout
+	// gives the handler 2m of margin to finalize its response. All
 	// other routes complete in well under a second; ReadHeaderTimeout
 	// stays strict so slowloris cannot exploit the longer write side.
 	srv := &http.Server{
@@ -79,7 +79,7 @@ func main() {
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      11 * time.Minute,
+		WriteTimeout:      12 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
