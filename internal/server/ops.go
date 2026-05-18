@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -109,13 +110,14 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, envBlob)
+	hashBody, err := stableBlobOperationBody(req.Scope, req.ID, plaintext, req.Metadata)
 	if err != nil {
 		return nil, err
 	}
-	// metaHash is no longer mixed into the op-hash directly: it travels
-	// inside the AAD and therefore inside the encrypted envelope, which
-	// is itself the BODY of the canonical tuple.
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, hashBody)
+	if err != nil {
+		return nil, err
+	}
 	_ = metaHash
 
 	// messageCount is metadata-only (the chat-list UI uses it for the
@@ -235,7 +237,11 @@ func autoResolve(
 	retryReq.IfMatch = &newIfMatch
 	retryReq.IdempotencyKey = req.IdempotencyKey + ":resolved"
 	_ = metaHash
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, newIfMatch, retryReq.IdempotencyKey, envBlob)
+	hashBody, err := stableBlobOperationBody(req.Scope, req.ID, mergedPT, req.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, newIfMatch, retryReq.IdempotencyKey, hashBody)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +290,22 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 		IfMatch:        ifMatch,
 		IdempotencyKey: idempotencyKey,
 		Body:           body,
+	}), nil
+}
+
+func stableBlobOperationBody(scope, id string, plaintext []byte, metadata map[string]any) ([]byte, error) {
+	metaHash, err := envelope.MetadataHash(metadata)
+	if err != nil {
+		return nil, badRequest("invalid metadata: " + err.Error())
+	}
+	plainHash := sha256.Sum256(plaintext)
+	return cryptopkg.AppendCanonical(nil, cryptopkg.CanonicalInput{
+		Method:         "PLAINTEXT",
+		Path:           scope + "/" + id,
+		KeyIDHex:       metaHash[:32],
+		IfMatch:        metaHash[32:],
+		IdempotencyKey: "",
+		Body:           plainHash[:],
 	}), nil
 }
 

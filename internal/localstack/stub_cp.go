@@ -4,7 +4,7 @@
 // suite (`internal/localstack/smoke`) drive the same stack.
 //
 // The stub controlplane mirrors the real controlplane's HTTP shape on
-// /api/sync/* and /api/keys/* with enough fidelity that the enclave
+// /api/sync/* with enough fidelity that the enclave
 // handler exercises every real code path. It is NOT a faithful
 // reimplementation: it has no Postgres, no idempotency table, and no
 // op-hash verification. Tests that need those concerns belong in the
@@ -82,10 +82,10 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/sync/needs-migration", s.needsMigration)
 	mux.HandleFunc("POST /api/sync/migration-failure", s.migrationFailure)
 	mux.HandleFunc("POST /api/sync/rewrap", s.rewrap)
-	mux.HandleFunc("POST /api/keys", s.registerKey)
-	mux.HandleFunc("GET /api/keys/current", s.currentKey)
-	mux.HandleFunc("POST /api/keys/{kid}/bundles", s.addBundle)
-	mux.HandleFunc("DELETE /api/keys/{kid}/bundles/{cid}", s.removeBundle)
+	mux.HandleFunc("POST /api/sync/keys", s.registerKey)
+	mux.HandleFunc("GET /api/sync/keys/current", s.currentKey)
+	mux.HandleFunc("POST /api/sync/keys/{kid}/bundles", s.addBundle)
+	mux.HandleFunc("DELETE /api/sync/keys/{kid}/bundles/{cid}", s.removeBundle)
 	s.mux = mux
 	return s
 }

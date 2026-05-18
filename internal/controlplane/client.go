@@ -498,7 +498,7 @@ type CurrentKeyBundle struct {
 }
 
 func (c *Client) GetCurrentKey(ctx context.Context, jwt string) (*CurrentKeyResponse, error) {
-	endpoint := c.baseURL + "/api/keys/current"
+	endpoint := c.baseURL + "/api/sync/keys/current"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -554,7 +554,7 @@ func RegisterKeyBody(req RegisterKeyRequest) ([]byte, error) {
 }
 
 // RegisterKeyPath is the controlplane path the RegisterKey call targets.
-const RegisterKeyPath = "/api/keys"
+const RegisterKeyPath = "/api/sync/keys"
 
 func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error {
 	endpoint := c.baseURL + RegisterKeyPath
@@ -614,7 +614,7 @@ func AddBundleBody(req AddBundleRequest) ([]byte, error) {
 // Used by the enclave to keep the op-hash canonical path aligned
 // with the actual wire path.
 func AddBundlePath(keyIDHex string) string {
-	return "/api/keys/" + url.PathEscape(keyIDHex) + "/bundles"
+	return "/api/sync/keys/" + url.PathEscape(keyIDHex) + "/bundles"
 }
 
 func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
@@ -658,7 +658,7 @@ type RemoveBundleRequest struct {
 // RemoveBundlePath returns the canonical wire path for a remove-bundle
 // request so callers can compute the op-hash over the same string.
 func RemoveBundlePath(keyIDHex, credentialID string) string {
-	return "/api/keys/" + url.PathEscape(keyIDHex) + "/bundles/" + url.PathEscape(credentialID)
+	return "/api/sync/keys/" + url.PathEscape(keyIDHex) + "/bundles/" + url.PathEscape(credentialID)
 }
 
 func (c *Client) RemoveBundle(ctx context.Context, req RemoveBundleRequest) error {
