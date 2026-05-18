@@ -7,10 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 
-	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
@@ -25,12 +23,12 @@ const attachmentIVLen = 12
 // it back to controlplane with Rewrap=true. When scope=chat, also
 // performs the lazy attachment cascade: any attachment with an
 // embedded per-attachment encryptionKey (v0/v1) is fetched from the
-// legacy /api/storage/attachment endpoint, decrypted in-enclave,
-// re-uploaded through buckets under the attachment id directly (the
-// id is a UUIDv4 the webapp minted), AAD-sealed under the current
-// CEK, and registered with controlplane as a v2 index row. The
-// mutated plaintext (with `encryptionKey` cleared from each promoted
-// attachment) is what we seal as v2.
+// legacy /api/storage/attachment endpoint, decrypted in-enclave, and
+// re-uploaded through buckets under the attachment id using the
+// existing per-attachment key as the buckets slot key. The chat
+// JSON's `attachments[i].encryptionKey` is preserved verbatim so
+// future reads (and shares) can address the buckets entry directly
+// without the enclave having to look up any per-attachment state.
 //
 // Returns the new etag on success. Plaintext is zeroed by the caller.
 func rewrapBlob(
@@ -46,7 +44,7 @@ func rewrapBlob(
 ) (string, error) {
 	finalPlaintext := plaintext
 	if scope == envelope.ScopeChat {
-		mutated, err := rewrapChatAttachments(ctx, deps, sess, id, plaintext, targetKey)
+		mutated, err := rewrapChatAttachments(ctx, deps, sess, id, plaintext)
 		if err != nil {
 			return "", err
 		}
@@ -106,11 +104,13 @@ func rewrapBlob(
 
 // rewrapChatAttachments walks the chat plaintext, finds any
 // attachments with an embedded encryptionKey (legacy v0/v1 image
-// rows), and promotes them to buckets-backed v2 storage. Returns a
-// freshly-serialized plaintext with `encryptionKey` removed from each
-// promoted attachment so the caller can re-seal it. Returns (nil, nil)
-// when the plaintext doesn't parse as a chat envelope or contains no
-// legacy attachments — letting the rewrap proceed as a pure re-seal.
+// rows), and promotes them to buckets-backed v2 storage. The
+// per-attachment key is reused as the buckets slot key, so the
+// chat JSON itself never has to change — the same `encryptionKey`
+// that used to unlock the controlplane BYTEA now unlocks the buckets
+// blob. Returns (nil, nil) when the plaintext doesn't parse as a
+// chat envelope or contains no legacy attachments — letting the
+// rewrap proceed as a pure re-seal.
 //
 // We swallow per-attachment failures: an attachment whose legacy row
 // is already gone (e.g. 404), or whose buckets PUT fails transiently,
@@ -122,7 +122,6 @@ func rewrapChatAttachments(
 	sess Session,
 	chatID string,
 	plaintext []byte,
-	targetKey []byte,
 ) ([]byte, error) {
 	var parsed map[string]any
 	if err := json.Unmarshal(plaintext, &parsed); err != nil {
@@ -133,7 +132,6 @@ func rewrapChatAttachments(
 		return nil, nil
 	}
 
-	dirty := false
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -156,35 +154,29 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
-			if promoted := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey, targetKey); promoted {
-				delete(att, "encryptionKey")
-				dirty = true
-			}
+			_ = promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey)
 		}
 	}
 
-	if !dirty {
-		return nil, nil
-	}
-	out, err := json.Marshal(parsed)
-	if err != nil {
-		return nil, fmt.Errorf("rewrap: re-serialize chat: %w", err)
-	}
-	return out, nil
+	// Plaintext is never mutated; the per-attachment encryptionKey
+	// stays as-is so the same value addresses the buckets entry
+	// after promotion as addressed the controlplane BYTEA before it.
+	return nil, nil
 }
 
 // promoteOneAttachment fetches one legacy ciphertext, decrypts it
-// with the embedded per-attachment key, re-uploads through buckets
-// under the attachment id, and registers the new v2 row with
-// controlplane. Returns true iff the cascade fully succeeded; on any
-// per-step error returns false so the chat rewrap keeps the
-// encryptionKey field in place and the row stays v1.
+// with the embedded per-attachment key, re-uploads the plaintext
+// through buckets under the attachment id (reusing the same
+// per-attachment key as the buckets slot key), and registers the
+// new v2 row with controlplane. Returns true iff the cascade fully
+// succeeded. The chat JSON's `encryptionKey` field is preserved
+// verbatim so the same key now addresses the buckets entry that
+// previously addressed the legacy BYTEA row.
 func promoteOneAttachment(
 	ctx context.Context,
 	deps Deps,
 	sess Session,
 	chatID, attID, legacyKeyB64 string,
-	targetKey []byte,
 ) bool {
 	if !deps.Buckets.Configured() {
 		return false
@@ -193,8 +185,7 @@ func promoteOneAttachment(
 	if err != nil {
 		if errors.Is(err, controlplane.ErrLegacyAttachmentNotFound) {
 			// already migrated by a concurrent pass, or the row was
-			// dropped — clear encryptionKey so future reads use the
-			// v2 path and stop trying the legacy fetch.
+			// dropped — there is nothing to promote.
 			return true
 		}
 		return false
@@ -210,15 +201,7 @@ func promoteOneAttachment(
 	defer cryptopkg.Zero(plaintext)
 	defer cryptopkg.Zero(legacyKey)
 
-	aad, err := cryptopkg.AttachmentAAD(sess.Claims.Subject, chatID, attID)
-	if err != nil {
-		return false
-	}
-	v2envelope, err := cryptopkg.SealAttachment(targetKey, plaintext, aad)
-	if err != nil {
-		return false
-	}
-	if err := deps.Buckets.Put(ctx, attID, v2envelope, buckets.SentinelSlotKey); err != nil {
+	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
 		return false
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, attID, chatID); err != nil {
@@ -232,11 +215,12 @@ func promoteOneAttachment(
 }
 
 // deleteChatAttachmentsBestEffort fetches the chat, decrypts with the
-// CEK the caller provided to the Delete op, parses out v2 attachment
+// CEK the caller provided to the Delete op, parses out attachment
 // ids, and tells buckets to drop each one. Any failure aborts the
 // cascade silently — the caller's chat-delete must still proceed,
-// and orphans in buckets are unreadable to anyone else because the
-// access tokens are CEK-keyed.
+// and orphans in buckets are unaddressable to anyone else because
+// the per-attachment slot key lives only inside the (now-deleted)
+// chat envelope.
 func deleteChatAttachmentsBestEffort(
 	ctx context.Context,
 	deps Deps,
@@ -306,13 +290,15 @@ func deleteChatAttachmentsBestEffort(
 			if att["type"] != "image" {
 				continue
 			}
-			if _, hasLegacyKey := att["encryptionKey"].(string); hasLegacyKey {
-				continue
-			}
 			attID, _ := att["id"].(string)
 			if attID == "" {
 				continue
 			}
+			// Buckets Delete is idempotent on 404 (legacy v1
+			// rows that were never promoted to buckets simply
+			// aren't there). Issuing the call is cheaper than
+			// figuring out per-attachment which generation
+			// it's on.
 			_ = deps.Buckets.Delete(ctx, attID)
 		}
 	}
