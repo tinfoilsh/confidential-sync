@@ -1,7 +1,26 @@
 // Package buckets is the sync-enclave's HTTP client for
 // buckets.tinfoil.sh. Attachments live in a single Tinfoil-owned
-// tenant; per-user separation comes from the access tokens being
-// derived from each user's CEK so they are unguessable across users.
+// tenant; per-user separation comes from two layers stacked on top
+// of the API key:
+//
+//  1. The access token (URL path) is the attachment's UUIDv4 id,
+//     which carries 122 bits of randomness — globally non-colliding
+//     and unguessable to any party that does not already see the
+//     controlplane's `chat_attachments.id` column.
+//  2. The bytes stored at the slot are an enclave-built v2 envelope
+//     (AES-256-GCM under the user's CEK with an AAD that binds
+//     `clerk_user_id || chat_id || attachment_id`). Even an attacker
+//     who can read the bucket bytes recovers only the sealed
+//     envelope; without the user's CEK they cannot open it, and
+//     without the matching AAD tuple they cannot move the ciphertext
+//     to a different chat or user.
+//
+// The buckets server still asks for a slot key on `Put`/`Get`, but
+// the enclave passes `SentinelSlotKey` — a published all-zeros key —
+// so the buckets-side AES layer adds no cryptographic strength on
+// top of the in-enclave seal. Doing it this way means the buckets
+// operator never sees the user's CEK, and a buckets compromise
+// reveals at most one sealed envelope per slot.
 package buckets
 
 import (
@@ -20,6 +39,15 @@ import (
 // ErrNotFound is returned when the requested access token is not
 // present in buckets. Callers map this to a 404.
 var ErrNotFound = errors.New("buckets: item not found")
+
+// SentinelSlotKey is the all-zeros 32-byte key the enclave hands to
+// the buckets server's format-1 layer. The actual confidentiality
+// guarantee comes from the in-enclave AES-256-GCM seal under the
+// user's CEK (see package doc) — using a published constant for the
+// buckets layer keeps the wire surface stable while making the
+// security model explicit: the buckets operator is not in the trust
+// boundary for attachment plaintext.
+var SentinelSlotKey = make([]byte, 32)
 
 // Client talks to buckets.tinfoil.sh on behalf of the enclave.
 // Authentication is a single static Tinfoil API key the enclave

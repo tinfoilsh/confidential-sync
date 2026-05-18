@@ -485,6 +485,7 @@ func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt stri
 
 type CurrentKeyResponse struct {
 	KeyID      string                      `json:"key_id"`
+	Etag       string                      `json:"etag"`
 	Bundles    map[string]CurrentKeyBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via"`
 	CreatedAt  time.Time                   `json:"created_at"`
@@ -556,15 +557,26 @@ func RegisterKeyBody(req RegisterKeyRequest) ([]byte, error) {
 // RegisterKeyPath is the controlplane path the RegisterKey call targets.
 const RegisterKeyPath = "/api/sync/keys"
 
-func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error {
+// RegisterKeyResponse mirrors the wire body the controlplane emits on
+// a successful `POST /api/sync/keys`. `WipedV2Attachments` is
+// populated only when the call hit the start-fresh bypass; on every
+// other path it is nil/empty.
+type RegisterKeyResponse struct {
+	OK                 bool     `json:"ok"`
+	KeyID              string   `json:"key_id"`
+	Etag               string   `json:"etag"`
+	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
+}
+
+func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) (*RegisterKeyResponse, error) {
 	endpoint := c.baseURL + RegisterKeyPath
 	body, err := RegisterKeyBody(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c.addAuth(httpReq, req.JWT)
 	httpReq.Header.Set(HeaderContentType, "application/json")
@@ -579,14 +591,20 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) error 
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return parseError(resp.StatusCode, respBody)
+		return nil, parseError(resp.StatusCode, respBody)
 	}
-	return nil
+	out := &RegisterKeyResponse{}
+	if len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			return nil, fmt.Errorf("controlplane: decode register-key response: %w", err)
+		}
+	}
+	return out, nil
 }
 
 type AddBundleRequest struct {

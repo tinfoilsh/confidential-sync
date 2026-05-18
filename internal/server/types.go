@@ -156,6 +156,7 @@ type KeyCurrentBundle struct {
 // state as a 404 here.
 type KeyCurrentResponse struct {
 	KeyID      *string                     `json:"key_id"`
+	Etag       string                      `json:"etag,omitempty"`
 	Bundles    map[string]KeyCurrentBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via,omitempty"`
 	CreatedAt  string                      `json:"created_at,omitempty"`

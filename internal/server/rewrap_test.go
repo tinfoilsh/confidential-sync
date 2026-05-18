@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -156,13 +157,9 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 		t.Fatalf("expected needs_rewrap=false")
 	}
 
-	// Buckets should now hold an entry under the derived access token.
-	tok2, err := cryptopkg.DeriveAttachmentToken(f.userKey, attID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !f.bk.has(tok2) {
-		t.Fatalf("attachment was not uploaded to buckets under token %q", tok2)
+	// Buckets should now hold an entry under the attachment id.
+	if !f.bk.has(attID) {
+		t.Fatalf("attachment was not uploaded to buckets under id %q", attID)
 	}
 
 	// Controlplane should know the attachment is v2-owned now.
@@ -253,31 +250,26 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	f.cp.blobs["chat/c2"] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: v2blob}
 	f.cp.mu.Unlock()
 
-	// Pre-seed the buckets entry the cascade should remove.
-	token, err := cryptopkg.DeriveAttachmentToken(f.userKey, attID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attKey, err := cryptopkg.DeriveAttachmentKey(f.userKey, attID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Pre-seed the buckets entry the cascade should remove. With
+	// the v2 attachment model the path is just the attachment id
+	// and the slot key is the published sentinel.
 	f.bk.mu.Lock()
-	f.bk.items[token] = bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{attKey}}
+	f.bk.items[attID] = bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}}
 	f.bk.mu.Unlock()
-	if !f.bk.has(token) {
+	if !f.bk.has(attID) {
 		t.Fatalf("precondition: bucket not seeded")
 	}
 
+	cekB64 := base64.StdEncoding.EncodeToString(f.userKey)
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{
 		Scope: "chat", ID: "c2",
-		Key:            f.userKeyB64,
+		Key:            cekB64,
 		IdempotencyKey: "del-1",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d %s", resp.StatusCode, body)
 	}
-	if f.bk.has(token) {
+	if f.bk.has(attID) {
 		t.Fatalf("buckets entry should be gone after chat delete")
 	}
 }

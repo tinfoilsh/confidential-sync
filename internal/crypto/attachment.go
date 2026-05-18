@@ -1,67 +1,89 @@
 package crypto
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
-	"io"
-
-	"golang.org/x/crypto/hkdf"
+	"fmt"
 )
 
-// attachmentKeyInfo is the HKDF info string that produces the
-// per-attachment AES-256 key the enclave hands to buckets.tinfoil.sh.
-// Distinct from attachmentTokenInfo so the two HKDF outputs are
-// independent.
-const attachmentKeyInfo = "attachment-key|"
+// AttachmentIVSize is the AES-GCM nonce length used by the v2
+// attachment envelope. 12 bytes matches the standard GCM nonce size
+// and the legacy webapp format so callers see one consistent shape.
+const AttachmentIVSize = 12
 
-// attachmentTokenInfo is the HKDF info string that produces the
-// per-attachment access token (the buckets URL path). Path tokens
-// must be opaque to the buckets server: knowing the token is the
-// only proof of ownership of the slot, so they must be unguessable
-// across users. Deriving them from the user's CEK guarantees that.
-const attachmentTokenInfo = "attachment-token|"
+// attachmentAADDomain tags the canonical JSON the enclave builds for
+// each attachment ciphertext. Distinct from the chat envelope's
+// domain so an attachment ciphertext can never be replayed as a
+// chat blob and vice versa.
+const attachmentAADDomain = "tinfoil-attachment-v2"
 
-// AttachmentTokenSize is the number of HKDF bytes used to form the
-// access token. 24 raw bytes encode to 48 hex chars, well inside
-// the buckets [36..76] charset window.
-const AttachmentTokenSize = 24
+// AttachmentAAD returns the canonical JSON AAD that binds an
+// attachment ciphertext to the user, chat, and attachment id. The
+// enclave re-derives the same bytes on Get so a stolen ciphertext
+// cannot be moved under a different (user, chat, id) tuple.
+func AttachmentAAD(clerkUserID, chatID, attachmentID string) ([]byte, error) {
+	if clerkUserID == "" || chatID == "" || attachmentID == "" {
+		return nil, errors.New("crypto: attachment aad requires user, chat, id")
+	}
+	return json.Marshal(struct {
+		Domain        string `json:"domain"`
+		ClerkUserID   string `json:"clerk_user_id"`
+		ChatID        string `json:"chat_id"`
+		AttachmentID  string `json:"attachment_id"`
+	}{attachmentAADDomain, clerkUserID, chatID, attachmentID})
+}
 
-// DeriveAttachmentKey returns the 32-byte AES-256 key the sync
-// enclave hands to buckets when sealing the named attachment. Each
-// (CEK, attachmentID) pair maps to a unique key so a compromised key
-// only ever reveals one attachment's bytes.
-func DeriveAttachmentKey(cek []byte, attachmentID string) ([]byte, error) {
+// SealAttachment encrypts plaintext under the user's 32-byte CEK using
+// AES-256-GCM with a random 12-byte IV. The output is laid out as
+// `IV(12) || ciphertext || tag`, which is the same wire shape the
+// legacy webapp emitted — making the bucket bytes self-describing
+// without a separate format byte.
+func SealAttachment(cek, plaintext, aad []byte) ([]byte, error) {
 	if len(cek) != KeySize {
 		return nil, ErrKeySize
 	}
-	if attachmentID == "" {
-		return nil, errors.New("crypto: attachment id is required")
+	block, err := aes.NewCipher(cek)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: attachment cipher: %w", err)
 	}
-	r := hkdf.New(sha256.New, cek, nil, []byte(attachmentKeyInfo+attachmentID))
-	key := make([]byte, KeySize)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return nil, err
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: attachment gcm: %w", err)
 	}
-	return key, nil
+	iv := make([]byte, AttachmentIVSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, fmt.Errorf("crypto: attachment iv: %w", err)
+	}
+	ct := gcm.Seal(nil, iv, plaintext, aad)
+	out := make([]byte, 0, len(iv)+len(ct))
+	out = append(out, iv...)
+	out = append(out, ct...)
+	return out, nil
 }
 
-// DeriveAttachmentToken returns the opaque access token the sync
-// enclave uses as the buckets URL path for the named attachment.
-// The token is a hex-encoded HKDF output keyed by the CEK so that
-// across users tokens are unguessable and across rotations the
-// same (CEK, id) pair always resolves to the same slot.
-func DeriveAttachmentToken(cek []byte, attachmentID string) (string, error) {
+// OpenAttachment reverses SealAttachment. It expects exactly the
+// `IV(12) || ciphertext || tag` layout and returns the plaintext on
+// success. A tamper-bit or AAD mismatch surfaces as the standard
+// GCM `cipher: message authentication failed` error.
+func OpenAttachment(cek, blob, aad []byte) ([]byte, error) {
 	if len(cek) != KeySize {
-		return "", ErrKeySize
+		return nil, ErrKeySize
 	}
-	if attachmentID == "" {
-		return "", errors.New("crypto: attachment id is required")
+	if len(blob) < AttachmentIVSize {
+		return nil, errors.New("crypto: attachment ciphertext too short")
 	}
-	r := hkdf.New(sha256.New, cek, nil, []byte(attachmentTokenInfo+attachmentID))
-	raw := make([]byte, AttachmentTokenSize)
-	if _, err := io.ReadFull(r, raw); err != nil {
-		return "", err
+	block, err := aes.NewCipher(cek)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: attachment cipher: %w", err)
 	}
-	return hex.EncodeToString(raw), nil
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: attachment gcm: %w", err)
+	}
+	iv := blob[:AttachmentIVSize]
+	ct := blob[AttachmentIVSize:]
+	return gcm.Open(nil, iv, ct, aad)
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
@@ -25,10 +26,11 @@ const attachmentIVLen = 12
 // performs the lazy attachment cascade: any attachment with an
 // embedded per-attachment encryptionKey (v0/v1) is fetched from the
 // legacy /api/storage/attachment endpoint, decrypted in-enclave,
-// re-uploaded through buckets under a path the enclave derives from
-// (targetKey, attachment_id), and registered with controlplane as a
-// v2 index row. The mutated plaintext (with `encryptionKey` cleared
-// from each promoted attachment) is what we seal as v2.
+// re-uploaded through buckets under the attachment id directly (the
+// id is a UUIDv4 the webapp minted), AAD-sealed under the current
+// CEK, and registered with controlplane as a v2 index row. The
+// mutated plaintext (with `encryptionKey` cleared from each promoted
+// attachment) is what we seal as v2.
 //
 // Returns the new etag on success. Plaintext is zeroed by the caller.
 func rewrapBlob(
@@ -173,10 +175,10 @@ func rewrapChatAttachments(
 
 // promoteOneAttachment fetches one legacy ciphertext, decrypts it
 // with the embedded per-attachment key, re-uploads through buckets
-// under a path derived from (targetKey, id), and registers the new
-// v2 row with controlplane. Returns true iff the cascade fully
-// succeeded; on any per-step error returns false so the chat rewrap
-// keeps the encryptionKey field in place and the row stays v1.
+// under the attachment id, and registers the new v2 row with
+// controlplane. Returns true iff the cascade fully succeeded; on any
+// per-step error returns false so the chat rewrap keeps the
+// encryptionKey field in place and the row stays v1.
 func promoteOneAttachment(
 	ctx context.Context,
 	deps Deps,
@@ -208,16 +210,15 @@ func promoteOneAttachment(
 	defer cryptopkg.Zero(plaintext)
 	defer cryptopkg.Zero(legacyKey)
 
-	attKey, err := cryptopkg.DeriveAttachmentKey(targetKey, attID)
+	aad, err := cryptopkg.AttachmentAAD(sess.Claims.Subject, chatID, attID)
 	if err != nil {
 		return false
 	}
-	defer cryptopkg.Zero(attKey)
-	token, err := cryptopkg.DeriveAttachmentToken(targetKey, attID)
+	v2envelope, err := cryptopkg.SealAttachment(targetKey, plaintext, aad)
 	if err != nil {
 		return false
 	}
-	if err := deps.Buckets.Put(ctx, token, plaintext, attKey); err != nil {
+	if err := deps.Buckets.Put(ctx, attID, v2envelope, buckets.SentinelSlotKey); err != nil {
 		return false
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, attID, chatID); err != nil {
@@ -312,11 +313,7 @@ func deleteChatAttachmentsBestEffort(
 			if attID == "" {
 				continue
 			}
-			token, err := cryptopkg.DeriveAttachmentToken(cek, attID)
-			if err != nil {
-				continue
-			}
-			_ = deps.Buckets.Delete(ctx, token)
+			_ = deps.Buckets.Delete(ctx, attID)
 		}
 	}
 }
