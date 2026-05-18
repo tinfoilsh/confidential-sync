@@ -17,6 +17,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/server"
 )
@@ -104,7 +105,8 @@ func Start(cfg Config) (*Stack, error) {
 		return nil, fmt.Errorf("verifier: %w", err)
 	}
 	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second})
-	handler := server.NewHandler(server.Deps{Controlplane: cpClient, GitSHA: "local-stack"}, verifier, nil)
+	bucketsClient := buckets.NewClient(cpURL, "local-stack-buckets-key", &http.Client{Timeout: 10 * time.Second})
+	handler := server.NewHandler(server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: "local-stack"}, verifier, nil)
 
 	enclaveLn, err := listen(cfg.EnclaveAddr)
 	if err != nil {

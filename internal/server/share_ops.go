@@ -24,6 +24,11 @@ const shareKeySize = 32
 // shareIVSize is the AES-GCM nonce length used for share envelopes.
 const shareIVSize = 12
 
+// shareMaxPlaintextBytes caps decompressed share plaintext returned by
+// /v1/share/open. The encrypted request body is capped separately by
+// MaxRequestBytes, but gzip expansion happens after decrypt.
+const shareMaxPlaintextBytes = 32 << 20
+
 // ShareSealRequest carries the plaintext the owner wants to share.
 // The enclave generates a fresh random key, gzip-then-AES-GCM-seals
 // the plaintext, and returns the ciphertext + key. The owner uploads
@@ -192,5 +197,13 @@ func gunzipBytes(in []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	limited := io.LimitReader(r, shareMaxPlaintextBytes+1)
+	out, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > shareMaxPlaintextBytes {
+		return nil, errors.New("share: decompressed plaintext exceeds limit")
+	}
+	return out, nil
 }

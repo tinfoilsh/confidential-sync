@@ -163,6 +163,16 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	if !f.bk.has(attID) {
 		t.Fatalf("attachment was not uploaded to buckets under id %q", attID)
 	}
+	item, ok := f.bk.item(attID)
+	if !ok {
+		t.Fatalf("attachment was not uploaded to buckets under id %q", attID)
+	}
+	if !bytes.Equal(item.Value, attPT) {
+		t.Fatalf("migrated attachment bytes mismatch: got %q want %q", item.Value, attPT)
+	}
+	if len(item.EncryptionKeys) != 1 || !bytes.Equal(item.EncryptionKeys[0], attKey) {
+		t.Fatalf("migrated attachment key mismatch")
+	}
 
 	// Controlplane should know the attachment is v2-owned now.
 	f.cp.mu.Lock()
@@ -280,5 +290,3 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 		t.Fatalf("buckets entry should be gone after chat delete")
 	}
 }
-
-

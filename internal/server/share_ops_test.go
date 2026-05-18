@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -102,5 +106,44 @@ func TestShareSealGzipsPlaintext(t *testing.T) {
 	// inner stream were not compressed we'd see at least 2048+28.
 	if len(raw) > 256 {
 		t.Fatalf("expected gzip to compress a highly-redundant payload; got %d bytes", len(raw))
+	}
+}
+
+func TestShareOpenRejectsOversizedDecompressedPlaintext(t *testing.T) {
+	// Hand-craft a small ciphertext whose decompressed payload would
+	// overflow shareMaxPlaintextBytes. Sealing 32 MiB of redundant
+	// bytes through ShareSeal works but burns 100+ MiB of transient
+	// allocations on every test run; this path stays under a few KiB
+	// while still hitting the gunzip cap.
+	key := make([]byte, shareKeySize)
+	rand.Read(key)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	chunk := bytes.Repeat([]byte("A"), 64<<10)
+	written := 0
+	for written <= shareMaxPlaintextBytes {
+		n, err := gz.Write(chunk)
+		if err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		written += n
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	ciphertext, err := seal(key, buf.Bytes())
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	_, err = ShareOpen(context.Background(), Deps{}, ShareOpenRequest{
+		ShareKey:   hex.EncodeToString(key),
+		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+	})
+	if err == nil {
+		t.Fatal("expected oversized share plaintext to fail")
+	}
+	appErr, ok := err.(*AppError)
+	if !ok || appErr.Status != 400 || appErr.Code != CodeBadRequest {
+		t.Fatalf("unexpected error: %T %v", err, err)
 	}
 }

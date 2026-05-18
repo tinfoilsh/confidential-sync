@@ -59,7 +59,12 @@ type cpStub struct {
 	needsMigration    []cpNeedsMigration
 	legacyAttachments map[string][]byte // attachmentID → ciphertext (set by tests)
 	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
-	mux               *http.ServeMux
+	// wipedAttachments seeds the start_fresh response so tests can
+	// exercise the enclave-side buckets cleanup cascade. Real
+	// controlplane returns the ids of the v2 attachments it nulled
+	// during the atomic wipe; tests pre-populate this slice.
+	wipedAttachments []string
+	mux              *http.ServeMux
 	server            *httptest.Server
 	registerHandler   func(w http.ResponseWriter, r *http.Request)
 	captureHeaders    func(r *http.Request)
@@ -199,7 +204,25 @@ func (s *cpStub) handleGetBlob(scope string) http.HandlerFunc {
 func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := s.extractID(scope, r)
-		delete(s.blobs, s.putBlobKey(scope, id))
+		key := s.putBlobKey(scope, id)
+		blob, ok := s.blobs[key]
+		if !ok {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":         controlplane.StatusStaleBlob,
+				"current_etag": "0",
+			})
+			return
+		}
+		if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && ifMatch != "*" && ifMatch != formatETag(blob.ETag) {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			json.NewEncoder(w).Encode(map[string]string{
+				"code":         controlplane.StatusStaleBlob,
+				"current_etag": formatETag(blob.ETag),
+			})
+			return
+		}
+		delete(s.blobs, key)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -280,6 +303,12 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	} else {
+		for k, b := range s.blobs {
+			if b.KeyID != body.KeyID {
+				delete(s.blobs, k)
+			}
+		}
 	}
 	s.keys[body.KeyID] = struct{}{}
 	s.currentKID = body.KeyID
@@ -289,7 +318,17 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 		}
 		s.bundles[body.KeyID][body.InitialBundle.CredentialID] = *body.InitialBundle
 	}
-	w.WriteHeader(http.StatusNoContent)
+	// Mirror the real controlplane shape so the enclave's buckets
+	// cleanup cascade has something to drain when tests exercise
+	// start_fresh. wipedV2Attachments stays empty unless the test
+	// pre-seeded it via s.wipedAttachments.
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":                   true,
+		"key_id":               body.KeyID,
+		"etag":                 "1",
+		"wiped_v2_attachments": s.wipedAttachments,
+	})
 }
 
 func (s *cpStub) handleAddBundle(w http.ResponseWriter, r *http.Request) {
@@ -668,6 +707,9 @@ func TestStaleBlobSurfacesSyncConflict(t *testing.T) {
 	if parsed["code"] != "SYNC_CONFLICT" {
 		t.Fatalf("expected code=SYNC_CONFLICT, got %v in %s", parsed["code"], body2)
 	}
+	if parsed["current_etag"] != "1" {
+		t.Fatalf("expected current_etag=1, got %v in %s", parsed["current_etag"], body2)
+	}
 }
 
 func TestRegisterKeyAtomicWithIfMatchStar(t *testing.T) {
@@ -984,5 +1026,35 @@ func TestKeyIDDerivationConsistencyAcrossClients(t *testing.T) {
 	}
 	if _, err := hex.DecodeString(got); err != nil {
 		t.Fatalf("not hex: %v", err)
+	}
+}
+
+func TestAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
+	id, err := newAttachmentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(id) != 36 {
+		t.Fatalf("attachment id length = %d, want 36", len(id))
+	}
+	if _, err := hex.DecodeString(id); err != nil {
+		t.Fatalf("attachment id is not hex: %v", err)
+	}
+}
+
+func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
+	id, key, err := deriveAttachmentMaterials("idem-attachment", "user_123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(key)
+	if len(id) != 36 {
+		t.Fatalf("attachment id length = %d, want 36", len(id))
+	}
+	if _, err := hex.DecodeString(id); err != nil {
+		t.Fatalf("attachment id is not hex: %v", err)
+	}
+	if len(key) != attKeySize {
+		t.Fatalf("attachment key length = %d, want %d", len(key), attKeySize)
 	}
 }

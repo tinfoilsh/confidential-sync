@@ -1,11 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -36,17 +36,15 @@ func newBucketsStub(t *testing.T) *bucketsStub {
 		apiKey: "test-api-key",
 		items:  map[string]bucketsItem{},
 	}
-	s.server = httptest.NewServer(http.HandlerFunc(s.serve))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/items/{token}", s.serve)
+	s.server = httptest.NewServer(mux)
 	t.Cleanup(s.server.Close)
 	return s
 }
 
 func (s *bucketsStub) serve(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, "/items/") {
-		http.NotFound(w, r)
-		return
-	}
-	token := strings.TrimPrefix(r.URL.Path, "/items/")
+	token := r.PathValue("token")
 	if got := r.Header.Get("Authorization"); got != "Bearer "+s.apiKey {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -61,6 +59,10 @@ func (s *bucketsStub) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if body.Format != 1 {
+			http.Error(w, "unsupported format", http.StatusBadRequest)
 			return
 		}
 		value, err := base64.StdEncoding.DecodeString(body.Value)
@@ -97,7 +99,7 @@ func (s *bucketsStub) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		match := false
 		for _, k := range item.EncryptionKeys {
-			if len(k) == len(supplied) && string(k) == string(supplied) {
+			if bytes.Equal(k, supplied) {
 				match = true
 				break
 			}
@@ -134,8 +136,9 @@ func (s *bucketsStub) has(token string) bool {
 	return ok
 }
 
-func (s *bucketsStub) count() int {
+func (s *bucketsStub) item(token string) (bucketsItem, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.items)
+	item, ok := s.items[token]
+	return item, ok
 }

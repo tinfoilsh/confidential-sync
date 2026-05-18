@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -296,6 +297,47 @@ func TestAddBundleForwardsCredentials(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestGetLegacyAttachmentRejectsOversizedBody(t *testing.T) {
+	// Shrink the cap for the duration of the test so we can prove the
+	// oversize-body rejection without streaming 64 MiB through the
+	// fixture. The cap is a package-level var precisely so tests can
+	// pick a small value here.
+	orig := maxLegacyAttachmentBytes
+	maxLegacyAttachmentBytes = 1024
+	defer func() { maxLegacyAttachmentBytes = orig }()
+
+	st := newStub(t)
+	st.handle1("GET", "/api/storage/attachment/att_1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(w, io.LimitReader(repeatingReader('x'), int64(maxLegacyAttachmentBytes+1)))
+	})
+	c := NewClient(st.server.URL, nil)
+	_, err := c.GetLegacyAttachment(context.Background(), "j", "att_1")
+	if err == nil || !strings.Contains(err.Error(), "legacy attachment exceeds") {
+		t.Fatalf("expected oversized attachment error, got %v", err)
+	}
+}
+
+func TestGetLegacyAttachmentMapsNotFound(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/storage/attachment/missing", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	c := NewClient(st.server.URL, nil)
+	_, err := c.GetLegacyAttachment(context.Background(), "j", "missing")
+	if !errors.Is(err, ErrLegacyAttachmentNotFound) {
+		t.Fatalf("expected ErrLegacyAttachmentNotFound, got %v", err)
+	}
+}
+
+type repeatingReader byte
+
+func (r repeatingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(r)
+	}
+	return len(p), nil
 }
 
 // cpErrAs is a tiny helper to keep tests readable without leaking errors.As

@@ -3,9 +3,13 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"io"
+
+	"golang.org/x/crypto/hkdf"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
@@ -36,6 +40,13 @@ const attKeySize = 32
 type AttachmentPutRequest struct {
 	ChatID    string `json:"chat_id"`
 	Plaintext string `json:"plaintext"` // base64 attachment bytes
+	// IdempotencyKey is the caller's anti-duplication tag. When set,
+	// the enclave deterministically derives the attachment id and
+	// per-attachment key from it (via HKDF over the user's clerk
+	// subject so two users with colliding ids still hit different
+	// buckets slots), so a retried upload produces the same
+	// (id, att_key) and the same buckets bytes — no orphans.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // AttachmentPutResponse confirms the bucket write + index
@@ -48,16 +59,47 @@ type AttachmentPutResponse struct {
 	AttKey string `json:"att_key"` // base64 32-byte AES-256 key
 }
 
-// newAttachmentID mints a fresh 128-bit random attachment id encoded
-// as 32 lowercase hex characters. We use hex (not UUIDv4 dashes) so
-// the id is a clean buckets-path-safe string with no
-// version-bit/encoding ambiguity.
+const (
+	attachmentIDBytes = 18
+)
+
+// newAttachmentID mints a fresh 144-bit random attachment id encoded
+// as 36 lowercase hex characters. Buckets currently requires URL
+// handles to be at least 36 chars, and hex keeps the id path-safe
+// with no version-bit/encoding ambiguity.
 func newAttachmentID() (string, error) {
-	var b [16]byte
+	var b [attachmentIDBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+const (
+	attachmentIDInfo  = "tinfoil-attachment-id-v1"
+	attachmentKeyInfo = "tinfoil-attachment-key-v1"
+)
+
+// deriveAttachmentMaterials reproduces the (id, slot key) pair from
+// a caller-supplied idempotency key + clerk subject. The same
+// idempotency key from the same user always produces the same id +
+// key, so a retried AttachmentPut is a true no-op against buckets
+// instead of an orphaning duplicate upload.
+func deriveAttachmentMaterials(idempotencyKey, clerkSubject string) (string, []byte, error) {
+	if idempotencyKey == "" {
+		return "", nil, errors.New("idempotency key is required")
+	}
+	ikm := []byte(idempotencyKey + "|" + clerkSubject)
+	idBytes := make([]byte, attachmentIDBytes)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(attachmentIDInfo)), idBytes); err != nil {
+		return "", nil, err
+	}
+	key := make([]byte, attKeySize)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(attachmentKeyInfo)), key); err != nil {
+		cryptopkg.Zero(key)
+		return "", nil, err
+	}
+	return hex.EncodeToString(idBytes), key, nil
 }
 
 // AttachmentGetRequest carries an attachment fetch. The webapp
@@ -73,15 +115,6 @@ type AttachmentGetRequest struct {
 type AttachmentGetResponse struct {
 	OK        bool   `json:"ok"`
 	Plaintext string `json:"plaintext"`
-}
-
-// AttachmentDeleteRequest removes the buckets entry. Carries no key
-// because the buckets path is the attachment id and deletion only
-// needs addressing — buckets verifies the request against the
-// enclave's Tinfoil API key, which is sufficient since the path is
-// inside the enclave's tenant.
-type AttachmentDeleteRequest struct {
-	ID string `json:"id"`
 }
 
 // AttachmentPut uploads an attachment plaintext to buckets under a
@@ -102,14 +135,28 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 	}
 	defer cryptopkg.Zero(plaintext)
 
-	id, err := newAttachmentID()
-	if err != nil {
-		return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment id: " + err.Error()}
-	}
-
-	attKey := make([]byte, attKeySize)
-	if _, err := rand.Read(attKey); err != nil {
-		return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment key: " + err.Error()}
+	var (
+		id     string
+		attKey []byte
+	)
+	if req.IdempotencyKey != "" {
+		// Deterministic derivation: any retry of the same upload
+		// resolves to the same id+key. The buckets Put under that
+		// pair is idempotent (same value, same slot key), and the
+		// controlplane index registration is safe to repeat.
+		id, attKey, err = deriveAttachmentMaterials(req.IdempotencyKey, sess.Claims.Subject)
+		if err != nil {
+			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "derive attachment materials: " + err.Error()}
+		}
+	} else {
+		id, err = newAttachmentID()
+		if err != nil {
+			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment id: " + err.Error()}
+		}
+		attKey = make([]byte, attKeySize)
+		if _, err := rand.Read(attKey); err != nil {
+			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment key: " + err.Error()}
+		}
 	}
 	defer cryptopkg.Zero(attKey)
 
@@ -166,6 +213,9 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 		if errors.Is(err, buckets.ErrNotFound) {
 			return nil, &AppError{Status: 404, Code: CodeNotFound, Message: "attachment not found"}
 		}
+		if errors.Is(err, buckets.ErrForbidden) {
+			return nil, badRequest("attachment key does not match")
+		}
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets get failed: " + err.Error()}
 	}
 	defer cryptopkg.Zero(plaintext)
@@ -173,20 +223,4 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 		OK:        true,
 		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
 	}, nil
-}
-
-// AttachmentDelete removes the buckets entry for a single attachment.
-// Called when the enclave walks a chat's attachments at delete time
-// and when the start-fresh wipe drains the user's bucket footprint.
-func AttachmentDelete(ctx context.Context, deps Deps, _ Session, req AttachmentDeleteRequest) (*OKResponse, error) {
-	if deps.Buckets == nil || !deps.Buckets.Configured() {
-		return nil, &AppError{Status: 503, Code: CodeInternal, Message: "buckets backend not configured"}
-	}
-	if req.ID == "" {
-		return nil, badRequest("id is required")
-	}
-	if err := deps.Buckets.Delete(ctx, req.ID); err != nil {
-		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets delete failed: " + err.Error()}
-	}
-	return &OKResponse{OK: true}, nil
 }

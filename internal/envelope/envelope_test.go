@@ -98,6 +98,16 @@ func TestCanonicalAADRequiresExplicitProfileID(t *testing.T) {
 	if _, err := CanonicalAAD(missing); err == nil {
 		t.Fatal("profile AAD without explicit id must fail")
 	}
+
+	wrong := AAD{
+		KeyIDHex:    strings.Repeat("c", 32),
+		Scope:       ScopeProfile,
+		ID:          "typo",
+		ClerkUserID: "u",
+	}
+	if _, err := CanonicalAAD(wrong); err == nil {
+		t.Fatal("profile AAD with non-canonical id must fail")
+	}
 }
 
 func TestCanonicalBundleAAD(t *testing.T) {
@@ -112,22 +122,6 @@ func TestCanonicalBundleAAD(t *testing.T) {
 	want := `{"clerk_user_id":"user_1","credential_id":"cred-1","domain":"tinfoil-key-bundle-v2","key_id":"00000000000000000000000000000000"}`
 	if string(out) != want {
 		t.Fatalf("bundle AAD mismatch:\n got:  %s\n want: %s", out, want)
-	}
-}
-
-func TestMetadataHashStableAcrossKeyOrder(t *testing.T) {
-	a := map[string]any{"a": 1, "b": "two", "c": []any{1.0, 2.0}}
-	b := map[string]any{"c": []any{1.0, 2.0}, "b": "two", "a": 1}
-	ha, err := MetadataHash(a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hb, err := MetadataHash(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ha != hb {
-		t.Fatalf("metadata hash unstable: %s vs %s", ha, hb)
 	}
 }
 
@@ -401,10 +395,10 @@ func TestRewrapV1ProductionBlob(t *testing.T) {
 	clerkUserID := "user_prod_v1"
 
 	payload := map[string]any{
-		"title":      "prod v1 round trip",
-		"messages":   []any{"hello", "world"},
-		"isDeleted":  false,
-		"updatedAt":  "2024-05-15T10:00:00.000Z",
+		"title":     "prod v1 round trip",
+		"messages":  []any{"hello", "world"},
+		"isDeleted": false,
+		"updatedAt": "2024-05-15T10:00:00.000Z",
 	}
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {

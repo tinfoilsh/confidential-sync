@@ -2,8 +2,6 @@ package envelope
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"sort"
@@ -69,6 +67,9 @@ func CanonicalAAD(a AAD) ([]byte, error) {
 	if a.ClerkUserID == "" {
 		return nil, ErrAADInvalid
 	}
+	if a.Scope == ScopeProfile && a.ID != ProfileSingletonID {
+		return nil, ErrAADInvalid
+	}
 	if a.ID == "" {
 		return nil, ErrAADInvalid
 	}
@@ -107,18 +108,6 @@ func CanonicalBundleAAD(a BundleAAD) ([]byte, error) {
 	return marshalCanonical(fields)
 }
 
-// MetadataHash computes the canonical SHA-256 of unencrypted side metadata.
-// Metadata is canonicalized to sorted-key JSON before hashing so clients and
-// the enclave agree byte-for-byte even if their JSON encoders differ.
-func MetadataHash(metadata map[string]any) (string, error) {
-	canon, err := canonicalize(metadata)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(canon)
-	return hex.EncodeToString(sum[:]), nil
-}
-
 type kv struct {
 	k string
 	v any
@@ -138,14 +127,6 @@ func marshalCanonical(fields []kv) ([]byte, error) {
 		}
 	}
 	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
-func canonicalize(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := writeCanonicalValue(&buf, v); err != nil {
-		return nil, err
-	}
 	return buf.Bytes(), nil
 }
 

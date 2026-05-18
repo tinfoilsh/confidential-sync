@@ -112,10 +112,22 @@ func Encrypt(key []byte, plaintext, aad []byte, keyIDHex string) ([]byte, error)
 	if len(keyIDHex) != 32 || !isLowerHex(keyIDHex) {
 		return nil, ErrInvalidEnvelope
 	}
+	// Reject plaintexts that won't fit under the decompress cap.
+	// Without this check a write can succeed at seal time and then
+	// fail every subsequent decrypt — turning oversized inputs into
+	// silent data loss instead of an immediate, actionable error.
+	if len(plaintext) > maxDecompressedBytes {
+		return nil, ErrInvalidEnvelope
+	}
 	compressed, err := gzipBytes(plaintext)
 	if err != nil {
 		return nil, err
 	}
+	// The compressed buffer holds a transformed copy of the
+	// plaintext until ciphertext is produced; zero it on the way
+	// out so we don't leave plaintext-derived material lying in
+	// enclave memory longer than necessary.
+	defer crypto.Zero(compressed)
 	nonce, ct, err := crypto.Seal(key, compressed, aad)
 	if err != nil {
 		return nil, err
@@ -175,6 +187,7 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	if err != nil {
 		return DecryptResult{}, err
 	}
+	defer crypto.Zero(compressed)
 	pt, err := gunzip(compressed)
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)

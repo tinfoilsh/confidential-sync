@@ -4,8 +4,8 @@ package smoke
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
-	"strings"
 	"testing"
 )
 
@@ -49,8 +49,14 @@ func TestT06_CASPreventsConcurrentOverwrite(t *testing.T) {
 	if status != http.StatusConflict {
 		t.Fatalf("expected 409, got %d body=%s", status, resp.Raw)
 	}
-	if !strings.Contains(string(resp.Raw), "SYNC_CONFLICT") {
-		t.Fatalf("expected SYNC_CONFLICT in response, got: %s", resp.Raw)
+	var errBody struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(resp.Raw, &errBody); err != nil {
+		t.Fatalf("parse error response: %v body=%s", err, resp.Raw)
+	}
+	if errBody.Code != "SYNC_CONFLICT" {
+		t.Fatalf("expected code=SYNC_CONFLICT, got %q body=%s", errBody.Code, resp.Raw)
 	}
 
 	// Sanity: the row's plaintext is still "second", not "third-stale".

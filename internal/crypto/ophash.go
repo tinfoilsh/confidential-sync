@@ -64,6 +64,17 @@ func DeriveOpHashKey(cek []byte) ([]byte, error) {
 //	                ("0" for create, "*" or a hex key for register-key)
 //	IdempotencyKey: client-chosen UUID/ULID, ASCII
 //	Body:           raw request body bytes (nil-safe for DELETEs)
+//	AAD:            canonical AAD bytes used during seal; nil for
+//	                non-blob operations (key register / rewrap-by-meta /
+//	                share / attachment)
+//	Envelope:       v2 envelope bytes posted as the request body; nil
+//	                for non-blob operations
+//
+// AAD and Envelope replace the previous "hash of plaintext + metadata"
+// proxy. Because the envelope already authenticates the plaintext
+// under the user's CEK via AES-GCM, MACing the envelope under K_op
+// transitively commits to the plaintext without ever placing a
+// plaintext-derived digest on the wire.
 type CanonicalInput struct {
 	Method         string
 	Path           string
@@ -71,12 +82,21 @@ type CanonicalInput struct {
 	IfMatch        string
 	IdempotencyKey string
 	Body           []byte
+	AAD            []byte
+	Envelope       []byte
 }
 
 // AppendCanonical writes the canonical encoding of the tuple to dst and
 // returns the extended slice. Each field is preceded by its length as a
 // big-endian uint32. This is the exact byte string the MAC is computed
 // over and the same encoding the web client uses.
+//
+// AAD and Envelope are only appended when at least one is populated.
+// Body-only operations (RegisterKey, AddBundle, rewrap, etc.) keep
+// the historical encoding so cached sync_idempotency_keys entries
+// continue to verify after this rollout. Blob mutations always carry
+// non-empty AAD + Envelope so they unambiguously land on the
+// extended encoding.
 func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.Method))
 	dst = appendLenPrefixed(dst, []byte(in.Path))
@@ -84,6 +104,10 @@ func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.IfMatch))
 	dst = appendLenPrefixed(dst, []byte(in.IdempotencyKey))
 	dst = appendLenPrefixed(dst, in.Body)
+	if len(in.AAD) > 0 || len(in.Envelope) > 0 {
+		dst = appendLenPrefixed(dst, in.AAD)
+		dst = appendLenPrefixed(dst, in.Envelope)
+	}
 	return dst
 }
 
