@@ -641,8 +641,20 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 		Body:           body,
 	})
 
-	if err := deps.Controlplane.RegisterKey(ctx, cpReq); err != nil {
+	cpResp, err := deps.Controlplane.RegisterKey(ctx, cpReq)
+	if err != nil {
 		return nil, err
+	}
+	// Drain the buckets blobs the controlplane wiped under the
+	// start-fresh bypass. The controlplane already committed its
+	// half of the wipe; failures here only leave orphaned buckets
+	// entries (unreachable to anyone without the old CEK + AAD),
+	// so the cascade is fire-and-forget per-id and never fails the
+	// register-key call.
+	if len(cpResp.WipedV2Attachments) > 0 && deps.Buckets != nil && deps.Buckets.Configured() {
+		for _, attID := range cpResp.WipedV2Attachments {
+			_ = deps.Buckets.Delete(ctx, attID)
+		}
 	}
 	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
 }
@@ -750,6 +762,7 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 	}
 	out := &KeyCurrentResponse{
 		KeyID:      &resp.KeyID,
+		Etag:       resp.Etag,
 		CreatedVia: resp.CreatedVia,
 		Bundles:    make(map[string]KeyCurrentBundle, len(resp.Bundles)),
 	}

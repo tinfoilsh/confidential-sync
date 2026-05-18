@@ -138,7 +138,7 @@ func TestRegisterKeyExistingDataConflict(t *testing.T) {
 		})
 	})
 	c := NewClient(st.server.URL, nil)
-	err := c.RegisterKey(context.Background(), RegisterKeyRequest{
+	_, err := c.RegisterKey(context.Background(), RegisterKeyRequest{
 		JWT:        "j",
 		KeyIDHex:   strings.Repeat("a", 32),
 		CreatedVia: "passkey",

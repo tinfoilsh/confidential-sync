@@ -396,7 +396,20 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"code": controlplane.StatusStaleKey, "current_key_id": s.currentKID})
 		return
 	}
-	if body.CreatedVia != "start_fresh" {
+	wipedAttachments := []string{}
+	if body.CreatedVia == "start_fresh" {
+		// Mirror the controlplane's atomic wipe: drop every blob
+		// for the user before swapping the primary key. The
+		// localstack stub doesn't track attachment-id ownership
+		// separately from the chat blobs (buckets is a no-op here),
+		// so the returned `wiped_v2_attachments` is intentionally
+		// empty; production controlplane returns the real ids.
+		for k, b := range s.blobs {
+			if b.KeyID != "" && b.KeyID != body.KeyID {
+				delete(s.blobs, k)
+			}
+		}
+	} else {
 		for _, b := range s.blobs {
 			if b.KeyID != "" && b.KeyID != body.KeyID {
 				w.WriteHeader(http.StatusConflict)
@@ -413,7 +426,13 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		}
 		s.bundles[body.KeyID][body.InitialBundle.CredentialID] = *body.InitialBundle
 	}
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":                   true,
+		"key_id":               body.KeyID,
+		"etag":                 "1",
+		"wiped_v2_attachments": wipedAttachments,
+	})
 }
 
 func (s *StubCP) currentKey(w http.ResponseWriter, r *http.Request) {

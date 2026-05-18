@@ -2,82 +2,75 @@ package crypto
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
-func TestDeriveAttachmentKey_StableAcrossCalls(t *testing.T) {
-	cek := make([]byte, KeySize)
-	for i := range cek {
-		cek[i] = byte(i)
-	}
-	a, err := DeriveAttachmentKey(cek, "att-1")
+func TestAttachmentAAD_StableAndScoped(t *testing.T) {
+	a, err := AttachmentAAD("user_1", "chat_1", "att_1")
 	if err != nil {
-		t.Fatalf("derive: %v", err)
+		t.Fatalf("aad: %v", err)
 	}
-	b, err := DeriveAttachmentKey(cek, "att-1")
+	b, err := AttachmentAAD("user_1", "chat_1", "att_1")
 	if err != nil {
-		t.Fatalf("derive again: %v", err)
+		t.Fatal(err)
 	}
 	if !bytes.Equal(a, b) {
-		t.Fatal("expected derivation to be deterministic for same (cek, id)")
+		t.Fatal("expected canonical AAD to be deterministic for the same tuple")
+	}
+	c, _ := AttachmentAAD("user_2", "chat_1", "att_1")
+	if bytes.Equal(a, c) {
+		t.Fatal("different users must produce distinct AAD")
+	}
+	d, _ := AttachmentAAD("user_1", "chat_2", "att_1")
+	if bytes.Equal(a, d) {
+		t.Fatal("different chats must produce distinct AAD")
 	}
 }
 
-func TestDeriveAttachmentKey_DistinctIDsGiveDistinctKeys(t *testing.T) {
-	cek := make([]byte, KeySize)
-	a, _ := DeriveAttachmentKey(cek, "att-1")
-	b, _ := DeriveAttachmentKey(cek, "att-2")
-	if bytes.Equal(a, b) {
-		t.Fatal("expected different attachment ids to give different keys")
-	}
-}
-
-func TestDeriveAttachmentToken_StableAndDistinct(t *testing.T) {
-	cek := make([]byte, KeySize)
-	for i := range cek {
-		cek[i] = byte(i + 1)
-	}
-	a, err := DeriveAttachmentToken(cek, "att-1")
+func TestSealOpenAttachment_RoundTrip(t *testing.T) {
+	cek := bytes.Repeat([]byte{0x42}, KeySize)
+	pt := []byte("hello attachment world")
+	aad, _ := AttachmentAAD("u", "c", "att")
+	blob, err := SealAttachment(cek, pt, aad)
 	if err != nil {
-		t.Fatalf("derive: %v", err)
+		t.Fatalf("seal: %v", err)
 	}
-	b, _ := DeriveAttachmentToken(cek, "att-1")
-	if a != b {
-		t.Fatal("expected token derivation to be deterministic")
+	if len(blob) <= AttachmentIVSize {
+		t.Fatalf("blob is shorter than the IV: %d", len(blob))
 	}
-	c, _ := DeriveAttachmentToken(cek, "att-2")
-	if a == c {
-		t.Fatal("expected different ids to give different tokens")
+	got, err := OpenAttachment(cek, blob, aad)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if !bytes.Equal(got, pt) {
+		t.Fatalf("round-trip mismatch: %q vs %q", got, pt)
 	}
 }
 
-func TestDeriveAttachment_KeyAndTokenAreIndependent(t *testing.T) {
+func TestOpenAttachment_RejectsWrongAAD(t *testing.T) {
+	cek := bytes.Repeat([]byte{0x11}, KeySize)
+	pt := []byte("body")
+	aad, _ := AttachmentAAD("u", "c", "att")
+	blob, err := SealAttachment(cek, pt, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong, _ := AttachmentAAD("u", "c", "different-att")
+	if _, err := OpenAttachment(cek, blob, wrong); err == nil {
+		t.Fatal("expected open to fail with the wrong AAD")
+	}
+}
+
+func TestSealAttachment_RejectsShortKey(t *testing.T) {
+	if _, err := SealAttachment(make([]byte, 16), []byte("x"), nil); err == nil {
+		t.Fatal("expected error for short cek")
+	}
+}
+
+func TestOpenAttachment_RejectsShortBlob(t *testing.T) {
 	cek := make([]byte, KeySize)
-	for i := range cek {
-		cek[i] = byte(i + 2)
-	}
-	k, _ := DeriveAttachmentKey(cek, "att-1")
-	tok, _ := DeriveAttachmentToken(cek, "att-1")
-	// Token is hex of 24 bytes => 48 hex chars; cannot equal a 32-byte key.
-	if string(k) == tok {
-		t.Fatal("expected key and token to be independent values")
-	}
-}
-
-func TestDeriveAttachmentKey_RejectsBadInputs(t *testing.T) {
-	if _, err := DeriveAttachmentKey(make([]byte, 16), "x"); err == nil {
-		t.Fatal("expected error for short cek")
-	}
-	if _, err := DeriveAttachmentKey(make([]byte, KeySize), ""); err == nil {
-		t.Fatal("expected error for empty id")
-	}
-}
-
-func TestDeriveAttachmentToken_RejectsBadInputs(t *testing.T) {
-	if _, err := DeriveAttachmentToken(make([]byte, 16), "x"); err == nil {
-		t.Fatal("expected error for short cek")
-	}
-	if _, err := DeriveAttachmentToken(make([]byte, KeySize), ""); err == nil {
-		t.Fatal("expected error for empty id")
+	if _, err := OpenAttachment(cek, []byte("tiny"), nil); err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("expected too-short error, got %v", err)
 	}
 }
