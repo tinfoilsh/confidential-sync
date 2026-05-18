@@ -130,7 +130,7 @@ func TestPutBlobStaleBlob(t *testing.T) {
 
 func TestRegisterKeyExistingDataConflict(t *testing.T) {
 	st := newStub(t)
-	st.handle1("POST", "/api/keys", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("POST", "/api/sync/keys", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(map[string]string{
 			"code":           StatusExistingDataUnderOtherKey,
@@ -266,7 +266,7 @@ func TestParseErrorNoBody(t *testing.T) {
 
 func TestGetCurrentKeyNotFound(t *testing.T) {
 	st := newStub(t)
-	st.handle1("GET", "/api/keys/current", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("GET", "/api/sync/keys/current", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	c := NewClient(st.server.URL, nil)
@@ -281,7 +281,7 @@ func TestGetCurrentKeyNotFound(t *testing.T) {
 
 func TestAddBundleForwardsCredentials(t *testing.T) {
 	st := newStub(t)
-	st.handle1("POST", "/api/keys/"+strings.Repeat("a", 32)+"/bundles", func(w http.ResponseWriter, r *http.Request) {
+	st.handle1("POST", "/api/sync/keys/"+strings.Repeat("a", 32)+"/bundles", func(w http.ResponseWriter, r *http.Request) {
 		var got map[string]string
 		json.NewDecoder(r.Body).Decode(&got)
 		if got["credential_id"] != "cred-1" || got["kek_iv"] != "iv" || got["encrypted_keys"] != "ct" {

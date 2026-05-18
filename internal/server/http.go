@@ -45,7 +45,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.Handle("POST /v1/key/current", h.authMiddleware(h.keyCurrent))
 
 	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
-	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddleware(h.migrateAll))
+	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllBudget+time.Minute))
 
 	mux.Handle("POST /v1/attachment/put", h.authMiddleware(h.attachmentPut))
 	mux.Handle("POST /v1/attachment/get", h.authMiddleware(h.attachmentGet))
@@ -66,13 +66,17 @@ func (h *Handler) Routes() http.Handler {
 // authMiddleware extracts and verifies the JWT, then attaches a Session to
 // the request context. Unauthenticated requests get a uniform 401.
 func (h *Handler) authMiddleware(fn func(http.ResponseWriter, *http.Request, Session)) http.Handler {
+	return h.authMiddlewareWithTimeout(fn, 30*time.Second)
+}
+
+func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.Request, Session), timeout time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok, err := auth.BearerToken(r.Header.Get("Authorization"))
 		if err != nil {
 			writeError(w, unauthorized("missing bearer token"))
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		claims, err := h.verifier.Verify(ctx, tok)
 		if err != nil {

@@ -78,22 +78,22 @@ func rewrapBlob(
 		Rewrap:         true,
 		Ciphertext:     envBlob,
 	}
-	rewrapBody, err := controlplane.RewrapBody(rewrapReq)
-	if err != nil {
-		return "", err
-	}
 	opKey, err := cryptopkg.DeriveOpHashKey(targetKey)
 	if err != nil {
 		return "", err
 	}
 	defer cryptopkg.Zero(opKey)
+	hashBody, err := stableBlobOperationBody(string(scope), id, finalPlaintext, nil)
+	if err != nil {
+		return "", err
+	}
 	rewrapReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
 		Method:         http.MethodPost,
 		Path:           controlplane.RewrapPath,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
-		Body:           rewrapBody,
+		Body:           hashBody,
 	})
 	resp, err := deps.Controlplane.PutBlob(ctx, rewrapReq)
 	if err != nil {

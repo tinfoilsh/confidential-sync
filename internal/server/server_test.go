@@ -127,10 +127,10 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("GET /api/sync/needs-migration", s.handleNeedsMigration)
 	s.mux.HandleFunc("POST /api/sync/migration-failure", s.handleMigrationFailure)
 	// key registry
-	s.mux.HandleFunc("POST /api/keys", s.handleRegisterKey)
-	s.mux.HandleFunc("POST /api/keys/{kid}/bundles", s.handleAddBundle)
-	s.mux.HandleFunc("DELETE /api/keys/{kid}/bundles/{cid}", s.handleRemoveBundle)
-	s.mux.HandleFunc("GET /api/keys/current", s.handleCurrentKey)
+	s.mux.HandleFunc("POST /api/sync/keys", s.handleRegisterKey)
+	s.mux.HandleFunc("POST /api/sync/keys/{kid}/bundles", s.handleAddBundle)
+	s.mux.HandleFunc("DELETE /api/sync/keys/{kid}/bundles/{cid}", s.handleRemoveBundle)
+	s.mux.HandleFunc("GET /api/sync/keys/current", s.handleCurrentKey)
 	// legacy attachment fetch + new attachment ownership index
 	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
 	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
