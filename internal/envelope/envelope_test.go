@@ -289,6 +289,64 @@ func TestDetectAllFormats(t *testing.T) {
 	}
 }
 
+// TestDetect_V1WithJSONPrefixNonce pins the guarantee that a v1
+// binary blob whose nonce starts with `{` or `{"` — the byte
+// patterns that look like the opening of a JSON envelope — still
+// classifies as v1. The discriminator must rely on a successful
+// JSON parse, not a prefix check; under prefix-only rules a real
+// production v1 blob with this nonce would silently route to the
+// JSON branch and become permanently undecryptable.
+func TestDetect_V1WithJSONPrefixNonce(t *testing.T) {
+	// Construct a blob shaped exactly like v1: nonce(12) || ct+tag.
+	// Pin the first two nonce bytes to `{` and `"` to exercise the
+	// adversarial case; the remaining bytes are any value that
+	// doesn't accidentally parse as JSON.
+	blob := make([]byte, cryptopkg.NonceSize+cryptopkg.TagSize+8)
+	for i := range blob {
+		blob[i] = byte(i + 1)
+	}
+	blob[0] = '{'
+	blob[1] = '"'
+	if Detect(blob) != VersionV1 {
+		t.Fatalf("v1 blob with JSON-prefix nonce must classify as v1, not %v", Detect(blob))
+	}
+}
+
+// TestDetect_TruncatedV2FallsThroughToV1 pins the trade-off baked
+// into the strict-parse cascade: a truncated v2 envelope fails the
+// full JSON parse and is treated as v1. DecryptLegacy then fails to
+// decrypt the malformed bytes and surfaces a decrypt error to the
+// caller. This is unavoidable from the wire format — v1 has no
+// version tag, so anything that does not parse as a complete v0 /
+// v2 envelope must be tried as v1 first to keep real v1 blobs
+// decryptable. The pin exists to make this trade-off explicit in
+// the test suite so any future "tighten Detect to return Unknown
+// on parse failure" change has to deal with the contract loudly.
+func TestDetect_TruncatedV2FallsThroughToV1(t *testing.T) {
+	truncated := []byte(`{"v":2,"kid":"aaaa`)
+	// Long enough to look like a v1 blob byte-count wise; the test
+	// asserts the dispatch decision, not the decrypt outcome.
+	pad := make([]byte, cryptopkg.NonceSize+cryptopkg.TagSize)
+	truncated = append(truncated, pad...)
+	if got := Detect(truncated); got != VersionV1 {
+		t.Fatalf("truncated v2 must fall through to v1 (so DecryptLegacy is tried), got %v", got)
+	}
+}
+
+// TestDetect_V0RequiresIvAndDataFields locks in the shape contract
+// for v0: a JSON object missing one of the required legacy fields
+// is not v0 even when the prefix looks JSON-ish.
+func TestDetect_V0RequiresIvAndDataFields(t *testing.T) {
+	missingData := []byte(`{"iv":"aaaaaaaaaaaa"}`)
+	if got := Detect(missingData); got == VersionV0 {
+		t.Fatalf("v0 detection must require both iv and data, got %v", got)
+	}
+	missingIv := []byte(`{"data":"aaaaaaaa"}`)
+	if got := Detect(missingIv); got == VersionV0 {
+		t.Fatalf("v0 detection must require both iv and data, got %v", got)
+	}
+}
+
 func TestDecryptLegacyV0RoundTrip(t *testing.T) {
 	k := newKey(t)
 	pt := []byte("legacy v0 plaintext")
