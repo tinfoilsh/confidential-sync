@@ -109,12 +109,10 @@ func rewrapBlob(
 // rewrapChatAttachments walks the chat plaintext, finds any
 // attachments with an embedded encryptionKey (legacy v0/v1 image
 // rows), and promotes them to buckets-backed v2 storage. The
-// per-attachment key is reused as the buckets slot key, so the
-// chat JSON itself never has to change — the same `encryptionKey`
-// that used to unlock the controlplane BYTEA now unlocks the buckets
-// blob. Returns (nil, nil) when the plaintext doesn't parse as a
-// chat envelope or contains no legacy attachments — letting the
-// rewrap proceed as a pure re-seal.
+// per-attachment key is reused as the buckets slot key, and legacy
+// attachment ids are preserved as the buckets ids.
+// Returns (nil, nil) when the plaintext doesn't parse as a chat
+// envelope — letting the rewrap proceed as a pure re-seal.
 //
 // We swallow per-attachment failures: an attachment whose legacy row
 // is already gone (e.g. 404), or whose buckets PUT fails transiently,
@@ -162,20 +160,22 @@ func rewrapChatAttachments(
 		}
 	}
 
-	// Plaintext is never mutated; the per-attachment encryptionKey
-	// stays as-is so the same value addresses the buckets entry
-	// after promotion as addressed the controlplane BYTEA before it.
-	return nil, nil
+	mutated, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, nil
+	}
+	return mutated, nil
 }
 
 // promoteOneAttachment fetches one legacy ciphertext, decrypts it
 // with the embedded per-attachment key, re-uploads the plaintext
-// through buckets under the attachment id (reusing the same
-// per-attachment key as the buckets slot key), and registers the
-// new v2 row with controlplane. Returns true iff the cascade fully
-// succeeded. The chat JSON's `encryptionKey` field is preserved
-// verbatim so the same key now addresses the buckets entry that
-// previously addressed the legacy BYTEA row.
+// through buckets under the same attachment id (reusing the same
+// per-attachment key as the buckets slot key), and registers the new
+// v2 row with controlplane. Returns true iff the cascade fully
+// succeeded. The chat JSON's
+// `encryptionKey` field is preserved verbatim so the same key now
+// addresses the buckets entry that previously addressed the legacy
+// BYTEA row.
 func promoteOneAttachment(
 	ctx context.Context,
 	deps Deps,

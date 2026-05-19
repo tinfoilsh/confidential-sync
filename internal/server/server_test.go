@@ -65,9 +65,9 @@ type cpStub struct {
 	// during the atomic wipe; tests pre-populate this slice.
 	wipedAttachments []string
 	mux              *http.ServeMux
-	server            *httptest.Server
-	registerHandler   func(w http.ResponseWriter, r *http.Request)
-	captureHeaders    func(r *http.Request)
+	server           *httptest.Server
+	registerHandler  func(w http.ResponseWriter, r *http.Request)
+	captureHeaders   func(r *http.Request)
 }
 
 type cpNeedsMigration struct {
