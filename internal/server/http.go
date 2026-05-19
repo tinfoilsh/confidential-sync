@@ -69,7 +69,15 @@ func (h *Handler) Routes() http.Handler {
 	// /v1/share/open is intentionally unauthenticated. Knowing the
 	// share key in the URL fragment is the access proof — the same
 	// trust model the legacy in-browser share path uses today.
-	mux.Handle("POST /v1/share/open", withRequestTimeout(http.HandlerFunc(h.shareOpen), attachmentRequestTimeout))
+	//
+	// No context timeout wrapper here: the work is pure in-memory
+	// CPU (AES-GCM Open + gzip inflate), neither of which observes
+	// context cancellation in Go's stdlib, so a wall-clock deadline
+	// would fire without doing anything. DoS protection comes from
+	// the bounded input — MaxRequestBytes caps the ciphertext on
+	// the wire and shareMaxPlaintextBytes caps the post-decompress
+	// plaintext — which makes worst-case work O(MiB), not O(time).
+	mux.Handle("POST /v1/share/open", http.HandlerFunc(h.shareOpen))
 
 	mux.HandleFunc("GET /v1/health", h.health)
 	mux.HandleFunc("GET /health", h.health)
