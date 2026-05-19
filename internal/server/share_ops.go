@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -137,40 +135,29 @@ func ShareOpen(ctx context.Context, deps Deps, req ShareOpenRequest) (*ShareOpen
 
 // seal returns [12B IV || AES-GCM ciphertext(plaintext, IV, no AAD)].
 // Format matches the on-the-wire layout the webapp recipient expects.
+// Wraps `cryptopkg.Seal` (the shared AES-256-GCM primitive used by
+// the envelope package) so this file does not maintain a private copy
+// of the cipher setup — drift in security-critical code is the
+// reason we centralise here.
 func seal(key, plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+	nonce, ct, err := cryptopkg.Seal(key, plaintext, nil)
 	if err != nil {
 		return nil, err
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	iv := make([]byte, shareIVSize)
-	if _, err := rand.Read(iv); err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, shareIVSize+len(plaintext)+aead.Overhead())
-	out = append(out, iv...)
-	out = aead.Seal(out, iv, plaintext, nil)
+	out := make([]byte, 0, len(nonce)+len(ct))
+	out = append(out, nonce...)
+	out = append(out, ct...)
 	return out, nil
 }
 
-// open inverts seal(); returns the plaintext.
+// open inverts seal(); returns the plaintext. Wraps `cryptopkg.Open`
+// for the same reason seal() wraps cryptopkg.Seal.
 func open(key, blob []byte) ([]byte, error) {
 	if len(blob) < shareIVSize+1 {
 		return nil, errors.New("share: ciphertext too short")
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
 	iv := blob[:shareIVSize]
-	return aead.Open(nil, iv, blob[shareIVSize:], nil)
+	return cryptopkg.Open(key, iv, blob[shareIVSize:], nil)
 }
 
 func decodeHexKey(s string) ([]byte, error) {
@@ -206,9 +193,14 @@ func gunzipBytes(in []byte) ([]byte, error) {
 	limited := io.LimitReader(r, shareMaxPlaintextBytes+1)
 	out, err := io.ReadAll(limited)
 	if err != nil {
+		// out may already hold partially-decompressed plaintext;
+		// zero it before surfacing the error so the bytes don't
+		// linger in memory until GC.
+		cryptopkg.Zero(out)
 		return nil, err
 	}
 	if len(out) > shareMaxPlaintextBytes {
+		cryptopkg.Zero(out)
 		return nil, errors.New("share: decompressed plaintext exceeds limit")
 	}
 	return out, nil
