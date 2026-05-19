@@ -86,7 +86,18 @@ func (s *bucketsStub) serve(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodGet:
 		s.mu.Lock()
-		item, ok := s.items[token]
+		stored, ok := s.items[token]
+		var item bucketsItem
+		if ok {
+			// Deep-copy the value + keys under the mutex so a
+			// concurrent PUT can't replace the slice headers
+			// out from under the GET handler.
+			item.Value = append([]byte(nil), stored.Value...)
+			item.EncryptionKeys = make([][]byte, len(stored.EncryptionKeys))
+			for i, k := range stored.EncryptionKeys {
+				item.EncryptionKeys[i] = append([]byte(nil), k...)
+			}
+		}
 		s.mu.Unlock()
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)

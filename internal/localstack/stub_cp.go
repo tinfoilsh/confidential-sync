@@ -110,7 +110,32 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// BucketsStubAPIKey is the static credential the buckets stub
+// expects on every /items/* call. Smoke tests configure the
+// enclave's buckets.Client with this same value; tightening the
+// check here catches missing-Authorization regressions that the
+// real buckets backend would surface as 401. Exported so the
+// stack wiring uses the same constant.
+const BucketsStubAPIKey = "local-stack-buckets-key"
+
+// bucketsExpectedFormat pins the buckets envelope format. The real
+// service enforces a single v1 layout; rejecting anything else here
+// surfaces wire-compat regressions in smoke tests instead of letting
+// them silently round-trip.
+const bucketsExpectedFormat = 1
+
+func (s *StubCP) checkBucketsAuth(w http.ResponseWriter, r *http.Request) bool {
+	if got := r.Header.Get("Authorization"); got != "Bearer "+BucketsStubAPIKey {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 func (s *StubCP) putBucketItem(w http.ResponseWriter, r *http.Request) {
+	if !s.checkBucketsAuth(w, r) {
+		return
+	}
 	token := r.PathValue("token")
 	var body struct {
 		Value          string   `json:"value"`
@@ -119,6 +144,10 @@ func (s *StubCP) putBucketItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if body.Format != bucketsExpectedFormat {
+		http.Error(w, "unsupported format", http.StatusBadRequest)
 		return
 	}
 	value, err := base64.StdEncoding.DecodeString(body.Value)
@@ -142,6 +171,9 @@ func (s *StubCP) putBucketItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *StubCP) getBucketItem(w http.ResponseWriter, r *http.Request) {
+	if !s.checkBucketsAuth(w, r) {
+		return
+	}
 	token := r.PathValue("token")
 	s.mu.Lock()
 	item, ok := s.bucketItems[token]
@@ -173,6 +205,9 @@ func (s *StubCP) getBucketItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *StubCP) deleteBucketItem(w http.ResponseWriter, r *http.Request) {
+	if !s.checkBucketsAuth(w, r) {
+		return
+	}
 	token := r.PathValue("token")
 	s.mu.Lock()
 	delete(s.bucketItems, token)
@@ -487,15 +522,16 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 	wipedAttachments := []string{}
 	if body.CreatedVia == "start_fresh" {
 		// Mirror the controlplane's atomic wipe: drop every blob
-		// for the user before swapping the primary key. The
-		// localstack stub doesn't track attachment-id ownership
-		// separately from the chat blobs (buckets is a no-op here),
-		// so the returned `wiped_v2_attachments` is intentionally
-		// empty; production controlplane returns the real ids.
+		// for the user before swapping the primary key, and
+		// report every bucket-backed attachment id back to the
+		// enclave so its cleanup cascade can drop them too.
 		for k, b := range s.blobs {
 			if b.KeyID != body.KeyID {
 				delete(s.blobs, k)
 			}
+		}
+		for token := range s.bucketItems {
+			wipedAttachments = append(wipedAttachments, token)
 		}
 	} else {
 		for _, b := range s.blobs {

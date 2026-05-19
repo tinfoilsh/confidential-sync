@@ -105,7 +105,7 @@ func Start(cfg Config) (*Stack, error) {
 		return nil, fmt.Errorf("verifier: %w", err)
 	}
 	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second})
-	bucketsClient := buckets.NewClient(cpURL, "local-stack-buckets-key", &http.Client{Timeout: 10 * time.Second})
+	bucketsClient := buckets.NewClient(cpURL, BucketsStubAPIKey, &http.Client{Timeout: 10 * time.Second})
 	handler := server.NewHandler(server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: "local-stack"}, verifier, nil)
 
 	enclaveLn, err := listen(cfg.EnclaveAddr)

@@ -186,10 +186,10 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 		t.Fatalf("legacy attachment row should be cleared")
 	}
 
-	// The stored v2 envelope must decrypt to a plaintext that no
-	// longer carries encryptionKey on the migrated attachment, so
-	// future reads through the v2 path won't fall back into the
-	// legacy branch on the webapp.
+	// The stored v2 envelope must decrypt to a plaintext that still
+	// carries the same encryptionKey on the migrated attachment.
+	// That field is what addresses the buckets entry now, so the
+	// webapp must continue to see it verbatim post-cascade.
 	f.cp.mu.Lock()
 	afterBlob := append([]byte(nil), f.cp.blobs["chat/c1"].Body...)
 	f.cp.mu.Unlock()
