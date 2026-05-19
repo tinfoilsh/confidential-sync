@@ -123,8 +123,8 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 // TestPullRewrapsAttachmentCascade exercises the lazy attachment
 // migration: a v1 chat whose plaintext references a legacy attachment
 // (with an embedded `encryptionKey`) should, after pull, produce a
-// buckets entry under the attachment id (with the per-attachment key
-// as the buckets slot key) AND a v2 chat envelope whose plaintext
+// buckets entry under the same attachment id (with the per-attachment
+// key as the buckets slot key) AND a v2 chat envelope whose plaintext
 // still carries the same `encryptionKey` value so the webapp can use
 // it as the buckets slot key on future fetches.
 func TestPullRewrapsAttachmentCascade(t *testing.T) {
@@ -132,7 +132,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	tok := f.jwt()
 
 	// Plant a legacy attachment ciphertext in the cp stub.
-	attID := "att_abc"
+	attID := "123e4567-e89b-12d3-a456-426614174000"
 	attKey := make([]byte, 32)
 	if _, err := rand.Read(attKey); err != nil {
 		t.Fatal(err)
@@ -184,7 +184,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 		t.Fatalf("expected needs_rewrap=false")
 	}
 
-	// Buckets should now hold an entry under the attachment id.
+	// Buckets should now hold an entry under the legacy attachment id.
 	if !f.bk.has(attID) {
 		t.Fatalf("attachment was not uploaded to buckets under id %q", attID)
 	}
@@ -211,10 +211,8 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 		t.Fatalf("legacy attachment row should be cleared")
 	}
 
-	// The stored v2 envelope must decrypt to a plaintext that still
-	// carries the same encryptionKey on the migrated attachment.
-	// That field is what addresses the buckets entry now, so the
-	// webapp must continue to see it verbatim post-cascade.
+	// The stored v2 envelope must decrypt to a plaintext with the
+	// same attachment id and encryptionKey on the migrated attachment.
 	f.cp.mu.Lock()
 	afterBlob := append([]byte(nil), f.cp.blobs["chat/c1"].Body...)
 	f.cp.mu.Unlock()
@@ -244,6 +242,13 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	if gotKey != base64.StdEncoding.EncodeToString(attKey) {
 		t.Fatalf("encryptionKey changed post-cascade: %q", gotKey)
+	}
+	gotID, has := att["id"].(string)
+	if !has {
+		t.Fatalf("attachment id must be preserved post-cascade: %#v", att)
+	}
+	if gotID != attID {
+		t.Fatalf("attachment id = %q, want %q", gotID, attID)
 	}
 }
 

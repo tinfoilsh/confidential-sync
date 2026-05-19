@@ -29,7 +29,7 @@ const attKeySize = 32
 // JSON under `attachments[i].encryptionKey`.
 //
 // The webapp never picks the attachment id: the enclave mints a
-// fresh 128-bit random id per upload and returns it. This keeps the
+// fresh 144-bit random id per upload and returns it. This keeps the
 // global buckets path namespace under enclave control, so the only
 // party that can write to both buckets and the controlplane's
 // chat_attachments table is also the only party that decides what id
