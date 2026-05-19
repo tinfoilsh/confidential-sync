@@ -19,4 +19,12 @@ shim:
     - /v1/sync/delete
     - /v1/key/register
     - /v1/key/add-bundle
+    - /v1/key/remove-bundle
+    - /v1/key/current
     - /v1/blobs/migrate
+    - /v1/blobs/migrate-all
+    - /v1/attachment/put
+    - /v1/attachment/get
+    - /v1/attachment/get-public
+    - /v1/share/seal
+    - /v1/share/open
