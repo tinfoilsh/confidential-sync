@@ -61,8 +61,14 @@ func main() {
 		os.Getenv("BUCKETS_API_KEY"),
 		&http.Client{Timeout: 60 * time.Second},
 	)
+	// An unconfigured buckets client is a soft failure: the
+	// attachment routes return 503 and rewrap / wipe paths skip the
+	// bucket-cleanup step (see attachment_ops.go, rewrap.go,
+	// ops.go). Local dev and the smoke suite intentionally run
+	// without BUCKETS_URL set; refusing to start would block every
+	// non-attachment flow as well.
 	if !bucketsClient.Configured() {
-		log.Fatal("BUCKETS_URL and BUCKETS_API_KEY are required")
+		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / BUCKETS_API_KEY unset); attachment routes will return 503")
 	}
 
 	deps := server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: gitSHA}
