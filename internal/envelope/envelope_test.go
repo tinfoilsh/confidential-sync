@@ -173,7 +173,10 @@ func TestV2RoundTrip(t *testing.T) {
 func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, _ := CanonicalAAD(aad)
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
 	plaintext := bytes.Repeat([]byte("compress-me-"), 256)
 	blob, err := Encrypt(k.Bytes, plaintext, aadBytes, k.KeyIDHex)
 	if err != nil {
@@ -206,7 +209,10 @@ func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
 func TestV2DecryptRejectsCorruptGzip(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, _ := CanonicalAAD(aad)
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Build a v2 envelope whose AES-GCM plaintext is NOT gzip (simulating an
 	// older v2-without-gzip blob produced before this change). The decrypt
 	// path must hard-fail per syncplan §X4.
@@ -231,13 +237,19 @@ func TestV2DecryptRejectsCorruptGzip(t *testing.T) {
 func TestV2AADMismatchFails(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, _ := CanonicalAAD(aad)
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
 	blob, err := Encrypt(k.Bytes, []byte("hi"), aadBytes, k.KeyIDHex)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrong := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeProfile, ID: "profile", ClerkUserID: "u"}
-	wrongBytes, _ := CanonicalAAD(wrong)
+	wrongBytes, err := CanonicalAAD(wrong)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = DecryptV2(blob, []Key{k}, func(string) ([]byte, error) { return wrongBytes, nil })
 	if err == nil {
 		t.Fatalf("expected AAD mismatch decrypt failure")
@@ -248,7 +260,10 @@ func TestV2NoMatchingKey(t *testing.T) {
 	k := newKey(t)
 	other := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, _ := CanonicalAAD(aad)
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
 	blob, err := Encrypt(k.Bytes, []byte("hi"), aadBytes, k.KeyIDHex)
 	if err != nil {
 		t.Fatal(err)
