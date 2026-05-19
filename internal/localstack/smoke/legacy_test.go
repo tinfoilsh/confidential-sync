@@ -72,6 +72,19 @@ func TestT12_LegacyV0BlobInlineRewrapsOnPull(t *testing.T) {
 	if string(gotPT) != string(plaintext) {
 		t.Fatalf("plaintext round-trip mismatch: got %q want %q", gotPT, plaintext)
 	}
+
+	// `needs_rewrap=false` alone does not prove the row was actually
+	// promoted — the field is also false on a hypothetical future
+	// regression that suppresses the flag without rewriting the
+	// blob. Verify the stored bytes are now a v2 envelope so the
+	// next pull skips the legacy decrypt path entirely.
+	stored := f.stack.CP.PeekBlob("chat", "legacy_1")
+	if stored == nil {
+		t.Fatalf("blob disappeared after legacy pull")
+	}
+	if !contains(stored.Body, []byte(`"v":2`)) {
+		t.Fatalf("expected legacy v0 blob to be promoted to v2 after pull, got: %s", stored.Body)
+	}
 }
 
 // T13: migrate transforms a legacy v0 blob into a v2 envelope under
