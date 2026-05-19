@@ -218,98 +218,16 @@ func promoteOneAttachment(
 	return true
 }
 
-// collectChatAttachmentIDs fetches the chat, decrypts with the CEK
-// the caller provided to the Delete op, and returns the list of
-// attachment ids referenced by the chat envelope. Returns nil on
-// any failure: callers treat that as "no attachments to clean up"
-// rather than aborting the chat delete.
-func collectChatAttachmentIDs(
-	ctx context.Context,
-	deps Deps,
-	sess Session,
-	chatID string,
-	cek []byte,
-) []string {
-	if !deps.Buckets.Configured() {
-		return nil
-	}
-	blob, err := deps.Controlplane.GetBlob(ctx, string(envelope.ScopeChat), chatID, sess.RawJWT)
-	if err != nil {
-		return nil
-	}
-	cekIDBytes, err := cryptopkg.DeriveKeyID(cek)
-	if err != nil {
-		return nil
-	}
-	cekKIDHex := cryptopkg.KeyIDHex(cekIDBytes)
-	var plaintext []byte
-	switch envelope.Detect(blob.Ciphertext) {
-	case envelope.VersionV2:
-		dec, err := envelope.DecryptV2(blob.Ciphertext, []envelope.Key{{Bytes: cek, KeyIDHex: cekKIDHex}}, func(kid string) ([]byte, error) {
-			return envelope.CanonicalAAD(envelope.AAD{
-				KeyIDHex:    kid,
-				Scope:       envelope.ScopeChat,
-				ID:          chatID,
-				ClerkUserID: sess.Claims.Subject,
-			})
-		})
-		if err != nil {
-			return nil
-		}
-		defer cryptopkg.Zero(dec.Plaintext)
-		plaintext = dec.Plaintext
-	case envelope.VersionV0, envelope.VersionV1:
-		// Legacy chats can't have v2 attachments yet, so there's
-		// nothing in buckets to clean up. The controlplane row drop
-		// alone suffices.
-		return nil
-	default:
-		return nil
-	}
-
-	var parsed map[string]any
-	if err := json.Unmarshal(plaintext, &parsed); err != nil {
-		return nil
-	}
-	rawMessages, ok := parsed["messages"].([]any)
-	if !ok {
-		return nil
-	}
-	var ids []string
-	for _, m := range rawMessages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		rawAtts, ok := msg["attachments"].([]any)
-		if !ok {
-			continue
-		}
-		for _, a := range rawAtts {
-			att, ok := a.(map[string]any)
-			if !ok {
-				continue
-			}
-			// Every bucket-backed attachment carries an id; the
-			// type label is freeform UI metadata and may evolve
-			// (images, audio, video, generic files). Filtering
-			// on `type == "image"` here would orphan everything
-			// else, so we cascade by presence of an id instead.
-			attID, _ := att["id"].(string)
-			if attID == "" {
-				continue
-			}
-			ids = append(ids, attID)
-		}
-	}
-	return ids
-}
-
 // deleteBucketAttachments fires off best-effort Delete calls for each
-// attachment id. Failures are swallowed: the caller has already
-// committed (or is about to commit) the chat row delete and orphans
-// in buckets are unaddressable without the per-attachment slot key
-// that lived inside the chat envelope.
+// attachment id supplied by the controlplane's chat-delete response.
+// The ids MUST come from the controlplane (via
+// `DeleteBlobResponse.WipedV2Attachments`), never from the
+// user-controlled chat plaintext: buckets has no per-user ownership
+// check, so trusting JSON ids would let a crafted chat delete an
+// unrelated victim's attachment whose id the attacker happened to
+// know. Failures are swallowed; an orphan in buckets is
+// unaddressable without the per-attachment slot key, which lived in
+// the (now-deleted) chat envelope.
 func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
 	if !deps.Buckets.Configured() {
 		return

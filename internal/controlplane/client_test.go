@@ -235,7 +235,7 @@ func TestDeleteBlobSendsHeaders(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	c := NewClient(st.server.URL, nil)
-	if err := c.DeleteBlob(context.Background(), DeleteBlobRequest{
+	if _, err := c.DeleteBlob(context.Background(), DeleteBlobRequest{
 		Scope:          "project",
 		ID:             "proj_1",
 		JWT:            "j",

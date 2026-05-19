@@ -223,7 +223,25 @@ func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 			return
 		}
 		delete(s.blobs, key)
-		w.WriteHeader(http.StatusNoContent)
+		// Mirror the real controlplane's chat-delete cascade: drop
+		// matching attachment-index rows and return their v2 ids so
+		// the enclave can wipe the buckets blobs. Tests rely on this
+		// to assert the secure attachment-cleanup path.
+		wipedV2 := []string{}
+		if scope == "chat" {
+			for aid, cid := range s.attachmentIndex {
+				if cid == id {
+					wipedV2 = append(wipedV2, aid)
+					delete(s.attachmentIndex, aid)
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":                   true,
+			"wiped_v2_attachments": wipedV2,
+		})
 	}
 }
 
@@ -1043,7 +1061,8 @@ func TestAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 }
 
 func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
-	id, key, err := deriveAttachmentMaterials("idem-attachment", "user_123")
+	plaintext := []byte("attachment-bytes")
+	id, key, err := deriveAttachmentMaterials("idem-attachment", "chat-1", "user_123", plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1056,5 +1075,41 @@ func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	}
 	if len(key) != attKeySize {
 		t.Fatalf("attachment key length = %d, want %d", len(key), attKeySize)
+	}
+
+	// A retry with byte-identical inputs reproduces the same
+	// (id, att_key) — that's the whole point of the derivation.
+	id2, key2, err := deriveAttachmentMaterials("idem-attachment", "chat-1", "user_123", plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(key2)
+	if id2 != id {
+		t.Fatalf("retry id mismatch: got %s, want %s", id2, id)
+	}
+	if !bytes.Equal(key, key2) {
+		t.Fatalf("retry key mismatch")
+	}
+
+	// Reusing the same idempotency key against different bytes
+	// MUST derive a different slot so the original attachment
+	// cannot be overwritten.
+	otherID, otherKey, err := deriveAttachmentMaterials("idem-attachment", "chat-1", "user_123", []byte("different-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(otherKey)
+	if otherID == id {
+		t.Fatalf("different plaintext must derive different id")
+	}
+
+	// Likewise across different chats.
+	otherChatID, otherChatKey, err := deriveAttachmentMaterials("idem-attachment", "chat-2", "user_123", plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(otherChatKey)
+	if otherChatID == id {
+		t.Fatalf("different chat id must derive different attachment id")
 	}
 }

@@ -359,14 +359,23 @@ type DeleteBlobRequest struct {
 	OperationHash  string
 }
 
-func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) error {
+// DeleteBlobResponse mirrors the controlplane's `writeDeleteResponse*`
+// shape. For chat deletes the controlplane returns the v2 attachment
+// ids it dropped, so the enclave can wipe the matching buckets blobs.
+// For non-chat scopes the field is empty.
+type DeleteBlobResponse struct {
+	OK                 bool     `json:"ok"`
+	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
+}
+
+func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*DeleteBlobResponse, error) {
 	endpoint, err := c.urlFor(req.Scope, req.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c.addAuth(httpReq, req.JWT)
 	if req.IfMatch != "" {
@@ -380,14 +389,23 @@ func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) error {
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return parseError(resp.StatusCode, body)
+		return nil, parseError(resp.StatusCode, body)
 	}
-	return nil
+	out := &DeleteBlobResponse{}
+	if len(body) > 0 {
+		// The controlplane may return an empty body on older
+		// deploys; treat that as a successful no-attachments delete
+		// rather than an error.
+		if err := json.Unmarshal(body, out); err != nil {
+			return nil, fmt.Errorf("controlplane: decode delete response: %w", err)
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt string) (*ListStatusResponse, error) {
