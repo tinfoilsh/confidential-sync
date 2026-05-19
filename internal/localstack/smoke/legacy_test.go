@@ -48,7 +48,7 @@ func injectV0(t *testing.T, f *fixture, scope, id string, plaintext []byte) {
 // because someone "cleaned up" v0/v1 support) would surface as
 // ok:false for users who haven't yet migrated; losing inline rewrap
 // would leave needs_rewrap=true.
-func TestT12_LegacyV0BlobReturnsNeedsRewrap(t *testing.T) {
+func TestT12_LegacyV0BlobInlineRewrapsOnPull(t *testing.T) {
 	t.Helper()
 	f := newFixture(t)
 

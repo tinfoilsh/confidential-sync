@@ -71,6 +71,12 @@ func ShareSeal(ctx context.Context, deps Deps, sess Session, req ShareSealReques
 		return nil, badRequest("invalid plaintext base64")
 	}
 	defer cryptopkg.Zero(plaintext)
+	// Mirror ShareOpen's decompression cap at seal time; otherwise
+	// this endpoint can mint shares that ShareOpen will then always
+	// reject as oversized, which is a silent footgun for the caller.
+	if len(plaintext) > shareMaxPlaintextBytes {
+		return nil, badRequest("plaintext exceeds share size limit")
+	}
 
 	compressed, err := gzipBytes(plaintext)
 	if err != nil {

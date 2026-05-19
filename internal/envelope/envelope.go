@@ -58,8 +58,11 @@ var (
 // v0 legacy is JSON with iv+data and no v field.
 // v1 legacy is raw binary `IV(12) || AES-GCM-ciphertext(gzip(JSON))` as
 // produced by the webapp's `compressAndEncrypt` (binary-codec.ts). The
-// first byte is a random IV byte, so anything that is not a JSON object
-// and is long enough to carry an IV + GCM tag is treated as v1.
+// first byte is a random IV byte, so anything that does not actually
+// parse as a JSON object and is long enough to carry an IV + GCM tag
+// is treated as v1. A v1 nonce whose first byte happens to be '{' would
+// otherwise get misclassified on the JSON branch — falling through on
+// parse failure keeps the classifier stable for every nonce.
 func Detect(blob []byte) Version {
 	if len(blob) == 0 {
 		return VersionUnknown
@@ -77,8 +80,11 @@ func Detect(blob []byte) Version {
 			if probe.IV != nil {
 				return VersionV0
 			}
+			// Parsed cleanly but neither shape matches — that's
+			// genuinely unknown, not a binary v1 blob whose
+			// first byte happened to be '{'.
+			return VersionUnknown
 		}
-		return VersionUnknown
 	}
 	if len(blob) >= crypto.NonceSize+crypto.TagSize {
 		return VersionV1

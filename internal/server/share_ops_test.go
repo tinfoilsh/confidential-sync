@@ -76,7 +76,10 @@ func TestShareOpenRejectsTamperedCiphertext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	raw, _ := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	raw, err := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	if err != nil {
+		t.Fatalf("decode seal ciphertext: %v", err)
+	}
 	raw[len(raw)-1] ^= 0x01
 	tampered := base64.StdEncoding.EncodeToString(raw)
 	_, err = ShareOpen(context.Background(), Deps{}, ShareOpenRequest{
