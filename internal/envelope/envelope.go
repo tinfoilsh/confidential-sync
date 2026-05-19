@@ -53,43 +53,82 @@ var (
 	ErrInvalidEnvelope = errors.New("envelope: invalid envelope")
 )
 
-// Detect classifies a ciphertext blob by inspecting its prefix.
-// v2 envelopes are JSON objects starting with `{` and containing `"v":2`.
-// v0 legacy is JSON with iv+data and no v field.
-// v1 legacy is raw binary `IV(12) || AES-GCM-ciphertext(gzip(JSON))` as
-// produced by the webapp's `compressAndEncrypt` (binary-codec.ts). The
-// first byte is a random IV byte, so anything that does not actually
-// parse as a JSON object and is long enough to carry an IV + GCM tag
-// is treated as v1. A v1 nonce whose first byte happens to be '{' would
-// otherwise get misclassified on the JSON branch — falling through on
-// parse failure keeps the classifier stable for every nonce.
+// Detect classifies a ciphertext blob by attempting strict parses
+// against each known envelope shape in turn. There is intentionally
+// no byte-prefix heuristic: any prefix-based discriminator is
+// ambiguous because v1 ciphertext bytes are uniformly random and can
+// imitate the opening of a JSON object. Instead we ask the harder
+// question "does this parse as a fully-formed v2 / v0 envelope?" and
+// fall back to v1 only when both strict parses fail.
+//
+//   1. Try parsing as a v2 envelope. v2 requires `"v":2` plus the
+//      `kid`, `alg`, `iv`, `ct` fields populated. A real v2 blob
+//      always succeeds here; a v1 binary blob has effectively zero
+//      probability of being a complete valid v2 JSON document with
+//      `"v":2`.
+//   2. Try parsing as a v0 envelope. v0 requires `iv` and `data`
+//      fields and explicitly forbids a `v` field (otherwise we'd
+//      accept v2 as v0 too). Same probabilistic argument as v2.
+//   3. Otherwise, if the blob is at least IV+TAG bytes long, treat
+//      it as v1. v1 has no version tag on the wire — that's why we
+//      cannot do better — but the strict-parse cascade above means
+//      we never accidentally route a real v0/v2 blob here.
+//
+// A truncated or otherwise-malformed v0/v2 envelope fails both
+// strict parses and falls through to v1; DecryptLegacy then fails
+// to decrypt the malformed bytes and the caller sees a decrypt
+// error. That is an unavoidable consequence of v1's lack of a
+// wire-level marker; the alternative (returning Unknown on parse
+// failure) silently loses real v1 blobs whose random nonce happens
+// to start with `{`. We prefer "always recover real v1 data" over
+// "produce a slightly more specific error on corruption".
 func Detect(blob []byte) Version {
 	if len(blob) == 0 {
 		return VersionUnknown
 	}
-	trimmed := bytes.TrimLeft(blob, " \t\r\n")
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		var probe struct {
-			V  *int    `json:"v"`
-			IV *string `json:"iv"`
-		}
-		if err := json.Unmarshal(trimmed, &probe); err == nil {
-			if probe.V != nil && *probe.V == int(VersionV2) {
-				return VersionV2
-			}
-			if probe.IV != nil {
-				return VersionV0
-			}
-			// Parsed cleanly but neither shape matches — that's
-			// genuinely unknown, not a binary v1 blob whose
-			// first byte happened to be '{'.
-			return VersionUnknown
-		}
+	if looksLikeV2(blob) {
+		return VersionV2
+	}
+	if looksLikeV0(blob) {
+		return VersionV0
 	}
 	if len(blob) >= crypto.NonceSize+crypto.TagSize {
 		return VersionV1
 	}
 	return VersionUnknown
+}
+
+// looksLikeV2 returns true when blob fully parses as JSON and carries
+// the v2 version tag. Field validity (non-empty kid/iv/ct, supported
+// alg) is enforced by DecryptV2; Detect's only job is shape
+// classification. A partial / truncated JSON document fails the
+// strict Unmarshal and is therefore not v2.
+func looksLikeV2(blob []byte) bool {
+	var env V2
+	if err := json.Unmarshal(blob, &env); err != nil {
+		return false
+	}
+	return env.V == int(VersionV2)
+}
+
+// looksLikeV0 returns true when blob fully parses as JSON in the v0
+// legacy shape: `iv` and `data` fields are both present, and the
+// `v` field is absent (so v2 envelopes never alias to v0). Empty
+// strings are still considered v0-shaped; per-field validity is
+// enforced by decryptV0.
+func looksLikeV0(blob []byte) bool {
+	var probe struct {
+		V    *int    `json:"v"`
+		IV   *string `json:"iv"`
+		Data *string `json:"data"`
+	}
+	if err := json.Unmarshal(blob, &probe); err != nil {
+		return false
+	}
+	if probe.V != nil {
+		return false
+	}
+	return probe.IV != nil && probe.Data != nil
 }
 
 type Key struct {
