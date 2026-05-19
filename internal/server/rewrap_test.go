@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -28,6 +29,27 @@ func sealLegacyChatBlob(t *testing.T, key, pt []byte) []byte {
 		"data": base64.StdEncoding.EncodeToString(ct),
 	})
 	return body
+}
+
+// sealLegacyChatBlobV1 emits the v1 wire format the webapp's
+// `compressAndEncrypt` produced in production:
+// IV(12) || AES-GCM-ciphertext(gzip(JSON)). Mirrors
+// envelope_test.go::TestDecryptLegacyV1RoundTrip.
+func sealLegacyChatBlobV1(t *testing.T, key, pt []byte) []byte {
+	t.Helper()
+	var gzbuf bytes.Buffer
+	zw := gzip.NewWriter(&gzbuf)
+	if _, err := zw.Write(pt); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	nonce, ct, err := cryptopkg.Seal(key, gzbuf.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(nonce, ct...)
 }
 
 // encryptAttachmentLegacy mirrors the webapp's encryptAttachment:
@@ -122,7 +144,10 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	f.cp.mu.Unlock()
 
-	// Plant a v0 chat that references the attachment.
+	// Plant a v1 chat (IV || AES-GCM(gzip(JSON))) that references
+	// the attachment. v1 is the wire format every production blob
+	// shipped in, so the cascade must exercise it directly rather
+	// than the simpler v0 `{iv, data}` shape.
 	chat := map[string]any{
 		"id": "c1",
 		"messages": []any{
@@ -141,7 +166,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	chatBytes, _ := json.Marshal(chat)
 	f.cp.mu.Lock()
-	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlob(t, f.userKey, chatBytes)}
+	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlobV1(t, f.userKey, chatBytes)}
 	f.cp.mu.Unlock()
 
 	resp, body := f.post("/v1/sync/pull", PullRequest{
@@ -276,6 +301,18 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	if !f.bk.has(attID) {
 		t.Fatalf("precondition: bucket not seeded")
 	}
+
+	// Register the attachment with the controlplane so it returns
+	// the id in its delete response. The enclave only wipes bucket
+	// blobs whose ids the controlplane confirmed it dropped — a
+	// crafted chat referencing some other user's attachment id no
+	// longer suffices.
+	f.cp.mu.Lock()
+	if f.cp.attachmentIndex == nil {
+		f.cp.attachmentIndex = map[string]string{}
+	}
+	f.cp.attachmentIndex[attID] = "c2"
+	f.cp.mu.Unlock()
 
 	cekB64 := base64.StdEncoding.EncodeToString(f.userKey)
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{

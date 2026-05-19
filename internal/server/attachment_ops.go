@@ -81,15 +81,28 @@ const (
 )
 
 // deriveAttachmentMaterials reproduces the (id, slot key) pair from
-// a caller-supplied idempotency key + clerk subject. The same
-// idempotency key from the same user always produces the same id +
-// key, so a retried AttachmentPut is a true no-op against buckets
-// instead of an orphaning duplicate upload.
-func deriveAttachmentMaterials(idempotencyKey, clerkSubject string) (string, []byte, error) {
+// a caller-supplied idempotency key, the chat id it belongs to, the
+// clerk subject, and a digest of the plaintext bytes. Binding the
+// derivation to all four inputs means:
+//
+//   - A true retry (same user, same chat, same key, same bytes)
+//     produces the same (id, att_key) and is a true no-op against
+//     buckets.
+//   - A reused key with different bytes (caller bug or attacker
+//     replaying a captured idempotency tag) derives a different id,
+//     so it cannot overwrite the original attachment's slot.
+//   - A reused key from a different chat or a different user
+//     likewise derives a different id, so per-chat / per-user
+//     ownership stays intact.
+func deriveAttachmentMaterials(idempotencyKey, chatID, clerkSubject string, plaintext []byte) (string, []byte, error) {
 	if idempotencyKey == "" {
 		return "", nil, errors.New("idempotency key is required")
 	}
-	ikm := []byte(idempotencyKey + "|" + clerkSubject)
+	if chatID == "" {
+		return "", nil, errors.New("chat id is required")
+	}
+	plaintextDigest := sha256.Sum256(plaintext)
+	ikm := []byte(idempotencyKey + "|" + chatID + "|" + clerkSubject + "|" + hex.EncodeToString(plaintextDigest[:]))
 	idBytes := make([]byte, attachmentIDBytes)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(attachmentIDInfo)), idBytes); err != nil {
 		return "", nil, err
@@ -141,10 +154,15 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 	)
 	if req.IdempotencyKey != "" {
 		// Deterministic derivation: any retry of the same upload
-		// resolves to the same id+key. The buckets Put under that
-		// pair is idempotent (same value, same slot key), and the
-		// controlplane index registration is safe to repeat.
-		id, attKey, err = deriveAttachmentMaterials(req.IdempotencyKey, sess.Claims.Subject)
+		// (same user, same chat, same key, same bytes) resolves to
+		// the same id+key. The buckets Put under that pair is
+		// idempotent (same value, same slot key), and the
+		// controlplane index registration is safe to repeat. Mixing
+		// chat_id + plaintext digest into the IKM ensures a
+		// caller-side bug that reuses the key for different content
+		// or a different chat lands on a fresh slot instead of
+		// silently overwriting the original attachment.
+		id, attKey, err = deriveAttachmentMaterials(req.IdempotencyKey, req.ChatID, sess.Claims.Subject, plaintext)
 		if err != nil {
 			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "derive attachment materials: " + err.Error()}
 		}

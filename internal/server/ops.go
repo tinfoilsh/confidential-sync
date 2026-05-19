@@ -367,27 +367,16 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	// Snapshot the chat's attachment ids before the controlplane row
-	// is gone. We can only resolve them by decrypting the v2 envelope
-	// in-enclave, and that envelope disappears with the row. The
-	// actual buckets cascade fires after the chat row drop has
-	// committed so a STALE_BLOB does not orphan-delete attachments
-	// that still belong to a surviving chat.
-	var attachmentIDs []string
-	if scope == envelope.ScopeChat {
-		attachmentIDs = collectChatAttachmentIDs(ctx, deps, sess, req.ID, key)
-	}
-
 	// If the caller passed a concrete ifMatch, run a single CAS-delete
 	// against that etag — a STALE_BLOB surfaces to the caller because
 	// they explicitly chose to race the etag they had.
 	if req.IfMatch != nil && *req.IfMatch != "" {
-		resp, err := deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
+		resp, cpResp, err := deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
 		if err != nil {
 			return nil, err
 		}
-		if scope == envelope.ScopeChat {
-			deleteBucketAttachments(ctx, deps, attachmentIDs)
+		if scope == envelope.ScopeChat && cpResp != nil {
+			deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 		}
 		return resp, nil
 	}
@@ -414,10 +403,17 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 			idem = fmt.Sprintf("%s:retry:%d", req.IdempotencyKey, attempt)
 		}
 		attemptReq.IdempotencyKey = idem
-		resp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
+		resp, cpResp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
 		if err == nil {
-			if scope == envelope.ScopeChat {
-				deleteBucketAttachments(ctx, deps, attachmentIDs)
+			if scope == envelope.ScopeChat && cpResp != nil {
+				// cpResp.WipedV2Attachments is the controlplane's
+				// authoritative list of v2 attachment ids that
+				// belonged to this (user, chat). Deriving the list
+				// from the user-controlled chat plaintext would let
+				// a crafted chat name a victim's attachment id and
+				// trick the enclave into deleting it; buckets has
+				// no per-user ownership check.
+				deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 			}
 			return resp, nil
 		}
@@ -431,22 +427,23 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 
 const deleteMaxRetries = 3
 
-func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest, key []byte, kidHex, ifMatch string) (*OKResponse, error) {
+func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest, key []byte, kidHex, ifMatch string) (*OKResponse, *controlplane.DeleteBlobResponse, error) {
 	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
+	cpResp, err := deps.Controlplane.DeleteBlob(ctx, controlplane.DeleteBlobRequest{
 		Scope:          req.Scope,
 		ID:             req.ID,
 		JWT:            sess.RawJWT,
 		IfMatch:        ifMatch,
 		IdempotencyKey: req.IdempotencyKey,
 		OperationHash:  opHash,
-	}); err != nil {
-		return nil, err
+	})
+	if err != nil {
+		return nil, nil, err
 	}
-	return &OKResponse{OK: true}, nil
+	return &OKResponse{OK: true}, cpResp, nil
 }
 
 func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRequest) (*KeyRegisterResponse, error) {
