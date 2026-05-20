@@ -256,6 +256,96 @@ func TestV2AADMismatchFails(t *testing.T) {
 	}
 }
 
+// TestV2RejectsNonCanonicalBase64CT pins the wire-level rule that
+// the `ct` field must be exact-canonical base64. Without this, the
+// spare 2 or 4 bits in the final base64 character (for 1- or 2-pad
+// encodings) can be flipped without changing the decoded bytes,
+// which looks like an AEAD bypass to anyone tampering byte-by-byte
+// even though AES-GCM did its job. The check is to re-encode after
+// decoding and require an exact match.
+func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
+	k := newKey(t)
+	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sweep payload sizes so we exercise every `0-, 1-, 2-pad`
+	// base64 trailing group; one of them will land on the
+	// spare-bit case the strict check exists to catch.
+	caught := false
+	for size := 1; size <= 8 && !caught; size++ {
+		blob, err := Encrypt(k.Bytes, bytes.Repeat([]byte{0xAB}, size), aadBytes, k.KeyIDHex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var env V2
+		if err := json.Unmarshal(blob, &env); err != nil {
+			t.Fatal(err)
+		}
+		nonCanonical, ok := altBase64SameDecode(env.CT)
+		if !ok {
+			continue
+		}
+		env.CT = nonCanonical
+		mutated, _ := json.Marshal(env)
+		_, err = DecryptV2(mutated, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+		if !errors.Is(err, ErrV2Malformed) {
+			t.Fatalf("expected ErrV2Malformed for non-canonical base64 ct (size=%d), got %v", size, err)
+		}
+		caught = true
+	}
+	if !caught {
+		t.Fatal("could not construct a non-canonical base64 variant in any sweep size; test setup bug")
+	}
+}
+
+// altBase64SameDecode returns an alternate base64 string that
+// decodes to the same bytes as s but differs in the trailing
+// "spare bits" of the final data character. Returns (_, false)
+// when s ends in `==` whose only data char already encodes zero
+// spare bits, or when s has no padding at all.
+func altBase64SameDecode(s string) (string, bool) {
+	if !strings.HasSuffix(s, "=") {
+		return "", false
+	}
+	// Strip the `=` chars, look at the last data char, and
+	// derive an alternate by adding 1 to its base64 value (mod 64).
+	// We then re-decode and re-encode the result via the stdlib
+	// canonicalizer to confirm the alternate is non-canonical.
+	stripped := strings.TrimRight(s, "=")
+	if len(stripped) == 0 {
+		return "", false
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	lastIdx := len(stripped) - 1
+	v := strings.IndexByte(alphabet, stripped[lastIdx])
+	if v < 0 {
+		return "", false
+	}
+	// Try every neighbor in base64-value space; one of them will
+	// share the same canonical decoding.
+	originalRaw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", false
+	}
+	for delta := 1; delta < 64; delta++ {
+		candidateVal := (v + delta) % 64
+		if candidateVal == v {
+			continue
+		}
+		candidate := stripped[:lastIdx] + string(alphabet[candidateVal]) + s[len(stripped):]
+		raw, err := base64.StdEncoding.DecodeString(candidate)
+		if err != nil {
+			continue
+		}
+		if bytes.Equal(raw, originalRaw) && candidate != s {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
 func TestV2NoMatchingKey(t *testing.T) {
 	k := newKey(t)
 	other := newKey(t)

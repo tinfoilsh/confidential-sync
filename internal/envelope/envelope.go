@@ -210,7 +210,7 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
 	}
-	ct, err := base64.StdEncoding.DecodeString(env.CT)
+	ct, err := strictStdBase64Decode(env.CT)
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
 	}
@@ -355,6 +355,31 @@ func gunzip(compressed []byte) ([]byte, error) {
 		return nil, errors.New("envelope: decompressed plaintext exceeds limit")
 	}
 	return out, nil
+}
+
+// strictStdBase64Decode decodes a standard-base64 string and rejects
+// any input that is not in canonical form.
+//
+// Go's stdlib base64 decoder is RFC 4648-permissive: when the final
+// base64 group ends with one or two `=` pad chars, the last data char
+// carries 2 or 4 "spare" bits that the decoder silently discards. As
+// a result, multiple distinct base64 strings decode to the same
+// bytes (`FPnA=`, `FPnB=`, ..., `FPnD=` all decode identically). For
+// authenticated-ciphertext fields like the v2 envelope's `ct`, this
+// means a flipped spare bit on the wire passes AES-GCM verification
+// because the bytes fed to Open didn't change — masking what looks
+// like (but is not) an AEAD bypass to anyone testing tamper
+// resistance byte-by-byte. We close that ambiguity by re-encoding
+// the decoded bytes and requiring an exact match against the input.
+func strictStdBase64Decode(s string) ([]byte, error) {
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if base64.StdEncoding.EncodeToString(raw) != s {
+		return nil, errors.New("envelope: base64 not in canonical form")
+	}
+	return raw, nil
 }
 
 // decodeBase64OrHex accepts both encodings because two production clients
