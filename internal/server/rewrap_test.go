@@ -138,6 +138,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 		t.Fatal(err)
 	}
 	attPT := []byte("a tiny image's bytes")
+	thumbnailB64 := base64.StdEncoding.EncodeToString([]byte("thumbnail bytes"))
 	f.cp.mu.Lock()
 	f.cp.legacyAttachments = map[string][]byte{
 		attID: encryptAttachmentLegacy(t, attKey, attPT),
@@ -158,6 +159,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 					map[string]any{
 						"id":            attID,
 						"type":          "image",
+						"base64":        thumbnailB64,
 						"encryptionKey": base64.StdEncoding.EncodeToString(attKey),
 					},
 				},
@@ -249,6 +251,13 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	if gotID != attID {
 		t.Fatalf("attachment id = %q, want %q", gotID, attID)
+	}
+	gotThumb, has := att["base64"].(string)
+	if !has {
+		t.Fatalf("inline thumbnail base64 must be preserved post-cascade: %#v", att)
+	}
+	if gotThumb != thumbnailB64 {
+		t.Fatalf("inline thumbnail base64 changed post-cascade: %q", gotThumb)
 	}
 }
 

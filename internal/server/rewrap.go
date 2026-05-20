@@ -110,7 +110,9 @@ func rewrapBlob(
 // attachments with an embedded encryptionKey (legacy v0/v1 image
 // rows), and promotes them to buckets-backed v2 storage. The
 // per-attachment key is reused as the buckets slot key, and legacy
-// attachment ids are preserved as the buckets ids.
+// attachment ids are preserved as the buckets ids. The chat plaintext
+// itself is not rewritten, so inline thumbnail/base64 fields remain
+// exactly as the client stored them.
 // Returns (nil, nil) when the plaintext doesn't parse as a chat
 // envelope — letting the rewrap proceed as a pure re-seal.
 //
@@ -160,11 +162,7 @@ func rewrapChatAttachments(
 		}
 	}
 
-	mutated, err := json.Marshal(parsed)
-	if err != nil {
-		return nil, nil
-	}
-	return mutated, nil
+	return nil, nil
 }
 
 // promoteOneAttachment fetches one legacy ciphertext, decrypts it
