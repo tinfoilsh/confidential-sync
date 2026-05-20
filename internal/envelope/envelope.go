@@ -210,15 +210,26 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
 	}
-	// Strict() rejects base64 inputs whose final group carries
-	// non-zero "spare" bits (the 2 or 4 bits past the last byte
-	// boundary for 1- or 2-pad encodings). Without Strict(),
-	// `XXXY=` and `XXXZ=` decode identically whenever the low bits
-	// of Y differ only within the spare range — so a bit flipped
-	// on the wire passes through to AES-GCM unchanged and the tag
-	// still validates, which is indistinguishable from an AEAD
-	// bypass to anyone tampering byte-by-byte even though
-	// AES-GCM has done its job correctly.
+	// The `ct` field must be exact-canonical RFC 4648 standard
+	// base64: only the 64-char alphabet plus `=` padding at the
+	// tail, and no non-zero "spare" bits in the final group. The
+	// canonical form is necessary because two different aspects
+	// of a permissive decoder both produce
+	// equal-decoded-bytes-different-wire-bytes ambiguity:
+	//
+	//   1. Spare bits in the last data char of a 1- or 2-pad
+	//      group (`XXXY=` and `XXXZ=` decode identically when Y
+	//      and Z differ only in their low 2 or 4 bits).
+	//   2. Embedded whitespace — `\n`, `\r` — which `Strict()`
+	//      still silently skips, so a tampered JSON envelope
+	//      could carry a `ct` string with `\n` injected anywhere
+	//      and decrypt to the same plaintext.
+	//
+	// `Strict()` catches (1) but not (2); the explicit alphabet
+	// pre-check below catches (2) without an extra allocation.
+	if !isCanonicalStdBase64(env.CT) {
+		return DecryptResult{}, ErrV2Malformed
+	}
 	ct, err := base64.StdEncoding.Strict().DecodeString(env.CT)
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
@@ -364,6 +375,45 @@ func gunzip(compressed []byte) ([]byte, error) {
 		return nil, errors.New("envelope: decompressed plaintext exceeds limit")
 	}
 	return out, nil
+}
+
+// isCanonicalStdBase64 returns true when s consists only of
+// standard-base64 alphabet characters (A-Z, a-z, 0-9, +, /) with
+// zero, one, or two `=` characters at the tail, and the total
+// length is a non-zero multiple of 4.
+//
+// This is an alphabet-and-shape check, not a value check; combined
+// with base64.StdEncoding.Strict().DecodeString it forbids both
+// non-canonical spare-bit endings and embedded whitespace
+// (\n, \r, ' ', \t) that the stdlib decoder otherwise tolerates.
+// Both forms would let two distinct wire-level `ct` strings
+// produce the same decoded ciphertext, which is a tampering
+// ambiguity we want to surface as ErrV2Malformed instead of
+// silently accepting either spelling.
+func isCanonicalStdBase64(s string) bool {
+	if len(s) == 0 || len(s)%4 != 0 {
+		return false
+	}
+	end := len(s)
+	pad := 0
+	if s[end-1] == '=' {
+		pad++
+		if s[end-2] == '=' {
+			pad++
+		}
+	}
+	for i := 0; i < end-pad; i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '+', c == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // decodeBase64OrHex accepts both encodings because two production clients

@@ -9,12 +9,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"time"
 
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 )
+
+// bucketsRollbackTimeout caps the best-effort cleanup that runs
+// after a successful buckets Put but a failed controlplane index.
+// Because the rollback runs on a context detached from the request
+// (so client cancellation can't skip it), it needs its own bounded
+// deadline — otherwise a hung buckets backend would pin the
+// handler well past the request budget.
+const bucketsRollbackTimeout = 30 * time.Second
 
 // attKeySize is the length of the per-attachment AES-256 key the
 // enclave mints on upload and hands to the webapp. Matches buckets'
@@ -113,6 +122,16 @@ func deriveAttachmentMaterials(idempotencyKey, chatID, clerkSubject string, plai
 	// `\u0000`. Length-prefixing is the standard
 	// domain-separation construction and has no string-injection
 	// failure mode.
+	//
+	// COMPAT NOTE: changing the IKM encoding after this code has
+	// shipped to production breaks idempotent retries across the
+	// deploy boundary (old enclave derived id A; new enclave
+	// derives id B for the same input; both end up in buckets and
+	// the chat JSON only references one of them, orphaning the
+	// other). The attachment feature has not yet been released, so
+	// the current rewrite is safe; any future format change must
+	// dual-derive on read and ship the format flip behind a
+	// compat window long enough to drain in-flight retries.
 	ikm := encodeIKM(idempotencyKey, chatID, clerkSubject, hex.EncodeToString(plaintextDigest[:]))
 	idBytes := make([]byte, attachmentIDBytes)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(attachmentIDInfo)), idBytes); err != nil {
@@ -220,8 +239,12 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		// bucket entry anyway. Detach from the request context so
 		// a client cancellation (which is the most common reason
 		// the index call fails after a successful Put) does not
-		// also skip the cleanup it triggered.
-		_ = deps.Buckets.Delete(context.WithoutCancel(ctx), id)
+		// also skip the cleanup it triggered, but enforce a fresh
+		// bounded deadline so a hung buckets backend cannot pin
+		// this handler past the request budget.
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
+		_ = deps.Buckets.Delete(rollbackCtx, id)
+		cancel()
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane index failed: " + err.Error()}
 	}
 	return &AttachmentPutResponse{
