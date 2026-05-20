@@ -257,12 +257,14 @@ func TestV2AADMismatchFails(t *testing.T) {
 }
 
 // TestV2RejectsNonCanonicalBase64CT pins the wire-level rule that
-// the `ct` field must be exact-canonical base64. Without this, the
-// spare 2 or 4 bits in the final base64 character (for 1- or 2-pad
-// encodings) can be flipped without changing the decoded bytes,
-// which looks like an AEAD bypass to anyone tampering byte-by-byte
-// even though AES-GCM did its job. The check is to re-encode after
-// decoding and require an exact match.
+// the `ct` field must be exact-canonical base64. The check covers
+// both 1-pad (`...X=`) and 2-pad (`...XX==`) trailing groups, since
+// each carries a different number of spare bits (2 and 4
+// respectively) and a permissive decoder treats both as a no-op.
+// Without this rule a bit-flipped spare bit passes AES-GCM
+// verification unchanged, which looks like an AEAD bypass to
+// anyone tampering byte-by-byte even though AES-GCM has done its
+// job correctly.
 func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
@@ -270,11 +272,13 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	// Sweep payload sizes so we exercise every `0-, 1-, 2-pad`
-	// base64 trailing group; one of them will land on the
-	// spare-bit case the strict check exists to catch.
-	caught := false
-	for size := 1; size <= 8 && !caught; size++ {
+	// base64 trailing group; each one needs to be caught by the
+	// strict decoder, otherwise a partial fix could let the
+	// remaining padding shape leak through.
+	covered := map[string]bool{"=": false, "==": false}
+	for size := 1; size <= 24; size++ {
 		blob, err := Encrypt(k.Bytes, bytes.Repeat([]byte{0xAB}, size), aadBytes, k.KeyIDHex)
 		if err != nil {
 			t.Fatal(err)
@@ -282,6 +286,10 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 		var env V2
 		if err := json.Unmarshal(blob, &env); err != nil {
 			t.Fatal(err)
+		}
+		pad := trailingPadding(env.CT)
+		if pad == "" || covered[pad] {
+			continue
 		}
 		nonCanonical, ok := altBase64SameDecode(env.CT)
 		if !ok {
@@ -291,13 +299,27 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 		mutated, _ := json.Marshal(env)
 		_, err = DecryptV2(mutated, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
 		if !errors.Is(err, ErrV2Malformed) {
-			t.Fatalf("expected ErrV2Malformed for non-canonical base64 ct (size=%d), got %v", size, err)
+			t.Fatalf("expected ErrV2Malformed for non-canonical base64 ct (pad=%q size=%d), got %v", pad, size, err)
 		}
-		caught = true
+		covered[pad] = true
+		if covered["="] && covered["=="] {
+			break
+		}
 	}
-	if !caught {
-		t.Fatal("could not construct a non-canonical base64 variant in any sweep size; test setup bug")
+	for pad, ok := range covered {
+		if !ok {
+			t.Fatalf("non-canonical base64 case for pad %q was never exercised; test setup bug", pad)
+		}
 	}
+}
+
+// trailingPadding returns the run of `=` characters at the end of s.
+func trailingPadding(s string) string {
+	i := len(s)
+	for i > 0 && s[i-1] == '=' {
+		i--
+	}
+	return s[i:]
 }
 
 // altBase64SameDecode returns an alternate base64 string that

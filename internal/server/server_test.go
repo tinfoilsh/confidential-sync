@@ -1112,4 +1112,23 @@ func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	if otherChatID == id {
 		t.Fatalf("different chat id must derive different attachment id")
 	}
+
+	// A length-prefixed IKM rules out a class of collisions a
+	// printable delimiter would otherwise allow: shifting bytes
+	// across the field boundary ("a|b","c") versus ("a","b|c")
+	// must derive to different (id, key) pairs even if the
+	// concatenated string is identical.
+	shiftedA_ID, shiftedA_Key, err := deriveAttachmentMaterials("idem|attachment", "chat-1", "user_123", plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(shiftedA_Key)
+	shiftedB_ID, shiftedB_Key, err := deriveAttachmentMaterials("idem", "attachment|chat-1", "user_123", plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(shiftedB_Key)
+	if shiftedA_ID == shiftedB_ID {
+		t.Fatalf("delimiter ambiguity: shifting bytes across field boundary derived the same id (%s)", shiftedA_ID)
+	}
 }
