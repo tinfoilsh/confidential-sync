@@ -16,21 +16,34 @@ import (
 )
 
 // Client talks to the controlplane on behalf of an authenticated user.
-// Every call forwards the user's JWT verbatim in the Authorization header;
-// the enclave does not mint its own credentials.
+// Every call forwards the user's JWT verbatim in the Authorization header
+// plus the enclave service credential required by the /api/sync surface.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	serviceSecret string
 }
 
-func NewClient(baseURL string, httpClient *http.Client) *Client {
+type Option func(*Client)
+
+func WithServiceSecret(secret string) Option {
+	return func(c *Client) {
+		c.serviceSecret = secret
+	}
+}
+
+func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &Client{
+	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: httpClient,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 const (
@@ -44,6 +57,7 @@ const (
 	HeaderProjectIDSet  = "X-Project-Id-Set"
 	HeaderETag          = "ETag"
 	HeaderContentType   = "Content-Type"
+	HeaderServiceSecret = "X-Sync-Enclave-Secret"
 )
 
 const (
@@ -143,6 +157,9 @@ type GetBlobResponse struct {
 }
 
 func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
+	if c.serviceSecret != "" {
+		req.Header.Set(HeaderServiceSecret, c.serviceSecret)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: request: %w", err)
