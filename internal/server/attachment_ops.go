@@ -242,9 +242,11 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		// also skip the cleanup it triggered, but enforce a fresh
 		// bounded deadline so a hung buckets backend cannot pin
 		// this handler past the request budget.
-		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
-		_ = deps.Buckets.Delete(rollbackCtx, id)
-		cancel()
+		func() {
+			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
+			defer cancel()
+			_ = deps.Buckets.Delete(rollbackCtx, id)
+		}()
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane index failed: " + err.Error()}
 	}
 	return &AttachmentPutResponse{
