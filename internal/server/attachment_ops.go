@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 )
 
@@ -180,6 +181,10 @@ type AttachmentGetResponse struct {
 	Plaintext string `json:"plaintext"`
 }
 
+type AttachmentDeleteRequest struct {
+	ID string `json:"id"`
+}
+
 // AttachmentPut uploads an attachment plaintext to buckets under a
 // fresh per-attachment key. The key is returned so the caller can
 // embed it in the chat JSON; nothing about the key is persisted by
@@ -300,4 +305,22 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 		OK:        true,
 		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
 	}, nil
+}
+
+func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req AttachmentDeleteRequest) (*OKResponse, error) {
+	if deps.Buckets == nil || !deps.Buckets.Configured() {
+		return nil, &AppError{Status: 503, Code: CodeInternal, Message: "buckets backend not configured"}
+	}
+	if req.ID == "" {
+		return nil, badRequest("id is required")
+	}
+	if err := deps.Controlplane.DeleteAttachmentIndex(ctx, sess.RawJWT, req.ID); err != nil {
+		var cpe *controlplane.Error
+		if errors.As(err, &cpe) && cpe.StatusCode == 404 {
+			return nil, &AppError{Status: 404, Code: CodeNotFound, Message: "attachment not found"}
+		}
+		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane attachment delete failed: " + err.Error()}
+	}
+	deleteBucketAttachments(ctx, deps, []string{req.ID})
+	return &OKResponse{OK: true}, nil
 }

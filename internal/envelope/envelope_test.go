@@ -33,6 +33,19 @@ func newKey(t *testing.T) Key {
 	return Key{Bytes: raw, KeyIDHex: cryptopkg.KeyIDHex(id)}
 }
 
+func keyFromHex(t *testing.T, rawHex string) Key {
+	t.Helper()
+	raw, err := hex.DecodeString(rawHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := cryptopkg.DeriveKeyID(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Key{Bytes: raw, KeyIDHex: cryptopkg.KeyIDHex(id)}
+}
+
 func TestCanonicalAADStable(t *testing.T) {
 	a := AAD{
 		KeyIDHex:    strings.Repeat("ab", 16),
@@ -558,10 +571,8 @@ func TestDecryptLegacyV0HexIV(t *testing.T) {
 	}
 }
 
-// TestDecryptLegacyV1RoundTrip exercises the exact wire format the webapp's
-// `compressAndEncrypt` (src/utils/binary-codec.ts) produced for every v1
-// cloud blob in production: IV(12) || AES-GCM-ciphertext(gzip(JSON)). This is
-// the production-blob round-trip test required by syncplan.md §0 item 4.
+// TestDecryptLegacyV1RoundTrip exercises the legacy v1 wire format:
+// IV(12) || AES-GCM-ciphertext(gzip(JSON)).
 func TestDecryptLegacyV1RoundTrip(t *testing.T) {
 	k := newKey(t)
 	payload := map[string]any{
@@ -604,41 +615,20 @@ func TestDecryptLegacyV1RoundTrip(t *testing.T) {
 	}
 }
 
-// TestRewrapV1ProductionBlob round-trips a v1 blob through the full
-// decrypt → re-encrypt(v2) pipeline that the enclave's migrate handler
-// runs. This is the "captured production blob" guarantee from §0 item 4:
-// a v1 blob produced by exactly the bytes the webapp writes must decrypt,
-// re-seal under a current CEK with AAD, and decrypt again as v2.
-func TestRewrapV1ProductionBlob(t *testing.T) {
-	oldKey := newKey(t)
+// TestRewrapV1WebappFixture round-trips a fixed v1 blob produced by
+// the webapp's pako + WebCrypto `compressAndEncrypt` pipeline through
+// the decrypt → re-encrypt(v2) path that the migrate handler runs.
+func TestRewrapV1WebappFixture(t *testing.T) {
+	oldKey := keyFromHex(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
 	newKey := newKey(t)
 	chatID := "chat_prod_v1_blob"
 	clerkUserID := "user_prod_v1"
 
-	payload := map[string]any{
-		"title":     "prod v1 round trip",
-		"messages":  []any{"hello", "world"},
-		"isDeleted": false,
-		"updatedAt": "2024-05-15T10:00:00.000Z",
-	}
-	jsonBytes, err := json.Marshal(payload)
+	jsonBytes := []byte(`{"title":"prod v1 round trip","messages":["hello","world"],"isDeleted":false,"updatedAt":"2024-05-15T10:00:00.000Z"}`)
+	v1Blob, err := hex.DecodeString("202122232425262728292a2bcdb1ae706c981a0e1a7f57427012f6c8c04c93b93bba4475af9dbe1b3708cb8e30eeb209220351a94e7591fcdc6079421b8a0b2018b4f76b75350fb020fd7c603d2c428c0e327e8e69e0528f2d8ce7c4fc74d1955ad3ac43d7be58fede7f3540844bd4ae057071d4933a149ba1b337a05333bcfcae5eedd93286070ff5f38b21938d3fc8bed6402c8c5deea465")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	var gzbuf bytes.Buffer
-	zw := gzip.NewWriter(&gzbuf)
-	if _, err := zw.Write(jsonBytes); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	nonce, ct, err := cryptopkg.Seal(oldKey.Bytes, gzbuf.Bytes(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v1Blob := append(nonce, ct...)
 
 	res, err := DecryptLegacy(v1Blob, []Key{oldKey})
 	if err != nil {

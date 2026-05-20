@@ -64,7 +64,7 @@ func TestShareOpenRejectsWrongKey(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected open with wrong key to fail")
 	}
-	if appErr, ok := err.(*AppError); !ok || !strings.Contains(appErr.Message, "share decrypt failed") {
+	if appErr, ok := err.(*AppError); !ok || appErr.Status != 400 || appErr.Code != CodeBadRequest || !strings.Contains(appErr.Message, "share decrypt failed") {
 		t.Fatalf("unexpected error: %T %v", err, err)
 	}
 }

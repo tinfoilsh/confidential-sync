@@ -514,11 +514,7 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 	// entries (unreachable to anyone without the old CEK + AAD),
 	// so the cascade is fire-and-forget per-id and never fails the
 	// register-key call.
-	if len(cpResp.WipedV2Attachments) > 0 && deps.Buckets != nil && deps.Buckets.Configured() {
-		for _, attID := range cpResp.WipedV2Attachments {
-			_ = deps.Buckets.Delete(ctx, attID)
-		}
-	}
+	deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
 }
 
@@ -743,8 +739,9 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 // profile predictable and avoids contention against a single user's
 // row set, which the controlplane indexes as one btree per scope.
 const (
-	MigrateAllBudget        = 10 * time.Minute
-	migrateAllScopeMaxBatch = 200
+	MigrateAllBudget         = 10 * time.Minute
+	MigrateAllRequestTimeout = MigrateAllBudget + 2*time.Minute
+	migrateAllScopeMaxBatch  = 200
 )
 
 func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequest) (*MigrateAllResponse, error) {

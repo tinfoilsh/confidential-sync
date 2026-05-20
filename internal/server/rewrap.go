@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
@@ -18,6 +20,8 @@ import (
 // AES-GCM ciphertexts. Older `encryptAttachment` builds emitted
 // [12B IV || AES-GCM(ct||tag)], no AAD.
 const attachmentIVLen = 12
+
+const bucketsDeleteCleanupTimeout = 30 * time.Second
 
 // rewrapBlob re-seals a blob under targetKey/targetKIDHex and writes
 // it back to controlplane with Rewrap=true. When scope=chat, also
@@ -115,11 +119,6 @@ func rewrapBlob(
 // exactly as the client stored them.
 // Returns (nil, nil) when the plaintext doesn't parse as a chat
 // envelope — letting the rewrap proceed as a pure re-seal.
-//
-// We swallow per-attachment failures: an attachment whose legacy row
-// is already gone (e.g. 404), or whose buckets PUT fails transiently,
-// must not block the chat rewrap. The chat is still readable; the
-// missing attachment was already going to render as a broken image.
 func rewrapChatAttachments(
 	ctx context.Context,
 	deps Deps,
@@ -158,7 +157,9 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
-			_ = promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey)
+			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -169,8 +170,7 @@ func rewrapChatAttachments(
 // with the embedded per-attachment key, re-uploads the plaintext
 // through buckets under the same attachment id (reusing the same
 // per-attachment key as the buckets slot key), and registers the new
-// v2 row with controlplane. Returns true iff the cascade fully
-// succeeded. The chat JSON's
+// v2 row with controlplane. The chat JSON's
 // `encryptionKey` field is preserved verbatim so the same key now
 // addresses the buckets entry that previously addressed the legacy
 // BYTEA row.
@@ -179,41 +179,41 @@ func promoteOneAttachment(
 	deps Deps,
 	sess Session,
 	chatID, attID, legacyKeyB64 string,
-) bool {
+) error {
 	if !deps.Buckets.Configured() {
-		return false
+		return errors.New("rewrap: buckets backend not configured")
 	}
 	ciphertext, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, attID)
 	if err != nil {
 		if errors.Is(err, controlplane.ErrLegacyAttachmentNotFound) {
 			// already migrated by a concurrent pass, or the row was
 			// dropped — there is nothing to promote.
-			return true
+			return nil
 		}
-		return false
+		return fmt.Errorf("rewrap: fetch legacy attachment %s: %w", attID, err)
 	}
 	legacyKey, err := base64.StdEncoding.DecodeString(legacyKeyB64)
 	if err != nil || len(legacyKey) != 32 {
-		return false
+		return fmt.Errorf("rewrap: invalid legacy attachment key for %s", attID)
 	}
+	defer cryptopkg.Zero(legacyKey)
 	plaintext, err := decryptLegacyAttachment(ciphertext, legacyKey)
 	if err != nil {
-		return false
+		return fmt.Errorf("rewrap: decrypt legacy attachment %s: %w", attID, err)
 	}
 	defer cryptopkg.Zero(plaintext)
-	defer cryptopkg.Zero(legacyKey)
 
 	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
-		return false
+		return fmt.Errorf("rewrap: promote attachment %s to buckets: %w", attID, err)
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, attID, chatID); err != nil {
 		// buckets PUT succeeded but index update failed — the bytes
 		// are present, controlplane just hasn't been told they're
 		// v2 yet. A subsequent rewrap pass will retry the register
 		// (Put is idempotent on the same id+key).
-		return false
+		return fmt.Errorf("rewrap: register attachment index %s: %w", attID, err)
 	}
-	return true
+	return nil
 }
 
 // deleteBucketAttachments fires off best-effort Delete calls for each
@@ -230,12 +230,14 @@ func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
 	if !deps.Buckets.Configured() {
 		return
 	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsDeleteCleanupTimeout)
+	defer cancel()
 	for _, attID := range ids {
 		// Buckets Delete is idempotent on 404 (legacy v1 rows that
 		// were never promoted to buckets simply aren't there).
 		// Issuing the call is cheaper than figuring out
 		// per-attachment which generation it's on.
-		_ = deps.Buckets.Delete(ctx, attID)
+		_ = deps.Buckets.Delete(cleanupCtx, attID)
 	}
 }
 

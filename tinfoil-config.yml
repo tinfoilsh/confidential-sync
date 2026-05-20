@@ -25,6 +25,7 @@ shim:
     - /v1/blobs/migrate-all
     - /v1/attachment/put
     - /v1/attachment/get
+    - /v1/attachment/delete
     - /v1/attachment/get-public
     - /v1/share/seal
     - /v1/share/open

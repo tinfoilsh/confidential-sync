@@ -12,13 +12,13 @@ import (
 // match byte-for-byte. The expected hash is computed once and pinned.
 
 const (
-	vectorCEKHex     = "4242424242424242424242424242424242424242424242424242424242424242"
-	vectorMethod     = "PUT"
-	vectorPath       = "/api/profile/"
-	vectorKeyIDHex   = "00112233445566778899aabbccddeeff"
-	vectorIfMatch    = "0"
-	vectorIdemKey    = "0123456789abcdef"
-	vectorBody       = `{"data":"hello"}`
+	vectorCEKHex      = "4242424242424242424242424242424242424242424242424242424242424242"
+	vectorMethod      = "PUT"
+	vectorPath        = "/api/profile/"
+	vectorKeyIDHex    = "00112233445566778899aabbccddeeff"
+	vectorIfMatch     = "0"
+	vectorIdemKey     = "0123456789abcdef"
+	vectorBody        = `{"data":"hello"}`
 	pinnedExpectedHex = "518d0af258a1001dbf5689ac11f85d783d152adcf664a24ef996010b12b52e23"
 )
 
@@ -97,6 +97,23 @@ func TestCanonical_BodyOnlyOpsStable(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("body-only canonical drift:\n got  %x\n want %x", got, want)
+	}
+}
+
+func TestCanonical_ExtendedEncodingUsesFieldPresence(t *testing.T) {
+	base := CanonicalInput{
+		Method: "PUT", Path: "/p", KeyIDHex: "kid",
+		IfMatch: "0", IdempotencyKey: "i", Body: []byte("body"),
+	}
+	legacy := AppendCanonical(nil, base)
+	withEmpty := base
+	withEmpty.AAD = []byte{}
+	withEmpty.Envelope = []byte{}
+	got := AppendCanonical(nil, withEmpty)
+	want := append([]byte{}, legacy...)
+	want = append(want, 0, 0, 0, 0, 0, 0, 0, 0)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("empty present AAD/envelope must use extended encoding:\n got  %x\n want %x", got, want)
 	}
 }
 

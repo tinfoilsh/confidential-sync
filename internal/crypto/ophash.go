@@ -91,11 +91,11 @@ type CanonicalInput struct {
 // big-endian uint32. This is the exact byte string the MAC is computed
 // over and the same encoding the web client uses.
 //
-// AAD and Envelope are only appended when at least one is populated.
+// AAD and Envelope are only appended when at least one is present.
 // Body-only operations (RegisterKey, AddBundle, rewrap, etc.) keep
 // the historical encoding so cached sync_idempotency_keys entries
 // continue to verify after this rollout. Blob mutations always carry
-// non-empty AAD + Envelope so they unambiguously land on the
+// present AAD + Envelope so they unambiguously land on the
 // extended encoding.
 func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.Method))
@@ -104,7 +104,7 @@ func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.IfMatch))
 	dst = appendLenPrefixed(dst, []byte(in.IdempotencyKey))
 	dst = appendLenPrefixed(dst, in.Body)
-	if len(in.AAD) > 0 || len(in.Envelope) > 0 {
+	if in.AAD != nil || in.Envelope != nil {
 		dst = appendLenPrefixed(dst, in.AAD)
 		dst = appendLenPrefixed(dst, in.Envelope)
 	}

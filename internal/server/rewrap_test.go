@@ -182,6 +182,9 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	if err := json.Unmarshal(body, &pr); err != nil {
 		t.Fatal(err)
 	}
+	if len(pr.Items) != 1 || !pr.Items[0].OK {
+		t.Fatalf("items: %+v", pr.Items)
+	}
 	if pr.Items[0].NeedsRewrap {
 		t.Fatalf("expected needs_rewrap=false")
 	}
@@ -309,9 +312,7 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	// real put/get path uses a per-attachment key as the slot key,
 	// but Delete needs only the access token, so any slot key
 	// works for this fixture.
-	f.bk.mu.Lock()
-	f.bk.items[attID] = bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}}
-	f.bk.mu.Unlock()
+	f.bk.items.Put(attID, bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}})
 	if !f.bk.has(attID) {
 		t.Fatalf("precondition: bucket not seeded")
 	}
