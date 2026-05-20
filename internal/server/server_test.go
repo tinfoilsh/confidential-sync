@@ -1131,4 +1131,7 @@ func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	if shiftedA_ID == shiftedB_ID {
 		t.Fatalf("delimiter ambiguity: shifting bytes across field boundary derived the same id (%s)", shiftedA_ID)
 	}
+	if bytes.Equal(shiftedA_Key, shiftedB_Key) {
+		t.Fatal("delimiter ambiguity: shifting bytes across field boundary derived the same key")
+	}
 }

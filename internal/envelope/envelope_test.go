@@ -313,6 +313,42 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 	}
 }
 
+// TestV2RejectsWhitespaceInBase64CT pins that an attacker who
+// injects `\n` or `\r` into the `ct` field gets a malformed-error
+// rather than a successful decrypt with a wire-different ct
+// string. base64.StdEncoding.Strict() alone tolerates whitespace,
+// so DecryptV2 also runs an explicit alphabet check.
+func TestV2RejectsWhitespaceInBase64CT(t *testing.T) {
+	k := newKey(t)
+	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
+	aadBytes, err := CanonicalAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := Encrypt(k.Bytes, []byte("hello world"), aadBytes, k.KeyIDHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inject := range []string{"\n", "\r", "\r\n", " ", "\t"} {
+		var env V2
+		if err := json.Unmarshal(blob, &env); err != nil {
+			t.Fatal(err)
+		}
+		// Inject the whitespace in the middle of ct (after the
+		// first 4-char group) so it lands inside the run of
+		// alphabet chars rather than next to the padding.
+		if len(env.CT) < 8 {
+			t.Fatalf("ciphertext shorter than expected: %d", len(env.CT))
+		}
+		env.CT = env.CT[:4] + inject + env.CT[4:]
+		mutated, _ := json.Marshal(env)
+		_, err = DecryptV2(mutated, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+		if !errors.Is(err, ErrV2Malformed) {
+			t.Fatalf("expected ErrV2Malformed for ct containing %q, got %v", inject, err)
+		}
+	}
+}
+
 // trailingPadding returns the run of `=` characters at the end of s.
 func trailingPadding(s string) string {
 	i := len(s)

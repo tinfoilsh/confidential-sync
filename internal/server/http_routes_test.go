@@ -4,8 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestShimPathsMatchRoutes pins ExternalRoutePaths against
@@ -21,7 +22,7 @@ func TestShimPathsMatchRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", cfgPath, err)
 	}
-	yamlPaths := parseShimPaths(t, string(raw))
+	yamlPaths := parseShimPaths(t, raw)
 
 	have := ExternalRoutePaths()
 	sort.Strings(have)
@@ -34,41 +35,25 @@ func TestShimPathsMatchRoutes(t *testing.T) {
 	}
 }
 
-func parseShimPaths(t *testing.T, body string) []string {
+// shimConfig captures only the fields this test cares about.
+// Unknown keys are ignored by yaml.v3's Unmarshal, so adding new
+// top-level sections to tinfoil-config.yml won't break the parser.
+type shimConfig struct {
+	Shim struct {
+		Paths []string `yaml:"paths"`
+	} `yaml:"shim"`
+}
+
+func parseShimPaths(t *testing.T, body []byte) []string {
 	t.Helper()
-	lines := strings.Split(body, "\n")
-	var (
-		inShim  bool
-		inPaths bool
-		out     []string
-	)
-	for _, ln := range lines {
-		trimmed := strings.TrimSpace(ln)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if !inShim {
-			if trimmed == "shim:" {
-				inShim = true
-			}
-			continue
-		}
-		if !inPaths {
-			if trimmed == "paths:" {
-				inPaths = true
-			}
-			continue
-		}
-		// A non-list line at any indentation ends the paths block.
-		if !strings.HasPrefix(trimmed, "- ") {
-			break
-		}
-		out = append(out, strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
+	var cfg shimConfig
+	if err := yaml.Unmarshal(body, &cfg); err != nil {
+		t.Fatalf("yaml.Unmarshal tinfoil-config.yml: %v", err)
 	}
-	if !inPaths {
-		t.Fatal("could not find shim.paths block in tinfoil-config.yml")
+	if len(cfg.Shim.Paths) == 0 {
+		t.Fatal("tinfoil-config.yml has empty shim.paths")
 	}
-	return out
+	return cfg.Shim.Paths
 }
 
 func repoRelative(t *testing.T, rel string) string {
