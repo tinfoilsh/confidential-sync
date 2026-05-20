@@ -337,9 +337,12 @@ func TestDeleteAttachmentIndex(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-jwt" {
 			t.Errorf("auth header: %q", got)
 		}
+		if got := r.Header.Get(HeaderServiceSecret); got != "sync-secret" {
+			t.Errorf("service secret header: %q", got)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	c := NewClient(st.server.URL, nil)
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
 	if err := c.DeleteAttachmentIndex(context.Background(), "test-jwt", "att_1"); err != nil {
 		t.Fatalf("delete attachment index: %v", err)
 	}

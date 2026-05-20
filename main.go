@@ -28,6 +28,7 @@ func main() {
 	clerkIssuer := os.Getenv("CLERK_ISSUER")
 	clerkAudience := os.Getenv("CLERK_AUDIENCE")
 	controlplaneURL := os.Getenv("CONTROLPLANE_URL")
+	syncEnclaveSecret := os.Getenv("SYNC_ENCLAVE_SECRET")
 	if env := os.Getenv("GIT_SHA"); env != "" {
 		gitSHA = env
 	}
@@ -37,6 +38,9 @@ func main() {
 	}
 	if controlplaneURL == "" {
 		log.Fatal("CONTROLPLANE_URL is required")
+	}
+	if syncEnclaveSecret == "" {
+		log.Fatal("SYNC_ENCLAVE_SECRET is required")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -54,7 +58,7 @@ func main() {
 
 	cpClient := controlplane.NewClient(controlplaneURL, &http.Client{
 		Timeout: 30 * time.Second,
-	})
+	}, controlplane.WithServiceSecret(syncEnclaveSecret))
 
 	bucketsClient := buckets.NewClient(
 		os.Getenv("BUCKETS_URL"),
