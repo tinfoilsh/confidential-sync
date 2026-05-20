@@ -139,6 +139,7 @@ func (s *cpStub) installHandlers() {
 	// legacy attachment fetch + new attachment ownership index
 	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
 	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
+	s.mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.handleDeleteAttachmentIndex)
 }
 
 func (s *cpStub) extractID(scope string, r *http.Request) string {
@@ -390,7 +391,7 @@ func (s *cpStub) handleLegacyAttachment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	body, ok := s.legacyAttachments[aid]
-	if !ok || len(body) == 0 {
+	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -418,6 +419,20 @@ func (s *cpStub) handleRegisterAttachmentIndex(w http.ResponseWriter, r *http.Re
 	if s.legacyAttachments != nil {
 		delete(s.legacyAttachments, aid)
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *cpStub) handleDeleteAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	aid := r.PathValue("aid")
+	if s.attachmentIndex == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if _, ok := s.attachmentIndex[aid]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	delete(s.attachmentIndex, aid)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1057,6 +1072,34 @@ func TestAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	}
 	if _, err := hex.DecodeString(id); err != nil {
 		t.Fatalf("attachment id is not hex: %v", err)
+	}
+}
+
+func TestAttachmentDeleteDropsIndexAndBucket(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	attID := "att_delete"
+
+	f.bk.items.Put(attID, bucketsItem{
+		Value:          []byte("payload"),
+		EncryptionKeys: [][]byte{bytes.Repeat([]byte{1}, 32)},
+	})
+	f.cp.mu.Lock()
+	f.cp.attachmentIndex = map[string]string{attID: "chat-1"}
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/attachment/delete", AttachmentDeleteRequest{ID: attID}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d %s", resp.StatusCode, body)
+	}
+	if f.bk.has(attID) {
+		t.Fatalf("buckets entry should be gone")
+	}
+	f.cp.mu.Lock()
+	_, indexed := f.cp.attachmentIndex[attID]
+	f.cp.mu.Unlock()
+	if indexed {
+		t.Fatalf("attachment index should be gone")
 	}
 }
 

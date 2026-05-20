@@ -118,7 +118,7 @@ func Start(cfg Config) (*Stack, error) {
 	enclaveSrv := &http.Server{
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      5 * time.Minute,
+		WriteTimeout:      server.MigrateAllRequestTimeout,
 	}
 	go func() { _ = enclaveSrv.Serve(enclaveLn) }()
 

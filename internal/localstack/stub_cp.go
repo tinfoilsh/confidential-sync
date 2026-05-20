@@ -12,7 +12,6 @@
 package localstack
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -22,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/bucketstub"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 )
 
@@ -46,11 +46,9 @@ type StubCP struct {
 	bundles    map[string]map[string]controlplane.CurrentKeyBundle
 	deletes    map[string]time.Time
 
-	// bucketItems mirrors the very small subset of buckets.tinfoil.sh
-	// the enclave talks to: per-token value + slot keys. Without it
-	// localstack attachment round-trips return 404 on GET no matter
-	// what was uploaded.
-	bucketItems map[string]*stubBucketItem
+	buckets           *bucketstub.Store
+	legacyAttachments map[string][]byte
+	attachmentIndex   map[string]string
 
 	// onFirstDelete maps "scope/id" to a callback that fires exactly
 	// once, at the very start of the first DELETE handled for that
@@ -63,20 +61,17 @@ type StubCP struct {
 	onFirstDelete map[string]func()
 }
 
-type stubBucketItem struct {
-	Value          []byte
-	EncryptionKeys [][]byte
-}
-
 // NewStubCP returns a stub controlplane ready to serve.
 func NewStubCP() *StubCP {
 	s := &StubCP{
-		blobs:         map[string]*StubBlob{},
-		keys:          map[string]struct{}{},
-		bundles:       map[string]map[string]controlplane.CurrentKeyBundle{},
-		deletes:       map[string]time.Time{},
-		bucketItems:   map[string]*stubBucketItem{},
-		onFirstDelete: map[string]func(){},
+		blobs:             map[string]*StubBlob{},
+		keys:              map[string]struct{}{},
+		bundles:           map[string]map[string]controlplane.CurrentKeyBundle{},
+		deletes:           map[string]time.Time{},
+		buckets:           bucketstub.NewStore(BucketsStubAPIKey),
+		legacyAttachments: map[string][]byte{},
+		attachmentIndex:   map[string]string{},
+		onFirstDelete:     map[string]func(){},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/sync/blob/chat/{id}", s.putBlob("chat"))
@@ -99,9 +94,12 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/sync/keys/current", s.currentKey)
 	mux.HandleFunc("POST /api/sync/keys/{kid}/bundles", s.addBundle)
 	mux.HandleFunc("DELETE /api/sync/keys/{kid}/bundles/{cid}", s.removeBundle)
-	mux.HandleFunc("PUT /items/{token}", s.putBucketItem)
-	mux.HandleFunc("GET /items/{token}", s.getBucketItem)
-	mux.HandleFunc("DELETE /items/{token}", s.deleteBucketItem)
+	mux.HandleFunc("GET /api/storage/attachment/{aid}", s.getLegacyAttachment)
+	mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.registerAttachmentIndex)
+	mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.deleteAttachmentIndex)
+	mux.HandleFunc("PUT /items/{token}", s.buckets.Handle)
+	mux.HandleFunc("GET /items/{token}", s.buckets.Handle)
+	mux.HandleFunc("DELETE /items/{token}", s.buckets.Handle)
 	s.mux = mux
 	return s
 }
@@ -117,105 +115,6 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // real buckets backend would surface as 401. Exported so the
 // stack wiring uses the same constant.
 const BucketsStubAPIKey = "local-stack-buckets-key"
-
-// bucketsExpectedFormat pins the buckets envelope format. The real
-// service enforces a single v1 layout; rejecting anything else here
-// surfaces wire-compat regressions in smoke tests instead of letting
-// them silently round-trip.
-const bucketsExpectedFormat = 1
-
-func (s *StubCP) checkBucketsAuth(w http.ResponseWriter, r *http.Request) bool {
-	if got := r.Header.Get("Authorization"); got != "Bearer "+BucketsStubAPIKey {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return false
-	}
-	return true
-}
-
-func (s *StubCP) putBucketItem(w http.ResponseWriter, r *http.Request) {
-	if !s.checkBucketsAuth(w, r) {
-		return
-	}
-	token := r.PathValue("token")
-	var body struct {
-		Value          string   `json:"value"`
-		EncryptionKeys []string `json:"encryption_keys"`
-		Format         int      `json:"format"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if body.Format != bucketsExpectedFormat {
-		http.Error(w, "unsupported format", http.StatusBadRequest)
-		return
-	}
-	value, err := base64.StdEncoding.DecodeString(body.Value)
-	if err != nil {
-		http.Error(w, "bad value", http.StatusBadRequest)
-		return
-	}
-	keys := make([][]byte, 0, len(body.EncryptionKeys))
-	for _, k := range body.EncryptionKeys {
-		kb, err := base64.StdEncoding.DecodeString(k)
-		if err != nil {
-			http.Error(w, "bad key", http.StatusBadRequest)
-			return
-		}
-		keys = append(keys, kb)
-	}
-	s.mu.Lock()
-	s.bucketItems[token] = &stubBucketItem{Value: value, EncryptionKeys: keys}
-	s.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *StubCP) getBucketItem(w http.ResponseWriter, r *http.Request) {
-	if !s.checkBucketsAuth(w, r) {
-		return
-	}
-	token := r.PathValue("token")
-	s.mu.Lock()
-	item, ok := s.bucketItems[token]
-	s.mu.Unlock()
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	supplied, err := base64.StdEncoding.DecodeString(r.Header.Get("X-Encryption-Key"))
-	if err != nil {
-		http.Error(w, "bad key", http.StatusBadRequest)
-		return
-	}
-	match := false
-	for _, k := range item.EncryptionKeys {
-		if bytes.Equal(k, supplied) {
-			match = true
-			break
-		}
-	}
-	if !match {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		Value string `json:"value"`
-	}{Value: base64.StdEncoding.EncodeToString(item.Value)})
-}
-
-func (s *StubCP) deleteBucketItem(w http.ResponseWriter, r *http.Request) {
-	if !s.checkBucketsAuth(w, r) {
-		return
-	}
-	token := r.PathValue("token")
-	s.mu.Lock()
-	delete(s.bucketItems, token)
-	s.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-
 
 // -----------------------------------------------------------------------------
 // Test-facing poke API. Holding the stub's mutex while calling these is
@@ -279,6 +178,12 @@ func (s *StubCP) CopyBlob(srcScope, srcID, dstScope, dstID string) bool {
 		UpdatedAt: time.Now().UTC(),
 	}
 	return true
+}
+
+func (s *StubCP) SetLegacyAttachment(id string, body []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.legacyAttachments[id] = append([]byte(nil), body...)
 }
 
 // OnFirstDelete registers a callback to fire exactly once, at the
@@ -393,7 +298,20 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 		}
 		delete(s.blobs, key)
 		s.deletes[key] = time.Now().UTC()
-		w.WriteHeader(http.StatusNoContent)
+		wipedV2 := []string{}
+		if scope == "chat" {
+			for aid, cid := range s.attachmentIndex {
+				if cid == id {
+					wipedV2 = append(wipedV2, aid)
+					delete(s.attachmentIndex, aid)
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":                   true,
+			"wiped_v2_attachments": wipedV2,
+		})
 	}
 }
 
@@ -497,6 +415,50 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "etag": formatETag(next), "key_id": req.KeyID})
 }
 
+func (s *StubCP) getLegacyAttachment(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	body, ok := s.legacyAttachments[r.PathValue("aid")]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(body)
+}
+
+func (s *StubCP) registerAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aid := r.PathValue("aid")
+	var body struct {
+		ChatID string `json:"chat_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if body.ChatID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.attachmentIndex[aid] = body.ChatID
+	delete(s.legacyAttachments, aid)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *StubCP) deleteAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aid := r.PathValue("aid")
+	if _, ok := s.attachmentIndex[aid]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	delete(s.attachmentIndex, aid)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -530,8 +492,12 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 				delete(s.blobs, k)
 			}
 		}
-		for token := range s.bucketItems {
-			wipedAttachments = append(wipedAttachments, token)
+		for aid := range s.attachmentIndex {
+			wipedAttachments = append(wipedAttachments, aid)
+			delete(s.attachmentIndex, aid)
+		}
+		for aid := range s.legacyAttachments {
+			delete(s.legacyAttachments, aid)
 		}
 	} else {
 		for _, b := range s.blobs {

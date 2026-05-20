@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -37,5 +38,34 @@ func TestClientPreservesForbidden(t *testing.T) {
 	_, err := c.Get(context.Background(), "att", make([]byte, 32))
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestClientRejectsMissingValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "api-key", srv.Client())
+	_, err := c.Get(context.Background(), "att", make([]byte, 32))
+	if err == nil || !strings.Contains(err.Error(), "missing value") {
+		t.Fatalf("expected missing value error, got %v", err)
+	}
+}
+
+func TestClientAllowsEmptyValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"value": ""})
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "api-key", srv.Client())
+	got, err := c.Get(context.Background(), "att", make([]byte, 32))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty value decoded to %d bytes", len(got))
 	}
 }

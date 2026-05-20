@@ -59,7 +59,7 @@ func main() {
 	bucketsClient := buckets.NewClient(
 		os.Getenv("BUCKETS_URL"),
 		os.Getenv("BUCKETS_API_KEY"),
-		&http.Client{Timeout: 60 * time.Second},
+		&http.Client{Timeout: server.AttachmentRequestTimeout},
 	)
 	// An unconfigured buckets client is a soft failure: the
 	// attachment routes return 503 and rewrap / wipe paths skip the
@@ -76,8 +76,8 @@ func main() {
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to
-	// server.MigrateAllBudget (10m). A 12-minute server WriteTimeout
-	// gives the handler 2m of margin to finalize its response. All
+	// server.MigrateAllBudget (10m). MigrateAllRequestTimeout gives
+	// the handler 2m of margin to finalize its response. All
 	// other routes complete in well under a second; ReadHeaderTimeout
 	// stays strict so slowloris cannot exploit the longer write side.
 	srv := &http.Server{
@@ -85,7 +85,7 @@ func main() {
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      12 * time.Minute,
+		WriteTimeout:      server.MigrateAllRequestTimeout,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}

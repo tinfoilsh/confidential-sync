@@ -16,12 +16,12 @@ import (
 // of decoded data, which exceeds any reasonable chat or document size.
 const MaxRequestBytes = 64 << 20
 
-// attachmentRequestTimeout is the deadline for attachment + share
+// AttachmentRequestTimeout is the deadline for attachment + share
 // transfers. The default 30s auth timeout is fine for sync blobs but
 // can prematurely cancel large bucket uploads/downloads on slow
 // network paths; this gives the buckets hop room to breathe while
 // still bounding worst-case latency.
-const attachmentRequestTimeout = 5 * time.Minute
+const AttachmentRequestTimeout = 5 * time.Minute
 
 type Handler struct {
 	deps     Deps
@@ -62,14 +62,17 @@ func (h *Handler) routeSpecs() []routeSpec {
 
 		{"POST", "/v1/blobs/migrate", func(h *Handler) http.Handler { return h.authMiddleware(h.migrate) }},
 		{"POST", "/v1/blobs/migrate-all", func(h *Handler) http.Handler {
-			return h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllBudget+time.Minute)
+			return h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllRequestTimeout)
 		}},
 
 		{"POST", "/v1/attachment/put", func(h *Handler) http.Handler {
-			return h.authMiddlewareWithTimeout(h.attachmentPut, attachmentRequestTimeout)
+			return h.authMiddlewareWithTimeout(h.attachmentPut, AttachmentRequestTimeout)
 		}},
 		{"POST", "/v1/attachment/get", func(h *Handler) http.Handler {
-			return h.authMiddlewareWithTimeout(h.attachmentGet, attachmentRequestTimeout)
+			return h.authMiddlewareWithTimeout(h.attachmentGet, AttachmentRequestTimeout)
+		}},
+		{"POST", "/v1/attachment/delete", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.attachmentDelete, AttachmentRequestTimeout)
 		}},
 		// /v1/attachment/get-public is intentionally unauthenticated.
 		// Knowing the attachment id + per-attachment key is the access
@@ -79,7 +82,7 @@ func (h *Handler) routeSpecs() []routeSpec {
 		// request timeout so the missing authMiddleware doesn't also
 		// drop the per-request deadline.
 		{"POST", "/v1/attachment/get-public", func(h *Handler) http.Handler {
-			return withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), attachmentRequestTimeout)
+			return withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), AttachmentRequestTimeout)
 		}},
 
 		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
@@ -376,6 +379,20 @@ func (h *Handler) attachmentGetPublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := AttachmentGet(r.Context(), h.deps, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req AttachmentDeleteRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentDelete(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

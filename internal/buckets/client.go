@@ -43,6 +43,8 @@ var ErrNotFound = errors.New("buckets: item not found")
 // ErrForbidden is returned when buckets rejects the supplied slot key.
 var ErrForbidden = errors.New("buckets: forbidden")
 
+const defaultRequestTimeout = 5 * time.Minute
+
 // Client talks to buckets.tinfoil.sh on behalf of the enclave.
 // Authentication is a single static Tinfoil API key the enclave
 // holds; every request is attributed to that key's tenant in R2.
@@ -54,7 +56,7 @@ type Client struct {
 
 func NewClient(baseURL, apiKey string, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		httpClient = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -77,7 +79,7 @@ type putRequest struct {
 }
 
 type getResponse struct {
-	Value string `json:"value"`
+	Value *string `json:"value"`
 }
 
 // Put stores a value at the given access token, encrypted server-side
@@ -154,7 +156,10 @@ func (c *Client) Get(ctx context.Context, accessToken string, key []byte) ([]byt
 	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
 		return nil, fmt.Errorf("buckets: decode get: %w", err)
 	}
-	plaintext, err := base64.StdEncoding.DecodeString(gr.Value)
+	if gr.Value == nil {
+		return nil, errors.New("buckets: missing value")
+	}
+	plaintext, err := base64.StdEncoding.DecodeString(*gr.Value)
 	if err != nil {
 		return nil, fmt.Errorf("buckets: decode value: %w", err)
 	}
@@ -202,5 +207,6 @@ func (c *Client) expectOK(resp *http.Response) error {
 		return nil
 	}
 	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return fmt.Errorf("buckets: status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
 }

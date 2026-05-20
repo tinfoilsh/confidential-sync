@@ -331,6 +331,20 @@ func TestGetLegacyAttachmentMapsNotFound(t *testing.T) {
 	}
 }
 
+func TestDeleteAttachmentIndex(t *testing.T) {
+	st := newStub(t)
+	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-jwt" {
+			t.Errorf("auth header: %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil)
+	if err := c.DeleteAttachmentIndex(context.Background(), "test-jwt", "att_1"); err != nil {
+		t.Fatalf("delete attachment index: %v", err)
+	}
+}
+
 type repeatingReader byte
 
 func (r repeatingReader) Read(p []byte) (int, error) {

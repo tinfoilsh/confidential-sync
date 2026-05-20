@@ -105,7 +105,7 @@ deliberate-break checks have been performed and documented:
 ### Running selectively
 
 ```sh
-# All 14
+# All 13
 go test -tags=smoke -v -count=1 ./internal/localstack/smoke
 
 # A specific test

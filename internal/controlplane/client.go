@@ -831,3 +831,27 @@ func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID,
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
+
+func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID string) error {
+	if attachmentID == "" {
+		return fmt.Errorf("controlplane: attachment id is required")
+	}
+	endpoint := c.baseURL + "/api/sync/attachment-index/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return parseError(resp.StatusCode, raw)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
