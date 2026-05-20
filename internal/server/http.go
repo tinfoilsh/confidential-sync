@@ -38,50 +38,95 @@ func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 	return &Handler{deps: deps, verifier: verifier, logger: logger}
 }
 
+// routeSpec ties one HTTP route's wire-level path to the handler
+// that serves it. Centralising the routes here lets us derive both
+// the mux registration and the canonical path list for shim-config
+// drift checks from a single source.
+type routeSpec struct {
+	method  string
+	path    string
+	handler func(*Handler) http.Handler
+}
+
+func (h *Handler) routeSpecs() []routeSpec {
+	return []routeSpec{
+		{"POST", "/v1/sync/push", func(h *Handler) http.Handler { return h.authMiddleware(h.push) }},
+		{"POST", "/v1/sync/pull", func(h *Handler) http.Handler { return h.authMiddleware(h.pull) }},
+		{"POST", "/v1/sync/list-status", func(h *Handler) http.Handler { return h.authMiddleware(h.listStatus) }},
+		{"POST", "/v1/sync/delete", func(h *Handler) http.Handler { return h.authMiddleware(h.delete) }},
+
+		{"POST", "/v1/key/register", func(h *Handler) http.Handler { return h.authMiddleware(h.registerKey) }},
+		{"POST", "/v1/key/add-bundle", func(h *Handler) http.Handler { return h.authMiddleware(h.addBundle) }},
+		{"POST", "/v1/key/remove-bundle", func(h *Handler) http.Handler { return h.authMiddleware(h.removeBundle) }},
+		{"POST", "/v1/key/current", func(h *Handler) http.Handler { return h.authMiddleware(h.keyCurrent) }},
+
+		{"POST", "/v1/blobs/migrate", func(h *Handler) http.Handler { return h.authMiddleware(h.migrate) }},
+		{"POST", "/v1/blobs/migrate-all", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllBudget+time.Minute)
+		}},
+
+		{"POST", "/v1/attachment/put", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.attachmentPut, attachmentRequestTimeout)
+		}},
+		{"POST", "/v1/attachment/get", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.attachmentGet, attachmentRequestTimeout)
+		}},
+		// /v1/attachment/get-public is intentionally unauthenticated.
+		// Knowing the attachment id + per-attachment key is the access
+		// proof — the same trust model the legacy public attachment
+		// endpoint uses, and the only way share recipients can read v2
+		// attachments without holding the owner's JWT. Wrapped in a
+		// request timeout so the missing authMiddleware doesn't also
+		// drop the per-request deadline.
+		{"POST", "/v1/attachment/get-public", func(h *Handler) http.Handler {
+			return withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), attachmentRequestTimeout)
+		}},
+
+		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
+		// /v1/share/open is intentionally unauthenticated. Knowing the
+		// share key in the URL fragment is the access proof — the same
+		// trust model the legacy in-browser share path uses today.
+		//
+		// No context timeout wrapper here: the work is pure in-memory
+		// CPU (AES-GCM Open + gzip inflate), neither of which observes
+		// context cancellation in Go's stdlib, so a wall-clock deadline
+		// would fire without doing anything. DoS protection comes from
+		// the bounded input — MaxRequestBytes caps the ciphertext on
+		// the wire and shareMaxPlaintextBytes caps the post-decompress
+		// plaintext — which makes worst-case work O(MiB), not O(time).
+		{"POST", "/v1/share/open", func(h *Handler) http.Handler { return http.HandlerFunc(h.shareOpen) }},
+
+		{"GET", "/v1/health", func(h *Handler) http.Handler { return http.HandlerFunc(h.health) }},
+		{"GET", "/health", func(h *Handler) http.Handler { return http.HandlerFunc(h.health) }},
+	}
+}
+
+// ExternalRoutePaths returns the canonical list of HTTP paths the
+// enclave exposes. The Tinfoil CVM shim hard-blocks any path not on
+// its allowlist, so this slice must stay in lockstep with
+// `tinfoil-config.yml#shim.paths`. The list is derived from the
+// same routeSpecs() table that powers Routes(), so adding a handler
+// to the mux automatically adds it here — TestShimPathsMatchRoutes
+// then forces the YAML to be updated in the same commit.
+func ExternalRoutePaths() []string {
+	specs := (&Handler{}).routeSpecs()
+	seen := make(map[string]struct{}, len(specs))
+	paths := make([]string, 0, len(specs))
+	for _, s := range specs {
+		if _, ok := seen[s.path]; ok {
+			continue
+		}
+		seen[s.path] = struct{}{}
+		paths = append(paths, s.path)
+	}
+	return paths
+}
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.Handle("POST /v1/sync/push", h.authMiddleware(h.push))
-	mux.Handle("POST /v1/sync/pull", h.authMiddleware(h.pull))
-	mux.Handle("POST /v1/sync/list-status", h.authMiddleware(h.listStatus))
-	mux.Handle("POST /v1/sync/delete", h.authMiddleware(h.delete))
-
-	mux.Handle("POST /v1/key/register", h.authMiddleware(h.registerKey))
-	mux.Handle("POST /v1/key/add-bundle", h.authMiddleware(h.addBundle))
-	mux.Handle("POST /v1/key/remove-bundle", h.authMiddleware(h.removeBundle))
-	mux.Handle("POST /v1/key/current", h.authMiddleware(h.keyCurrent))
-
-	mux.Handle("POST /v1/blobs/migrate", h.authMiddleware(h.migrate))
-	mux.Handle("POST /v1/blobs/migrate-all", h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllBudget+time.Minute))
-
-	mux.Handle("POST /v1/attachment/put", h.authMiddlewareWithTimeout(h.attachmentPut, attachmentRequestTimeout))
-	mux.Handle("POST /v1/attachment/get", h.authMiddlewareWithTimeout(h.attachmentGet, attachmentRequestTimeout))
-	// /v1/attachment/get-public is intentionally unauthenticated.
-	// Knowing the attachment id + per-attachment key is the access
-	// proof — the same trust model the legacy public attachment
-	// endpoint uses, and the only way share recipients can read v2
-	// attachments without holding the owner's JWT. Wrapped in a
-	// request timeout so the missing authMiddleware doesn't also
-	// drop the per-request deadline.
-	mux.Handle("POST /v1/attachment/get-public", withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), attachmentRequestTimeout))
-
-	mux.Handle("POST /v1/share/seal", h.authMiddleware(h.shareSeal))
-	// /v1/share/open is intentionally unauthenticated. Knowing the
-	// share key in the URL fragment is the access proof — the same
-	// trust model the legacy in-browser share path uses today.
-	//
-	// No context timeout wrapper here: the work is pure in-memory
-	// CPU (AES-GCM Open + gzip inflate), neither of which observes
-	// context cancellation in Go's stdlib, so a wall-clock deadline
-	// would fire without doing anything. DoS protection comes from
-	// the bounded input — MaxRequestBytes caps the ciphertext on
-	// the wire and shareMaxPlaintextBytes caps the post-decompress
-	// plaintext — which makes worst-case work O(MiB), not O(time).
-	mux.Handle("POST /v1/share/open", http.HandlerFunc(h.shareOpen))
-
-	mux.HandleFunc("GET /v1/health", h.health)
-	mux.HandleFunc("GET /health", h.health)
-
+	for _, spec := range h.routeSpecs() {
+		mux.Handle(spec.method+" "+spec.path, spec.handler(h))
+	}
 	return h.commonMiddleware(mux)
 }
 

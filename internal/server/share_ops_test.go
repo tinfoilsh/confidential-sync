@@ -104,7 +104,10 @@ func TestShareSealGzipsPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	raw, _ := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	raw, err := base64.StdEncoding.DecodeString(sealResp.Ciphertext)
+	if err != nil {
+		t.Fatalf("ciphertext is not valid base64: %v", err)
+	}
 	// AES-GCM overhead is 12 (IV) + 16 (tag) = 28 bytes; if the
 	// inner stream were not compressed we'd see at least 2048+28.
 	if len(raw) > 256 {

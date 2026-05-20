@@ -3,6 +3,7 @@ package buckets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,7 +35,7 @@ func TestClientPreservesForbidden(t *testing.T) {
 
 	c := NewClient(srv.URL, "api-key", srv.Client())
 	_, err := c.Get(context.Background(), "att", make([]byte, 32))
-	if err != ErrForbidden {
+	if !errors.Is(err, ErrForbidden) {
 		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
 }

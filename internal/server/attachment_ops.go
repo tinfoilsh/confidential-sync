@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -102,7 +103,17 @@ func deriveAttachmentMaterials(idempotencyKey, chatID, clerkSubject string, plai
 		return "", nil, errors.New("chat id is required")
 	}
 	plaintextDigest := sha256.Sum256(plaintext)
-	ikm := []byte(idempotencyKey + "|" + chatID + "|" + clerkSubject + "|" + hex.EncodeToString(plaintextDigest[:]))
+	// IKM components are length-prefixed (8-byte big-endian) so the
+	// derivation is unambiguous regardless of what bytes the inputs
+	// contain. A printable delimiter like "|" would collide on
+	// inputs that themselves contain that character
+	// (e.g. ("a|b","c") and ("a","b|c") would produce identical IKM
+	// and thus identical (id, key) pairs); a NUL delimiter would
+	// rule out one byte but JSON strings can carry NUL through
+	// `\u0000`. Length-prefixing is the standard
+	// domain-separation construction and has no string-injection
+	// failure mode.
+	ikm := encodeIKM(idempotencyKey, chatID, clerkSubject, hex.EncodeToString(plaintextDigest[:]))
 	idBytes := make([]byte, attachmentIDBytes)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, []byte(attachmentIDInfo)), idBytes); err != nil {
 		return "", nil, err
@@ -113,6 +124,26 @@ func deriveAttachmentMaterials(idempotencyKey, chatID, clerkSubject string, plai
 		return "", nil, err
 	}
 	return hex.EncodeToString(idBytes), key, nil
+}
+
+// encodeIKM concatenates the provided components using length
+// prefixes for unambiguous domain separation. Each component is
+// emitted as a big-endian uint64 byte-length followed by its bytes;
+// no separator can collide with input bytes because the length
+// uniquely identifies each field boundary.
+func encodeIKM(parts ...string) []byte {
+	total := 0
+	for _, p := range parts {
+		total += 8 + len(p)
+	}
+	buf := make([]byte, 0, total)
+	var lenBuf [8]byte
+	for _, p := range parts {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(p)))
+		buf = append(buf, lenBuf[:]...)
+		buf = append(buf, p...)
+	}
+	return buf
 }
 
 // AttachmentGetRequest carries an attachment fetch. The webapp
@@ -186,8 +217,11 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		// will be swept by the janitor — the controlplane row is
 		// still the source of truth for ownership, so a missing
 		// index row means the user effectively has no claim on the
-		// bucket entry anyway.
-		_ = deps.Buckets.Delete(ctx, id)
+		// bucket entry anyway. Detach from the request context so
+		// a client cancellation (which is the most common reason
+		// the index call fails after a successful Put) does not
+		// also skip the cleanup it triggered.
+		_ = deps.Buckets.Delete(context.WithoutCancel(ctx), id)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane index failed: " + err.Error()}
 	}
 	return &AttachmentPutResponse{
@@ -221,10 +255,10 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 	if err != nil {
 		return nil, badRequest("invalid att_key base64")
 	}
+	defer cryptopkg.Zero(attKey)
 	if len(attKey) != attKeySize {
 		return nil, badRequest("att_key must be 32 bytes")
 	}
-	defer cryptopkg.Zero(attKey)
 
 	plaintext, err := deps.Buckets.Get(ctx, req.ID, attKey)
 	if err != nil {
