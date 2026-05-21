@@ -46,7 +46,7 @@ func runAttachmentOrphanSweep(ctx context.Context, deps Deps, logger Logger) {
 }
 
 func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
-	ids, err := deps.Controlplane.ListOrphanedV2Attachments(ctx, attachmentOrphanReaperLimit)
+	ids, err := deps.Controlplane.DeleteOrphanedV2Attachments(ctx, attachmentOrphanReaperLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -54,9 +54,6 @@ func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
 	for _, id := range ids {
 		if err := deps.Buckets.Delete(ctx, id); err != nil {
 			return swept, fmt.Errorf("delete bucket attachment %s: %w", id, err)
-		}
-		if err := deps.Controlplane.DeleteOrphanedV2AttachmentIndex(ctx, id); err != nil {
-			return swept, fmt.Errorf("delete orphan attachment index %s: %w", id, err)
 		}
 		swept++
 	}
