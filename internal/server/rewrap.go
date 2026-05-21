@@ -82,14 +82,6 @@ func rewrapBlob(
 		Rewrap:         true,
 		Ciphertext:     envBlob,
 	}
-	// /api/sync/rewrap is a JSON POST, so the controlplane MACs over
-	// the exact JSON body bytes that hit the wire (not the bare
-	// envelope). Pre-marshal here so the enclave hashes the same
-	// representation the controlplane will reconstruct.
-	rewrapBody, err := controlplane.RewrapBody(rewrapReq)
-	if err != nil {
-		return "", err
-	}
 	opKey, err := cryptopkg.DeriveOpHashKey(targetKey)
 	if err != nil {
 		return "", err
@@ -101,7 +93,8 @@ func rewrapBlob(
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
-		Body:           rewrapBody,
+		Body:           finalPlaintext,
+		AAD:            aadBytes,
 	})
 	resp, err := deps.Controlplane.PutBlob(ctx, rewrapReq)
 	if err != nil {
@@ -157,9 +150,7 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
-			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
-				return nil, err
-			}
+			_ = promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey)
 		}
 	}
 

@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -27,23 +26,22 @@ import (
 const bucketsRollbackTimeout = 30 * time.Second
 
 // attKeySize is the length of the per-attachment AES-256 key the
-// enclave mints on upload and hands to the webapp. Matches buckets'
+// enclave derives on upload and hands to the webapp. Matches buckets'
 // required slot key size.
 const attKeySize = 32
 
 // AttachmentPutRequest carries a single attachment upload. The
 // plaintext lives on the wire only on the webapp↔enclave hop; the
-// enclave mints a fresh per-attachment AES-256 key, hands the
+// enclave derives a per-attachment AES-256 key, hands the
 // plaintext + that key to buckets (buckets seals natively under its
 // v1 envelope), registers ownership with the controlplane, and
 // returns the key to the webapp so it can be embedded in the chat
 // JSON under `attachments[i].encryptionKey`.
 //
-// The webapp never picks the attachment id: the enclave mints a
-// fresh 144-bit random id per upload and returns it. This keeps the
-// global buckets path namespace under enclave control, so the only
-// party that can write to both buckets and the controlplane's
-// chat_attachments table is also the only party that decides what id
+// The webapp never picks the attachment id: the enclave derives it
+// from the caller idempotency key, user, chat, and plaintext, then
+// returns it. This keeps retries stable while preserving enclave
+// control of buckets paths and the controlplane attachment index.
 // a new row gets. No CEK material flows on this request — the
 // per-attachment key is what protects the buckets bytes, and the
 // chat envelope (sealed under CEK) is what protects the
@@ -51,13 +49,13 @@ const attKeySize = 32
 type AttachmentPutRequest struct {
 	ChatID    string `json:"chat_id"`
 	Plaintext string `json:"plaintext"` // base64 attachment bytes
-	// IdempotencyKey is the caller's anti-duplication tag. When set,
-	// the enclave deterministically derives the attachment id and
-	// per-attachment key from it (via HKDF over the user's clerk
+	// IdempotencyKey is the caller's required anti-duplication tag.
+	// The enclave deterministically derives the attachment id and
+	// per-attachment key from it (via HKDF over the user's Clerk
 	// subject so two users with colliding ids still hit different
 	// buckets slots), so a retried upload produces the same
 	// (id, att_key) and the same buckets bytes — no orphans.
-	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	IdempotencyKey string `json:"idempotency_key"`
 }
 
 // AttachmentPutResponse confirms the bucket write + index
@@ -73,18 +71,6 @@ type AttachmentPutResponse struct {
 const (
 	attachmentIDBytes = 18
 )
-
-// newAttachmentID mints a fresh 144-bit random attachment id encoded
-// as 36 lowercase hex characters. Buckets currently requires URL
-// handles to be at least 36 chars, and hex keeps the id path-safe
-// with no version-bit/encoding ambiguity.
-func newAttachmentID() (string, error) {
-	var b [attachmentIDBytes]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
-}
 
 const (
 	attachmentIDInfo  = "tinfoil-attachment-id-v1"
@@ -186,15 +172,18 @@ type AttachmentDeleteRequest struct {
 }
 
 // AttachmentPut uploads an attachment plaintext to buckets under a
-// fresh per-attachment key. The key is returned so the caller can
-// embed it in the chat JSON; nothing about the key is persisted by
-// the enclave itself.
+// per-attachment key derived from the idempotency key. The key is
+// returned so the caller can embed it in the chat JSON; nothing about
+// the key is persisted by the enclave itself.
 func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentPutRequest) (*AttachmentPutResponse, error) {
 	if deps.Buckets == nil || !deps.Buckets.Configured() {
 		return nil, &AppError{Status: 503, Code: CodeInternal, Message: "buckets backend not configured"}
 	}
 	if req.ChatID == "" {
 		return nil, badRequest("chat_id is required")
+	}
+	if req.IdempotencyKey == "" {
+		return nil, badRequest("idempotency_key is required")
 	}
 
 	plaintext, err := base64.StdEncoding.DecodeString(req.Plaintext)
@@ -207,29 +196,18 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		id     string
 		attKey []byte
 	)
-	if req.IdempotencyKey != "" {
-		// Deterministic derivation: any retry of the same upload
-		// (same user, same chat, same key, same bytes) resolves to
-		// the same id+key. The buckets Put under that pair is
-		// idempotent (same value, same slot key), and the
-		// controlplane index registration is safe to repeat. Mixing
-		// chat_id + plaintext digest into the IKM ensures a
-		// caller-side bug that reuses the key for different content
-		// or a different chat lands on a fresh slot instead of
-		// silently overwriting the original attachment.
-		id, attKey, err = deriveAttachmentMaterials(req.IdempotencyKey, req.ChatID, sess.Claims.Subject, plaintext)
-		if err != nil {
-			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "derive attachment materials: " + err.Error()}
-		}
-	} else {
-		id, err = newAttachmentID()
-		if err != nil {
-			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment id: " + err.Error()}
-		}
-		attKey = make([]byte, attKeySize)
-		if _, err := rand.Read(attKey); err != nil {
-			return nil, &AppError{Status: 500, Code: CodeInternal, Message: "mint attachment key: " + err.Error()}
-		}
+	// Deterministic derivation: any retry of the same upload
+	// (same user, same chat, same key, same bytes) resolves to
+	// the same id+key. The buckets Put under that pair is
+	// idempotent (same value, same slot key), and the
+	// controlplane index registration is safe to repeat. Mixing
+	// chat_id + plaintext digest into the IKM ensures a
+	// caller-side bug that reuses the key for different content
+	// or a different chat lands on a fresh slot instead of
+	// silently overwriting the original attachment.
+	id, attKey, err = deriveAttachmentMaterials(req.IdempotencyKey, req.ChatID, sess.Claims.Subject, plaintext)
+	if err != nil {
+		return nil, &AppError{Status: 500, Code: CodeInternal, Message: "derive attachment materials: " + err.Error()}
 	}
 	defer cryptopkg.Zero(attKey)
 
@@ -308,9 +286,6 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 }
 
 func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req AttachmentDeleteRequest) (*OKResponse, error) {
-	if deps.Buckets == nil || !deps.Buckets.Configured() {
-		return nil, &AppError{Status: 503, Code: CodeInternal, Message: "buckets backend not configured"}
-	}
 	if req.ID == "" {
 		return nil, badRequest("id is required")
 	}
@@ -321,6 +296,8 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 		}
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane attachment delete failed: " + err.Error()}
 	}
-	deleteBucketAttachments(ctx, deps, []string{req.ID})
+	if deps.Buckets != nil && deps.Buckets.Configured() {
+		deleteBucketAttachments(ctx, deps, []string{req.ID})
+	}
 	return &OKResponse{OK: true}, nil
 }

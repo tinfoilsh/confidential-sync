@@ -99,10 +99,18 @@ func (s *Store) put(w http.ResponseWriter, r *http.Request, token string) {
 		http.Error(w, "bad value", http.StatusBadRequest)
 		return
 	}
+	if len(body.EncryptionKeys) == 0 {
+		http.Error(w, "bad key", http.StatusBadRequest)
+		return
+	}
 	keys := make([][]byte, 0, len(body.EncryptionKeys))
 	for _, k := range body.EncryptionKeys {
 		kb, err := base64.StdEncoding.DecodeString(k)
 		if err != nil {
+			http.Error(w, "bad key", http.StatusBadRequest)
+			return
+		}
+		if len(kb) == 0 {
 			http.Error(w, "bad key", http.StatusBadRequest)
 			return
 		}

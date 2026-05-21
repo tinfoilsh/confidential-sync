@@ -63,18 +63,20 @@ func DeriveOpHashKey(cek []byte) ([]byte, error) {
 //	IfMatch:        decimal ASCII etag, or the literal header value
 //	                ("0" for create, "*" or a hex key for register-key)
 //	IdempotencyKey: client-chosen UUID/ULID, ASCII
-//	Body:           raw request body bytes (nil-safe for DELETEs)
+//	Body:           stable logical body bytes (nil-safe for DELETEs;
+//	                plaintext for blob writes so randomized envelopes
+//	                do not break idempotent retries)
 //	AAD:            canonical AAD bytes used during seal; nil for
 //	                non-blob operations (key register / rewrap-by-meta /
 //	                share / attachment)
-//	Envelope:       v2 envelope bytes posted as the request body; nil
-//	                for non-blob operations
+//	Envelope:       optional v2 envelope bytes for callers that need
+//	                to bind a specific ciphertext generation
 //
-// AAD and Envelope replace the previous "hash of plaintext + metadata"
-// proxy. Because the envelope already authenticates the plaintext
-// under the user's CEK via AES-GCM, MACing the envelope under K_op
-// transitively commits to the plaintext without ever placing a
-// plaintext-derived digest on the wire.
+// Blob writes pass plaintext in Body and canonical AAD in AAD. The
+// plaintext is protected by a keyed MAC under K_op before it ever
+// reaches the controlplane, so low-entropy payloads remain outside
+// the controlplane's brute-force boundary while retries stay stable
+// across AES-GCM nonce changes.
 type CanonicalInput struct {
 	Method         string
 	Path           string
@@ -94,9 +96,8 @@ type CanonicalInput struct {
 // AAD and Envelope are only appended when at least one is present.
 // Body-only operations (RegisterKey, AddBundle, rewrap, etc.) keep
 // the historical encoding so cached sync_idempotency_keys entries
-// continue to verify after this rollout. Blob mutations always carry
-// present AAD + Envelope so they unambiguously land on the
-// extended encoding.
+// continue to verify after this rollout. Blob mutations carry AAD so
+// they unambiguously land on the extended encoding.
 func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.Method))
 	dst = appendLenPrefixed(dst, []byte(in.Path))

@@ -105,6 +105,10 @@ func NewStubCP() *StubCP {
 }
 
 func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/sync/") && r.Header.Get(controlplane.HeaderServiceSecret) != LocalStackSyncEnclaveSecret {
+		http.Error(w, "sync enclave credential is required", http.StatusForbidden)
+		return
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -115,6 +119,8 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // real buckets backend would surface as 401. Exported so the
 // stack wiring uses the same constant.
 const BucketsStubAPIKey = "local-stack-buckets-key"
+
+const LocalStackSyncEnclaveSecret = "local-stack-sync-enclave-secret"
 
 // -----------------------------------------------------------------------------
 // Test-facing poke API. Holding the stub's mutex while calling these is
