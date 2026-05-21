@@ -265,10 +265,10 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 }
 
 // TestDeleteChatCascadesAttachmentsToBuckets confirms that deleting a
-// v2 chat through the enclave wipes the attachment objects from
-// buckets before the controlplane row is dropped. The controlplane's
-// own cascade is unit-tested separately; here we only verify the
-// enclave-side half.
+// v2 chat through the enclave wipes attachment objects from buckets
+// using the ids returned by the controlplane delete response. The
+// controlplane's own cascade is unit-tested separately; here we only
+// verify the enclave-side half.
 func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()

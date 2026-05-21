@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 )
 
 // injectV0 injects a legacy v0 envelope into the stub at (scope, id),
@@ -82,8 +83,19 @@ func TestT12_LegacyV0BlobInlineRewrapsOnPull(t *testing.T) {
 	if stored == nil {
 		t.Fatalf("blob disappeared after legacy pull")
 	}
-	if !contains(stored.Body, []byte(`"v":2`)) {
-		t.Fatalf("expected legacy v0 blob to be promoted to v2 after pull, got: %s", stored.Body)
+	res, err := envelope.DecryptV2(stored.Body, []envelope.Key{{Bytes: f.cek, KeyIDHex: f.cekKID}}, func(kid string) ([]byte, error) {
+		return envelope.CanonicalAAD(envelope.AAD{
+			KeyIDHex:    kid,
+			Scope:       envelope.ScopeChat,
+			ID:          "legacy_1",
+			ClerkUserID: f.userSub,
+		})
+	})
+	if err != nil {
+		t.Fatalf("expected promoted blob to be a valid v2 envelope: %v; body=%s", err, stored.Body)
+	}
+	if string(res.Plaintext) != string(plaintext) {
+		t.Fatalf("promoted v2 plaintext mismatch: got %q want %q", res.Plaintext, plaintext)
 	}
 }
 
