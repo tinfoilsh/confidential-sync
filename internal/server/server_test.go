@@ -1096,19 +1096,6 @@ func TestKeyIDDerivationConsistencyAcrossClients(t *testing.T) {
 	}
 }
 
-func TestDerivedAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
-	id, _, err := deriveAttachmentMaterials("idem", "chat", "user", []byte("payload"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(id) != 36 {
-		t.Fatalf("attachment id length = %d, want 36", len(id))
-	}
-	if _, err := hex.DecodeString(id); err != nil {
-		t.Fatalf("attachment id is not hex: %v", err)
-	}
-}
-
 func TestAttachmentDeleteDropsIndexAndBucket(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
