@@ -274,7 +274,7 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	tok := f.jwt()
 
 	// Build a v2 chat plaintext that names a v2 attachment.
-	attID := "att_v2"
+	attID := "123e4567-e89b-12d3-a456-426614174222"
 	chat := map[string]any{
 		"id": "c2",
 		"messages": []any{

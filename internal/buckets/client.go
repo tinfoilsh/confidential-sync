@@ -3,10 +3,10 @@
 // tenant; per-user separation comes from two layers stacked on top
 // of the API key:
 //
-//  1. The access token (URL path) is the attachment's 128-bit
-//     enclave-minted random id (32 hex chars), globally
-//     non-colliding and unguessable to any party that does not
-//     already see the controlplane's `chat_attachments.id` column.
+//  1. The access token is the attachment's enclave-minted id,
+//     globally non-colliding and unguessable to any party that does
+//     not already see the controlplane's `chat_attachments.id`
+//     column.
 //  2. The bytes stored at the slot are sealed by buckets under a
 //     per-attachment AES-256-GCM key the enclave mints fresh on
 //     upload. The enclave never persists that key itself: it
@@ -30,8 +30,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -72,19 +73,23 @@ func (c *Client) Configured() bool {
 	return c != nil && c.baseURL != "" && c.apiKey != ""
 }
 
-type putRequest struct {
-	Value          string   `json:"value"`
-	EncryptionKeys []string `json:"encryption_keys"`
-	Format         int      `json:"format"`
+type getRequest struct {
+	AccessToken   string `json:"access_token"`
+	EncryptionKey string `json:"encryption_key"`
 }
 
-type getResponse struct {
-	Value *string `json:"value"`
+type accessTokenRequest struct {
+	AccessToken string `json:"access_token"`
+}
+
+type putResponse struct {
+	PlaintextLength int64  `json:"plaintext_length"`
+	Version         int64  `json:"version"`
+	CreatedAt       string `json:"created_at"`
 }
 
 // Put stores a value at the given access token, encrypted server-side
-// under the supplied 32-byte key. Uses the v1 envelope format so the
-// key slot can later be rotated without re-uploading the value.
+// under the supplied 32-byte key.
 func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []byte) error {
 	if !c.Configured() {
 		return errors.New("buckets: client not configured")
@@ -92,20 +97,33 @@ func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []b
 	if len(key) != 32 {
 		return fmt.Errorf("buckets: encryption key must be 32 bytes, got %d", len(key))
 	}
-	body, err := json.Marshal(putRequest{
-		Value:          base64.StdEncoding.EncodeToString(plaintext),
-		EncryptionKeys: []string{base64.StdEncoding.EncodeToString(key)},
-		Format:         1,
-	})
-	if err != nil {
-		return fmt.Errorf("buckets: marshal put: %w", err)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("access_token", accessToken); err != nil {
+		return fmt.Errorf("buckets: write access token: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.itemURL(accessToken), bytes.NewReader(body))
+	if err := writer.WriteField("encryption_keys", base64.StdEncoding.EncodeToString(key)); err != nil {
+		return fmt.Errorf("buckets: write encryption key: %w", err)
+	}
+	if err := writer.WriteField("plaintext_length", strconv.Itoa(len(plaintext))); err != nil {
+		return fmt.Errorf("buckets: write plaintext length: %w", err)
+	}
+	dataPart, err := writer.CreateFormField("data")
+	if err != nil {
+		return fmt.Errorf("buckets: create data field: %w", err)
+	}
+	if _, err := dataPart.Write(plaintext); err != nil {
+		return fmt.Errorf("buckets: write data: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("buckets: close multipart: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/put"), &body)
 	if err != nil {
 		return err
 	}
 	c.setAuth(req)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("buckets: put request: %w", err)
@@ -114,7 +132,13 @@ func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []b
 	if err := c.expectOK(resp); err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	var pr putResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return fmt.Errorf("buckets: decode put: %w", err)
+	}
+	if pr.PlaintextLength != int64(len(plaintext)) {
+		return fmt.Errorf("buckets: put length mismatch: got %d, want %d", pr.PlaintextLength, len(plaintext))
+	}
 	return nil
 }
 
@@ -127,12 +151,19 @@ func (c *Client) Get(ctx context.Context, accessToken string, key []byte) ([]byt
 	if len(key) != 32 {
 		return nil, fmt.Errorf("buckets: encryption key must be 32 bytes, got %d", len(key))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.itemURL(accessToken), nil)
+	body, err := json.Marshal(getRequest{
+		AccessToken:   accessToken,
+		EncryptionKey: base64.StdEncoding.EncodeToString(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("buckets: marshal get: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/get"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	c.setAuth(req)
-	req.Header.Set("X-Encryption-Key", base64.StdEncoding.EncodeToString(key))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("buckets: get request: %w", err)
@@ -152,16 +183,9 @@ func (c *Client) Get(ctx context.Context, accessToken string, key []byte) ([]byt
 	if err := c.expectOK(resp); err != nil {
 		return nil, err
 	}
-	var gr getResponse
-	if err := json.NewDecoder(resp.Body).Decode(&gr); err != nil {
-		return nil, fmt.Errorf("buckets: decode get: %w", err)
-	}
-	if gr.Value == nil {
-		return nil, errors.New("buckets: missing value")
-	}
-	plaintext, err := base64.StdEncoding.DecodeString(*gr.Value)
+	plaintext, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("buckets: decode value: %w", err)
+		return nil, fmt.Errorf("buckets: read get: %w", err)
 	}
 	return plaintext, nil
 }
@@ -173,11 +197,16 @@ func (c *Client) Delete(ctx context.Context, accessToken string) error {
 	if !c.Configured() {
 		return errors.New("buckets: client not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.itemURL(accessToken), nil)
+	body, err := json.Marshal(accessTokenRequest{AccessToken: accessToken})
+	if err != nil {
+		return fmt.Errorf("buckets: marshal delete: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/delete"), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	c.setAuth(req)
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("buckets: delete request: %w", err)
@@ -194,8 +223,8 @@ func (c *Client) Delete(ctx context.Context, accessToken string) error {
 	return nil
 }
 
-func (c *Client) itemURL(accessToken string) string {
-	return c.baseURL + "/items/" + url.PathEscape(accessToken)
+func (c *Client) endpointURL(path string) string {
+	return c.baseURL + path
 }
 
 func (c *Client) setAuth(req *http.Request) {
