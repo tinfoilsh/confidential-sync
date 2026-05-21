@@ -77,6 +77,7 @@ func main() {
 
 	deps := server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: gitSHA}
 	handler := server.NewHandler(deps, verifier, stdLogger{})
+	server.StartAttachmentOrphanReaper(ctx, deps, stdLogger{})
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to

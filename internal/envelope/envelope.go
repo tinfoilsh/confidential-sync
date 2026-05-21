@@ -61,18 +61,18 @@ var (
 // question "does this parse as a fully-formed v2 / v0 envelope?" and
 // fall back to v1 only when both strict parses fail.
 //
-//   1. Try parsing as a v2 envelope. v2 requires `"v":2` plus the
-//      `kid`, `alg`, `iv`, `ct` fields populated. A real v2 blob
-//      always succeeds here; a v1 binary blob has effectively zero
-//      probability of being a complete valid v2 JSON document with
-//      `"v":2`.
-//   2. Try parsing as a v0 envelope. v0 requires `iv` and `data`
-//      fields and explicitly forbids a `v` field (otherwise we'd
-//      accept v2 as v0 too). Same probabilistic argument as v2.
-//   3. Otherwise, if the blob is at least IV+TAG bytes long, treat
-//      it as v1. v1 has no version tag on the wire — that's why we
-//      cannot do better — but the strict-parse cascade above means
-//      we never accidentally route a real v0/v2 blob here.
+//  1. Try parsing as a v2 envelope. v2 requires `"v":2` plus the
+//     `kid`, `alg`, `iv`, `ct` fields populated. A real v2 blob
+//     always succeeds here; a v1 binary blob has effectively zero
+//     probability of being a complete valid v2 JSON document with
+//     `"v":2`.
+//  2. Try parsing as a v0 envelope. v0 requires `iv` and `data`
+//     fields and explicitly forbids a `v` field (otherwise we'd
+//     accept v2 as v0 too). Same probabilistic argument as v2.
+//  3. Otherwise, if the blob is at least IV+TAG bytes long, treat
+//     it as v1. v1 has no version tag on the wire — that's why we
+//     cannot do better — but the strict-parse cascade above means
+//     we never accidentally route a real v0/v2 blob here.
 //
 // A truncated or otherwise-malformed v0/v2 envelope fails both
 // strict parses and falls through to v1; DecryptLegacy then fails
@@ -132,8 +132,8 @@ func looksLikeV0(blob []byte) bool {
 }
 
 type Key struct {
-	Bytes     []byte
-	KeyIDHex  string // lowercase hex
+	Bytes    []byte
+	KeyIDHex string // lowercase hex
 }
 
 type DecryptResult struct {
@@ -316,7 +316,9 @@ func decryptV0(blob []byte, keys []Key) (DecryptResult, error) {
 }
 
 // decryptV1 reverses the webapp's `compressAndEncrypt` pipeline:
-//   IV(12) || AES-GCM-ciphertext(gzip(JSON))
+//
+//	IV(12) || AES-GCM-ciphertext(gzip(JSON))
+//
 // We split off the IV, AES-GCM-Open the rest, then gunzip the plaintext.
 // Legacy v1 blobs were written without AAD, so callers pass nil here.
 func decryptV1(blob []byte, keys []Key) (DecryptResult, error) {
@@ -333,6 +335,7 @@ func decryptV1(blob []byte, keys []Key) (DecryptResult, error) {
 		if err != nil {
 			continue
 		}
+		defer crypto.Zero(compressed)
 		pt, err := gunzip(compressed)
 		if err != nil {
 			return DecryptResult{}, fmt.Errorf("%w: %v", ErrV1Malformed, err)

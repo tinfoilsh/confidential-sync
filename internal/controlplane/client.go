@@ -872,3 +872,52 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
+
+func (c *Client) ListOrphanedV2Attachments(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	endpoint := c.baseURL + "/api/sync/orphan-attachments?limit=" + strconv.Itoa(limit)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, body)
+	}
+	var out struct {
+		AttachmentIDs []string `json:"attachment_ids"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode orphan attachments: %w", err)
+	}
+	return out.AttachmentIDs, nil
+}
+
+func (c *Client) DeleteOrphanedV2AttachmentIndex(ctx context.Context, attachmentID string) error {
+	if attachmentID == "" {
+		return fmt.Errorf("controlplane: attachment id is required")
+	}
+	endpoint := c.baseURL + "/api/sync/orphan-attachments/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return parseError(resp.StatusCode, body)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
