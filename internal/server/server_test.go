@@ -563,6 +563,40 @@ func newFixture(t *testing.T) *fixture {
 	}
 }
 
+func TestBlobOperationHashIgnoresRandomizedEnvelopeBytes(t *testing.T) {
+	f := newFixture(t)
+	plaintext := []byte(`{"id":"chat_1","messages":[]}`)
+	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
+		KeyIDHex:    f.userKeyID,
+		Scope:       envelope.ScopeChat,
+		ID:          "chat_1",
+		ClerkUserID: f.userSub,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Fatal("op-hash changed for identical logical blob write")
+	}
+
+	c, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, []byte(`{"id":"chat_1","messages":[{"role":"user"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == a {
+		t.Fatal("op-hash did not change when plaintext changed")
+	}
+}
+
 func (f *fixture) jwt() string {
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"sub": f.userSub,
@@ -1062,8 +1096,8 @@ func TestKeyIDDerivationConsistencyAcrossClients(t *testing.T) {
 	}
 }
 
-func TestAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
-	id, err := newAttachmentID()
+func TestDerivedAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
+	id, _, err := deriveAttachmentMaterials("idem", "chat", "user", []byte("payload"))
 	if err != nil {
 		t.Fatal(err)
 	}

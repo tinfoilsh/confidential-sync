@@ -104,7 +104,7 @@ func Start(cfg Config) (*Stack, error) {
 		_ = cpSrv.Close()
 		return nil, fmt.Errorf("verifier: %w", err)
 	}
-	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second})
+	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second}, controlplane.WithServiceSecret(LocalStackSyncEnclaveSecret))
 	bucketsClient := buckets.NewClient(cpURL, BucketsStubAPIKey, &http.Client{Timeout: 10 * time.Second})
 	handler := server.NewHandler(server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: "local-stack"}, verifier, nil)
 

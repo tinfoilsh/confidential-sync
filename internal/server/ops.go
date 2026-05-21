@@ -92,7 +92,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, aadBytes, envBlob)
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, aadBytes, plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -140,14 +140,11 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 }
 
 // operationHashForBlob derives X-Operation-Hash for a blob mutation
-// according to syncplan.md §7.0. The canonical tuple matches exactly
-// what the controlplane will see on the wire (METHOD, PATH, KEY_ID,
-// IF_MATCH, IDEMPOTENCY_KEY) plus the AAD and the v2 envelope bytes.
-// Because the envelope already authenticates the plaintext under the
-// user's CEK, MACing the envelope here transitively commits the MAC
-// to the plaintext without ever letting a plaintext-derived digest
-// reach the wire.
-func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, aad, env []byte) (string, error) {
+// according to syncplan.md §7.0. The MAC covers the logical plaintext
+// plus stable request metadata, not the randomized v2 envelope bytes,
+// so a retry with the same idempotency key can replay after a lost
+// response instead of tripping IDEMPOTENCY_CONFLICT on a fresh nonce.
+func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, aad, plaintext []byte) (string, error) {
 	path, err := controlplane.PathFor(scope, id)
 	if err != nil {
 		return "", err
@@ -163,8 +160,8 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 		KeyIDHex:       keyIDHex,
 		IfMatch:        ifMatch,
 		IdempotencyKey: idempotencyKey,
+		Body:           plaintext,
 		AAD:            aad,
-		Envelope:       env,
 	}), nil
 }
 
