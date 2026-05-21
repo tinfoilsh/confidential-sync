@@ -97,9 +97,9 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/storage/attachment/{aid}", s.getLegacyAttachment)
 	mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.registerAttachmentIndex)
 	mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.deleteAttachmentIndex)
-	mux.HandleFunc("PUT /items/{token}", s.buckets.Handle)
-	mux.HandleFunc("GET /items/{token}", s.buckets.Handle)
-	mux.HandleFunc("DELETE /items/{token}", s.buckets.Handle)
+	mux.HandleFunc("POST /put", s.buckets.Handle)
+	mux.HandleFunc("POST /get", s.buckets.Handle)
+	mux.HandleFunc("POST /delete", s.buckets.Handle)
 	s.mux = mux
 	return s
 }
@@ -113,7 +113,7 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // BucketsStubAPIKey is the static credential the buckets stub
-// expects on every /items/* call. Smoke tests configure the
+// expects on every buckets call. Smoke tests configure the
 // enclave's buckets.Client with this same value; tightening the
 // check here catches missing-Authorization regressions that the
 // real buckets backend would surface as 401. Exported so the

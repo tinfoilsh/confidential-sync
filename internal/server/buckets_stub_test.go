@@ -10,10 +10,10 @@ import (
 
 // bucketsStub mirrors the subset of buckets.tinfoil.sh that the
 // enclave's buckets.Client talks to: a single tenant keyed by API
-// key, with PUT/GET/DELETE on /items/{token}. Values are stored
+// key, with POSTs to /put, /get, and /delete. Values are stored
 // in-memory along with the encryption keys the caller declared at
-// PUT-time, and GET verifies the supplied X-Encryption-Key matches
-// one of the slots — same model real buckets uses.
+// PUT-time, and GET verifies the supplied encryption_key matches one
+// of the slots — same model real buckets uses.
 type bucketsStub struct {
 	t      *testing.T
 	apiKey string
@@ -31,7 +31,9 @@ func newBucketsStub(t *testing.T) *bucketsStub {
 	}
 	s.items = bucketstub.NewStore(s.apiKey)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/items/{token}", s.items.Handle)
+	mux.HandleFunc("POST /put", s.items.Handle)
+	mux.HandleFunc("POST /get", s.items.Handle)
+	mux.HandleFunc("POST /delete", s.items.Handle)
 	s.server = httptest.NewServer(mux)
 	t.Cleanup(s.server.Close)
 	return s

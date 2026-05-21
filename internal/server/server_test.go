@@ -1099,7 +1099,7 @@ func TestKeyIDDerivationConsistencyAcrossClients(t *testing.T) {
 func TestAttachmentDeleteDropsIndexAndBucket(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
-	attID := "att_delete"
+	attID := "123e4567-e89b-12d3-a456-426614174111"
 
 	f.bk.items.Put(attID, bucketsItem{
 		Value:          []byte("payload"),
