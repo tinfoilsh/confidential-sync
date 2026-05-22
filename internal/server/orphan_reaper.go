@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -51,11 +52,13 @@ func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
 		return 0, err
 	}
 	swept := 0
+	var deleteErrs []error
 	for _, id := range ids {
 		if err := deps.Buckets.Delete(ctx, id); err != nil {
-			return swept, fmt.Errorf("delete bucket attachment %s: %w", id, err)
+			deleteErrs = append(deleteErrs, fmt.Errorf("delete bucket attachment %s: %w", id, err))
+			continue
 		}
 		swept++
 	}
-	return swept, nil
+	return swept, errors.Join(deleteErrs...)
 }

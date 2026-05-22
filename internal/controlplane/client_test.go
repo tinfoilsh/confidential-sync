@@ -189,13 +189,16 @@ func TestListStatusEncodesQuery(t *testing.T) {
 		if r.URL.Query().Get("limit") != "50" {
 			t.Errorf("limit: %q", r.URL.Query().Get("limit"))
 		}
+		if r.URL.Query().Get("project_id") != "proj_1" {
+			t.Errorf("project_id: %q", r.URL.Query().Get("project_id"))
+		}
 		json.NewEncoder(w).Encode(ListStatusResponse{
 			Updates:    []BlobMeta{{ID: "a", ETag: "1", KeyID: strings.Repeat("a", 32)}},
 			NextCursor: "c2",
 		})
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j")
+	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j", "proj_1")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -193,7 +193,7 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	case len(req.IDs) > 0:
 		ids = req.IDs
 	case req.All:
-		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT)
+		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, "")
 		if err != nil {
 			return nil, err
 		}
@@ -307,10 +307,13 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	if !envelope.Scope(req.Scope).Valid() {
 		return nil, badRequest("invalid scope")
 	}
+	if req.ProjectID != "" && envelope.Scope(req.Scope) != envelope.ScopeChat {
+		return nil, badRequest("project_id filter is only valid for chat scope")
+	}
 	if req.Limit <= 0 || req.Limit > 500 {
 		req.Limit = 100
 	}
-	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT)
+	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, req.ProjectID)
 	if err != nil {
 		return nil, err
 	}
