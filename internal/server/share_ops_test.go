@@ -122,7 +122,9 @@ func TestShareOpenRejectsOversizedDecompressedPlaintext(t *testing.T) {
 	// allocations on every test run; this path stays under a few KiB
 	// while still hitting the gunzip cap.
 	key := make([]byte, shareKeySize)
-	rand.Read(key)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	chunk := bytes.Repeat([]byte("A"), 64<<10)

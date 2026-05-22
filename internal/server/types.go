@@ -57,9 +57,10 @@ type PullResponse struct {
 }
 
 type ListStatusRequest struct {
-	Scope  string `json:"scope"`
-	Cursor string `json:"cursor,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
+	Scope     string `json:"scope"`
+	Cursor    string `json:"cursor,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 type ListStatusResponse struct {

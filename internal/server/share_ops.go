@@ -17,10 +17,14 @@ import (
 
 // shareKeySize is the length of the randomly-generated AES-256 key
 // the enclave produces per share. Independent of the user's CEK.
-const shareKeySize = 32
+// Aliased to cryptopkg.KeySize so any drift in the AES-GCM primitive
+// shape lands here automatically.
+const shareKeySize = cryptopkg.KeySize
 
-// shareIVSize is the AES-GCM nonce length used for share envelopes.
-const shareIVSize = 12
+// shareIVSize is the AES-GCM nonce length used for share envelopes,
+// taken from the shared crypto primitive so seal() and open() never
+// disagree with the rest of the codebase about nonce layout.
+const shareIVSize = cryptopkg.NonceSize
 
 // shareMaxPlaintextBytes caps decompressed share plaintext returned by
 // /v1/share/open. The encrypted request body is capped separately by

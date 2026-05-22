@@ -157,6 +157,9 @@ func (s *Store) put(w http.ResponseWriter, r *http.Request) {
 			encoded, err = readPartString(part)
 			if err == nil {
 				partSize, err = strconv.ParseInt(encoded, 10, 64)
+				if err == nil && partSize <= 0 {
+					err = errBadPartSize
+				}
 			}
 		case "plaintext_length":
 			var encoded string
@@ -272,7 +275,6 @@ func (s *Store) get(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Encryption-Key-Fingerprints", encryptionKeyFingerprints(item.EncryptionKeys))
 	w.Header().Set("X-Plaintext-Length", strconv.Itoa(len(item.Value)))
 	w.Header().Set("X-Part-Size", strconv.FormatInt(item.PartSize, 10))
-	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Length", strconv.Itoa(len(item.Value)))
 	_, _ = w.Write(item.Value)
 }
@@ -309,7 +311,10 @@ func cloneItem(item Item) Item {
 	return cp
 }
 
-var errBadKey = &badRequestError{message: "bad key"}
+var (
+	errBadKey      = &badRequestError{message: "bad key"}
+	errBadPartSize = &badRequestError{message: "part_size must be positive"}
+)
 
 type badRequestError struct {
 	message string

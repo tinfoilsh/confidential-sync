@@ -89,7 +89,10 @@ type putResponse struct {
 }
 
 // Put stores a value at the given access token, encrypted server-side
-// under the supplied 32-byte key.
+// under the supplied 32-byte key. The multipart body is streamed via
+// an io.Pipe so the full plaintext is never buffered in memory a
+// second time — attachments can be up to the request-size cap and
+// doubling that cost during the upload would push us into OOM territory.
 func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []byte) error {
 	if !c.Configured() {
 		return errors.New("buckets: client not configured")
@@ -97,29 +100,43 @@ func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []b
 	if len(key) != 32 {
 		return fmt.Errorf("buckets: encryption key must be 32 bytes, got %d", len(key))
 	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	if err := writer.WriteField("access_token", accessToken); err != nil {
-		return fmt.Errorf("buckets: write access token: %w", err)
-	}
-	if err := writer.WriteField("encryption_keys", base64.StdEncoding.EncodeToString(key)); err != nil {
-		return fmt.Errorf("buckets: write encryption key: %w", err)
-	}
-	if err := writer.WriteField("plaintext_length", strconv.Itoa(len(plaintext))); err != nil {
-		return fmt.Errorf("buckets: write plaintext length: %w", err)
-	}
-	dataPart, err := writer.CreateFormField("data")
+
+	bodyReader, bodyWriter := io.Pipe()
+	writer := multipart.NewWriter(bodyWriter)
+
+	// Goroutine writes the multipart sections into the pipe; the
+	// HTTP transport reads them out. Closing the writer side with
+	// an error makes the transport surface that error verbatim
+	// instead of emitting a truncated request body.
+	go func() {
+		err := func() error {
+			if err := writer.WriteField("access_token", accessToken); err != nil {
+				return fmt.Errorf("buckets: write access token: %w", err)
+			}
+			if err := writer.WriteField("encryption_keys", base64.StdEncoding.EncodeToString(key)); err != nil {
+				return fmt.Errorf("buckets: write encryption key: %w", err)
+			}
+			if err := writer.WriteField("plaintext_length", strconv.Itoa(len(plaintext))); err != nil {
+				return fmt.Errorf("buckets: write plaintext length: %w", err)
+			}
+			dataPart, err := writer.CreateFormField("data")
+			if err != nil {
+				return fmt.Errorf("buckets: create data field: %w", err)
+			}
+			if _, err := dataPart.Write(plaintext); err != nil {
+				return fmt.Errorf("buckets: write data: %w", err)
+			}
+			if err := writer.Close(); err != nil {
+				return fmt.Errorf("buckets: close multipart: %w", err)
+			}
+			return nil
+		}()
+		_ = bodyWriter.CloseWithError(err)
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/put"), bodyReader)
 	if err != nil {
-		return fmt.Errorf("buckets: create data field: %w", err)
-	}
-	if _, err := dataPart.Write(plaintext); err != nil {
-		return fmt.Errorf("buckets: write data: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("buckets: close multipart: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/put"), &body)
-	if err != nil {
+		_ = bodyReader.Close()
 		return err
 	}
 	c.setAuth(req)

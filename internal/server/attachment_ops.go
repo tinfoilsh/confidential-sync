@@ -215,21 +215,26 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets put failed: " + err.Error()}
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, id, req.ChatID); err != nil {
-		// Best-effort buckets rollback. If this fails the orphan
-		// will be swept by the janitor — the controlplane row is
-		// still the source of truth for ownership, so a missing
-		// index row means the user effectively has no claim on the
-		// bucket entry anyway. Detach from the request context so
-		// a client cancellation (which is the most common reason
-		// the index call fails after a successful Put) does not
-		// also skip the cleanup it triggered, but enforce a fresh
-		// bounded deadline so a hung buckets backend cannot pin
-		// this handler past the request budget.
-		func() {
-			rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
-			defer cancel()
-			_ = deps.Buckets.Delete(rollbackCtx, id)
-		}()
+		// Only roll back when we have a structured 4xx response from
+		// the controlplane — that's the one signal that proves the
+		// index row was NOT committed. Transport errors, context
+		// cancellation, and 5xx are all ambiguous: the controlplane
+		// may already hold an index entry pointing at this bucket
+		// id, in which case a rollback would silently delete a row
+		// the user still owns. The orphan reaper is the correct
+		// path for those ambiguous cases — it cross-checks the
+		// controlplane index of record before reaping any bucket.
+		if isControlplaneRejection(err) {
+			// Detach from the request context so a client cancellation
+			// does not also skip the cleanup it triggered, but enforce
+			// a fresh bounded deadline so a hung buckets backend
+			// cannot pin this handler past the request budget.
+			func() {
+				rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
+				defer cancel()
+				_ = deps.Buckets.Delete(rollbackCtx, id)
+			}()
+		}
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane index failed: " + err.Error()}
 	}
 	return &AttachmentPutResponse{
@@ -283,6 +288,20 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 		OK:        true,
 		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
 	}, nil
+}
+
+// isControlplaneRejection reports whether `err` is a structured 4xx
+// response from the controlplane. Only those errors prove the
+// request did NOT mutate state on the server, so they're the only
+// safe trigger for an inline buckets rollback. Anything else
+// (transport failures, context cancellation, 5xx) leaves the
+// commit status ambiguous and must defer to the orphan reaper.
+func isControlplaneRejection(err error) bool {
+	var cpe *controlplane.Error
+	if !errors.As(err, &cpe) {
+		return false
+	}
+	return cpe.StatusCode >= 400 && cpe.StatusCode < 500
 }
 
 func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req AttachmentDeleteRequest) (*OKResponse, error) {
