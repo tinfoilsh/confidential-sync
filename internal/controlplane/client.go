@@ -46,6 +46,19 @@ func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client 
 	return c
 }
 
+// Header* and Status* below mirror the canonical wire contract
+// defined in github.com/tinfoilsh/controlplane/pkg/contract
+// (headers.go, sentinels.go, wirecodes.go). Keeping a local copy
+// rather than importing the controlplane module preserves the
+// enclave's standalone build surface (see go.mod — no controlplane
+// dependency by design); the pin test in client_contract_test.go
+// fails CI if any constant drifts from the canonical value.
+//
+// HeaderContentType / HeaderServiceSecret / HeaderAuth are enclave-only
+// (not part of the public /api/sync/* contract) and live here for
+// convenience; the same applies to StatusLegacyBlobNotMigrated, which
+// the enclave returns to its own clients but the controlplane does not
+// emit.
 const (
 	HeaderAuth          = "Authorization"
 	HeaderKeyID         = "X-Key-Id"
@@ -61,6 +74,12 @@ const (
 )
 
 const (
+	IfMatchCreateOnly = "0"
+	IfMatchAnyKey     = "*"
+)
+
+const (
+	StatusPreconditionRequired      = "PRECONDITION_REQUIRED"
 	StatusStaleKey                  = "STALE_KEY"
 	StatusStaleBlob                 = "STALE_BLOB"
 	StatusExistingDataUnderOtherKey = "EXISTING_DATA_UNDER_OTHER_KEY"
