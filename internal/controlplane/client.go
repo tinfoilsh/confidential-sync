@@ -16,8 +16,13 @@ import (
 )
 
 // Client talks to the controlplane on behalf of an authenticated user.
-// Every call forwards the user's JWT verbatim in the Authorization header
-// plus the enclave service credential required by the /api/sync surface.
+// User-driven calls forward the user's JWT verbatim in the
+// Authorization header plus the enclave service credential required
+// by the /api/sync surface. A small set of enclave-internal
+// maintenance calls (currently DeleteOrphanedV2Attachments) skip the
+// JWT because they have no associated user request; they
+// authenticate to the controlplane with the service credential
+// alone.
 type Client struct {
 	baseURL       string
 	httpClient    *http.Client
