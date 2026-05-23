@@ -49,9 +49,11 @@ type StubCP struct {
 	bundles    map[string]map[string]controlplane.CurrentKeyBundle
 	deletes    map[string]time.Time
 
-	buckets           *bucketstub.Store
-	legacyAttachments map[string][]byte
-	attachmentIndex   map[string]string
+	buckets             *bucketstub.Store
+	legacyAttachments   map[string][]byte
+	attachmentIndex     map[string]string
+	pendingAttachments  map[string]pendingAttachment
+	pendingExpiryWindow time.Duration
 
 	// onFirstDelete maps "scope/id" to a callback that fires exactly
 	// once, at the very start of the first DELETE handled for that
@@ -64,17 +66,28 @@ type StubCP struct {
 	onFirstDelete map[string]func()
 }
 
+// pendingAttachment mirrors the pending_attachment_writes ledger so
+// smoke tests can assert the enclave's two-phase upload flow ends up
+// in the right state without needing a real Postgres.
+type pendingAttachment struct {
+	chatID      string
+	clerkUserID string
+	createdAt   time.Time
+}
+
 // NewStubCP returns a stub controlplane ready to serve.
 func NewStubCP() *StubCP {
 	s := &StubCP{
-		blobs:             map[string]*StubBlob{},
-		keys:              map[string]struct{}{},
-		bundles:           map[string]map[string]controlplane.CurrentKeyBundle{},
-		deletes:           map[string]time.Time{},
-		buckets:           bucketstub.NewStore(BucketsStubAPIKey),
-		legacyAttachments: map[string][]byte{},
-		attachmentIndex:   map[string]string{},
-		onFirstDelete:     map[string]func(){},
+		blobs:               map[string]*StubBlob{},
+		keys:                map[string]struct{}{},
+		bundles:             map[string]map[string]controlplane.CurrentKeyBundle{},
+		deletes:             map[string]time.Time{},
+		buckets:             bucketstub.NewStore(BucketsStubAPIKey),
+		legacyAttachments:   map[string][]byte{},
+		attachmentIndex:     map[string]string{},
+		pendingAttachments:  map[string]pendingAttachment{},
+		pendingExpiryWindow: 15 * time.Minute,
+		onFirstDelete:       map[string]func(){},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/sync/blob/chat/{id}", s.putBlob("chat"))
@@ -100,6 +113,8 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/storage/attachment/{aid}", s.getLegacyAttachment)
 	mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.registerAttachmentIndex)
 	mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.deleteAttachmentIndex)
+	mux.HandleFunc("POST /api/sync/pending-attachments/{aid}", s.reservePendingAttachment)
+	mux.HandleFunc("POST /api/sync/pending-attachments/sweep", s.sweepPendingAttachments)
 	mux.HandleFunc("POST /put", s.buckets.Handle)
 	mux.HandleFunc("POST /get", s.buckets.Handle)
 	mux.HandleFunc("POST /delete", s.buckets.Handle)
@@ -510,7 +525,67 @@ func (s *StubCP) registerAttachmentIndex(w http.ResponseWriter, r *http.Request)
 	}
 	s.attachmentIndex[aid] = body.ChatID
 	delete(s.legacyAttachments, aid)
+	delete(s.pendingAttachments, aid)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *StubCP) reservePendingAttachment(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aid := r.PathValue("aid")
+	var body struct {
+		ChatID string `json:"chat_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if body.ChatID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if _, exists := s.pendingAttachments[aid]; !exists {
+		s.pendingAttachments[aid] = pendingAttachment{
+			chatID:      body.ChatID,
+			clerkUserID: stubClerkUserIDFromAuth(r.Header.Get("Authorization")),
+			createdAt:   time.Now(),
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *StubCP) sweepPendingAttachments(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	now := time.Now()
+	type pendingRow struct {
+		AttachmentID string `json:"attachment_id"`
+		ChatID       string `json:"chat_id"`
+		ClerkUserID  string `json:"clerk_user_id"`
+	}
+	s.mu.Lock()
+	rows := make([]pendingRow, 0)
+	for aid, pa := range s.pendingAttachments {
+		if now.Sub(pa.createdAt) < s.pendingExpiryWindow {
+			continue
+		}
+		rows = append(rows, pendingRow{
+			AttachmentID: aid,
+			ChatID:       pa.chatID,
+			ClerkUserID:  pa.clerkUserID,
+		})
+		delete(s.pendingAttachments, aid)
+		if len(rows) >= limit {
+			break
+		}
+	}
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"rows": rows})
 }
 
 func (s *StubCP) deleteAttachmentIndex(w http.ResponseWriter, r *http.Request) {

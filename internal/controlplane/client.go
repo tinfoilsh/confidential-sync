@@ -922,6 +922,93 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 	return nil
 }
 
+// ReservePendingAttachmentWrite asks controlplane to stamp a guard
+// row before the enclave writes bytes to buckets. A duplicate
+// reservation for the same id is a no-op, so retries of the same
+// upload don't proliferate guard rows. The companion call
+// RegisterAttachmentIndex clears the row inside the same DB
+// transaction; the sweeper drains anything that times out.
+func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachmentID, chatID string) error {
+	if attachmentID == "" {
+		return fmt.Errorf("controlplane: attachment id is required")
+	}
+	if chatID == "" {
+		return fmt.Errorf("controlplane: chat id is required")
+	}
+	body, err := json.Marshal(struct {
+		ChatID string `json:"chat_id"`
+	}{ChatID: chatID})
+	if err != nil {
+		return fmt.Errorf("controlplane: marshal pending attachment: %w", err)
+	}
+	endpoint := c.baseURL + "/api/sync/pending-attachments/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return parseError(resp.StatusCode, raw)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// PendingAttachmentRow is one entry from a sweep response: the
+// abandoned attachment id, its owner, and the chat it was meant for.
+// The enclave's sweeper uses (clerk_user_id, attachment_id) to drive
+// the buckets-side cleanup before logging the reconciliation.
+type PendingAttachmentRow struct {
+	AttachmentID string `json:"attachment_id"`
+	ChatID       string `json:"chat_id"`
+	ClerkUserID  string `json:"clerk_user_id"`
+}
+
+// SweepPendingAttachmentWrites pulls the next batch of expired guard
+// rows from controlplane. The rows are deleted from the pending
+// ledger by the same call, so the caller is the sole owner of the
+// cleanup obligation for the returned ids. Enclave-only — the route
+// is gated by the sync enclave service secret on the CP side.
+func (c *Client) SweepPendingAttachmentWrites(ctx context.Context, limit int) ([]PendingAttachmentRow, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	endpoint := c.baseURL + "/api/sync/pending-attachments/sweep?limit=" + strconv.Itoa(limit)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, body)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("controlplane: read pending attachments sweep: %w", readErr)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, nil
+	}
+	var out struct {
+		Rows []PendingAttachmentRow `json:"rows"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode pending attachments sweep: %w", err)
+	}
+	return out.Rows, nil
+}
+
 func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 500

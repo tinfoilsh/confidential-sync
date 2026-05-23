@@ -211,6 +211,13 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 	}
 	defer cryptopkg.Zero(attKey)
 
+	// Stamp the pending-write guard before touching buckets. If the
+	// reservation itself fails (CP unreachable) we surface immediately
+	// rather than risk a buckets write the sweeper can never see; the
+	// caller retries the whole upload. Idempotent on retry.
+	if err := deps.Controlplane.ReservePendingAttachmentWrite(ctx, sess.RawJWT, id, req.ChatID); err != nil {
+		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane reserve failed: " + err.Error()}
+	}
 	if err := deps.Buckets.Put(ctx, id, plaintext, attKey); err != nil {
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets put failed: " + err.Error()}
 	}
