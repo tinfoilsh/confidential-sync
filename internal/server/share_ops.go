@@ -155,9 +155,12 @@ func seal(key, plaintext []byte) ([]byte, error) {
 }
 
 // open inverts seal(); returns the plaintext. Wraps `cryptopkg.Open`
-// for the same reason seal() wraps cryptopkg.Seal.
+// for the same reason seal() wraps cryptopkg.Seal. Any real
+// AES-GCM ciphertext is at least TagSize bytes (the authentication
+// tag is appended unconditionally), so the minimum legal blob is
+// IV + TagSize; anything shorter cannot have come from seal().
 func open(key, blob []byte) ([]byte, error) {
-	if len(blob) < shareIVSize+1 {
+	if len(blob) < shareIVSize+cryptopkg.TagSize {
 		return nil, errors.New("share: ciphertext too short")
 	}
 	iv := blob[:shareIVSize]
