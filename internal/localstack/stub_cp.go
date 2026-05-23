@@ -12,7 +12,10 @@
 package localstack
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -423,14 +426,71 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 
 func (s *StubCP) getLegacyAttachment(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	body, ok := s.legacyAttachments[r.PathValue("aid")]
+	aid := r.PathValue("aid")
+	body, ok := s.legacyAttachments[aid]
+	s.mu.Unlock()
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	subject := stubClerkUserIDFromAuth(r.Header.Get("Authorization"))
+	claim, err := stubSignLegacyClaim(LocalStackSyncEnclaveSecret, subject, aid, body)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set(controlplane.HeaderLegacyClaim, claim)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(body)
+}
+
+// stubClerkUserIDFromAuth pulls the JWT subject out of the bearer token
+// the enclave forwards. Real CP runs middleware that validates the JWT
+// and populates `userID = clerk.user.id`; the stub is happy to read the
+// `sub` claim directly because smoke fixtures mint signed JWTs whose
+// subject the test harness already controls.
+func stubClerkUserIDFromAuth(authHeader string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return ""
+	}
+	token := authHeader[len(prefix):]
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Sub
+}
+
+func stubSignLegacyClaim(secret, clerkUserID, attID string, ciphertext []byte) (string, error) {
+	digest := sha256.Sum256(ciphertext)
+	payload, err := json.Marshal(struct {
+		ClerkUserID string `json:"clerk_user_id"`
+		ID          string `json:"id"`
+		Scope       string `json:"scope"`
+		SHA256      string `json:"sha256"`
+	}{
+		ClerkUserID: clerkUserID,
+		ID:          attID,
+		Scope:       "attachment",
+		SHA256:      hex.EncodeToString(digest[:]),
+	})
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 func (s *StubCP) registerAttachmentIndex(w http.ResponseWriter, r *http.Request) {

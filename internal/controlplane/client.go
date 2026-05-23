@@ -801,38 +801,60 @@ func IsCode(err error, code string) bool {
 // then registers a v2 index row (which nulls the BYTEA column).
 // A 404 surfaces as ErrLegacyAttachmentNotFound so the caller can
 // treat already-migrated rows as a no-op.
+//
+// Returns the ciphertext alongside the controlplane's X-Legacy-Claim
+// header so the caller can verify CP signed off on this specific
+// (user, attachment) pair before promoting it to v2.
 var ErrLegacyAttachmentNotFound = errors.New("controlplane: legacy attachment not found")
 
-func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) ([]byte, error) {
+// HeaderLegacyClaim names the response header carrying the CP-signed
+// claim that authorizes a legacy attachment re-seal for a specific
+// user. Lives in controlplane/client.go so both enclave and CP can
+// import the canonical constant.
+const HeaderLegacyClaim = "X-Legacy-Claim"
+
+// LegacyAttachmentResponse is the result of GetLegacyAttachment. Claim
+// is empty when CP did not stamp the header (only possible in dev
+// mode with no shared secret configured); the caller MUST treat the
+// missing header as a hard failure in production.
+type LegacyAttachmentResponse struct {
+	Ciphertext []byte
+	Claim      string
+}
+
+func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) (LegacyAttachmentResponse, error) {
 	if attachmentID == "" {
-		return nil, fmt.Errorf("controlplane: attachment id is required")
+		return LegacyAttachmentResponse{}, fmt.Errorf("controlplane: attachment id is required")
 	}
 	endpoint := c.baseURL + "/api/storage/attachment/" + url.PathEscape(attachmentID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	c.addAuth(httpReq, jwt)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrLegacyAttachmentNotFound
+		return LegacyAttachmentResponse{}, ErrLegacyAttachmentNotFound
 	}
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, parseError(resp.StatusCode, raw)
+		return LegacyAttachmentResponse{}, parseError(resp.StatusCode, raw)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxLegacyAttachmentBytes)+1))
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	if len(body) > maxLegacyAttachmentBytes {
-		return nil, fmt.Errorf("controlplane: legacy attachment exceeds %d bytes", maxLegacyAttachmentBytes)
+		return LegacyAttachmentResponse{}, fmt.Errorf("controlplane: legacy attachment exceeds %d bytes", maxLegacyAttachmentBytes)
 	}
-	return body, nil
+	return LegacyAttachmentResponse{
+		Ciphertext: body,
+		Claim:      resp.Header.Get(HeaderLegacyClaim),
+	}, nil
 }
 
 // RegisterAttachmentIndex records ownership of a v2 attachment with

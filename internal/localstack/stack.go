@@ -106,7 +106,12 @@ func Start(cfg Config) (*Stack, error) {
 	}
 	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second}, controlplane.WithServiceSecret(LocalStackSyncEnclaveSecret))
 	bucketsClient := buckets.NewClient(cpURL, BucketsStubAPIKey, &http.Client{Timeout: server.AttachmentRequestTimeout})
-	handler := server.NewHandler(server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: "local-stack"}, verifier, nil)
+	handler := server.NewHandler(server.Deps{
+		Controlplane:      cpClient,
+		Buckets:           bucketsClient,
+		GitSHA:            "local-stack",
+		SyncEnclaveSecret: LocalStackSyncEnclaveSecret,
+	}, verifier, nil)
 
 	enclaveLn, err := listen(cfg.EnclaveAddr)
 	if err != nil {
