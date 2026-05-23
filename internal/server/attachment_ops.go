@@ -308,6 +308,11 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	if req.ID == "" {
 		return nil, badRequest("id is required")
 	}
+	// Controlplane delete runs first because it is the ownership
+	// check: it rejects callers who don't own the attachment id,
+	// which is what stops an authenticated attacker from
+	// weaponizing the bucket-delete path against victim ids they
+	// might have observed in a shared chat.
 	if err := deps.Controlplane.DeleteAttachmentIndex(ctx, sess.RawJWT, req.ID); err != nil {
 		var cpe *controlplane.Error
 		if errors.As(err, &cpe) && cpe.StatusCode == 404 {
@@ -315,8 +320,17 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 		}
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane attachment delete failed: " + err.Error()}
 	}
+	// The bucket delete must succeed for the user's "delete this
+	// attachment" intent to actually land — a leaked bucket entry
+	// stays readable by anyone holding (id, att_key), so swallowing
+	// the failure would silently keep the bytes online after we
+	// reported success. Surface it as 502 so the caller can retry;
+	// buckets.Delete is idempotent on 404, so a retry after the
+	// controlplane index is already gone still cleans up safely.
 	if deps.Buckets != nil && deps.Buckets.Configured() {
-		deleteBucketAttachments(ctx, deps, []string{req.ID})
+		if err := deps.Buckets.Delete(ctx, req.ID); err != nil {
+			return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets attachment delete failed: " + err.Error()}
+		}
 	}
 	return &OKResponse{OK: true}, nil
 }
