@@ -865,37 +865,14 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID stri
 // controlplane resolves the user from claims, exactly like every
 // other sync route.
 func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID, chatID string) error {
-	if attachmentID == "" {
-		return fmt.Errorf("controlplane: attachment id is required")
-	}
-	if chatID == "" {
-		return fmt.Errorf("controlplane: chat id is required")
-	}
-	body, err := json.Marshal(struct {
-		ChatID string `json:"chat_id"`
-	}{ChatID: chatID})
-	if err != nil {
-		return fmt.Errorf("controlplane: marshal attachment index: %w", err)
-	}
-	endpoint := c.baseURL + "/api/sync/attachment-index/" + url.PathEscape(attachmentID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.addAuth(httpReq, jwt)
-	httpReq.Header.Set(HeaderContentType, "application/json")
-	resp, err := c.doRequest(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return parseError(resp.StatusCode, raw)
-	}
-	// Drain the success body so the HTTP/1.1 connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	return c.postAttachmentChatID(
+		ctx,
+		jwt,
+		attachmentID,
+		chatID,
+		"/api/sync/attachment-index/",
+		"attachment index",
+	)
 }
 
 func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID string) error {
@@ -929,6 +906,25 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 // RegisterAttachmentIndex clears the row inside the same DB
 // transaction; the sweeper drains anything that times out.
 func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachmentID, chatID string) error {
+	return c.postAttachmentChatID(
+		ctx,
+		jwt,
+		attachmentID,
+		chatID,
+		"/api/sync/pending-attachments/",
+		"pending attachment",
+	)
+}
+
+// postAttachmentChatID is the shared transport for the two
+// attachment-scoped POSTs that take a `{chat_id}` body keyed by
+// attachment id in the URL (attachment-index registration and the
+// pending-write ledger reservation). Factored out so the two paths
+// can't drift in headers, auth, or success-body handling.
+func (c *Client) postAttachmentChatID(
+	ctx context.Context,
+	jwt, attachmentID, chatID, pathPrefix, opLabel string,
+) error {
 	if attachmentID == "" {
 		return fmt.Errorf("controlplane: attachment id is required")
 	}
@@ -939,9 +935,9 @@ func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachm
 		ChatID string `json:"chat_id"`
 	}{ChatID: chatID})
 	if err != nil {
-		return fmt.Errorf("controlplane: marshal pending attachment: %w", err)
+		return fmt.Errorf("controlplane: marshal %s: %w", opLabel, err)
 	}
-	endpoint := c.baseURL + "/api/sync/pending-attachments/" + url.PathEscape(attachmentID)
+	endpoint := c.baseURL + pathPrefix + url.PathEscape(attachmentID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -957,6 +953,7 @@ func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachm
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return parseError(resp.StatusCode, raw)
 	}
+	// Drain the success body so the HTTP/1.1 connection can be reused.
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }

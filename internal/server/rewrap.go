@@ -284,16 +284,12 @@ func verifyLegacyAttachmentClaim(
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(payload)
-	expected := hex.EncodeToString(mac.Sum(nil))
+	expected := mac.Sum(nil)
 	provided, err := hex.DecodeString(providedClaim)
 	if err != nil {
 		return fmt.Errorf("malformed claim signature: %w", err)
 	}
-	expectedBytes, err := hex.DecodeString(expected)
-	if err != nil {
-		return fmt.Errorf("expected claim encode: %w", err)
-	}
-	if !hmac.Equal(provided, expectedBytes) {
+	if !hmac.Equal(provided, expected) {
 		return errors.New("claim signature mismatch")
 	}
 	return nil

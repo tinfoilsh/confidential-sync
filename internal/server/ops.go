@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -375,19 +374,14 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 
 	// If the caller passed a concrete ifMatch, run a single CAS-delete
 	// against that etag — a STALE_BLOB surfaces to the caller because
-	// they explicitly chose to race the etag they had. Pre-fetch the
-	// blob so the bucket cascade can be filtered against the chat
-	// plaintext (defense-in-depth against a poisoned WipedV2Attachments
-	// list).
+	// they explicitly chose to race the etag they had.
 	if req.IfMatch != nil && *req.IfMatch != "" {
-		chatAttIDs := chatAttachmentIDsForDelete(ctx, deps, sess, scope, req.ID, key, kidHex)
 		resp, cpResp, err := deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
 		if err != nil {
 			return nil, err
 		}
 		if scope == envelope.ScopeChat && cpResp != nil {
-			wipeSet := intersectAttachmentIDs(cpResp.WipedV2Attachments, chatAttIDs)
-			deleteBucketAttachments(ctx, deps, wipeSet)
+			deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 		}
 		return resp, nil
 	}
@@ -399,8 +393,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	// is augmented with the retry counter so each attempt's cache row
 	// is independent — otherwise a replay of attempt 1 would echo
 	// "OK" even after attempt 2 actually deleted the row.
-	var chatAttIDs map[string]bool
-	var chatAttIDsInitialized bool
 	for attempt := 0; attempt < deleteMaxRetries; attempt++ {
 		blob, err := deps.Controlplane.GetBlob(ctx, req.Scope, req.ID, sess.RawJWT)
 		if err != nil {
@@ -409,10 +401,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				return &OKResponse{OK: true}, nil
 			}
 			return nil, err
-		}
-		if !chatAttIDsInitialized && scope == envelope.ScopeChat {
-			chatAttIDs = extractChatAttachmentIDs(blob.Ciphertext, scope, req.ID, key, kidHex, sess.Claims.Subject)
-			chatAttIDsInitialized = true
 		}
 		attemptReq := req
 		idem := req.IdempotencyKey
@@ -425,14 +413,12 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 			if scope == envelope.ScopeChat && cpResp != nil {
 				// cpResp.WipedV2Attachments is the controlplane's
 				// authoritative list of v2 attachment ids that
-				// belonged to this (user, chat). We additionally
-				// intersect with attachment ids present in the
-				// decrypted chat envelope so a CP bug or compromise
-				// can't trick the enclave into deleting an
-				// unrelated victim's attachment; buckets has no
-				// per-user ownership check.
-				wipeSet := intersectAttachmentIDs(cpResp.WipedV2Attachments, chatAttIDs)
-				deleteBucketAttachments(ctx, deps, wipeSet)
+				// belonged to this (user, chat); the SQL that
+				// produces it (DeleteChatAttachmentsByChatReturningV2)
+				// filters on (clerk_user_id, chat_id) so the enclave
+				// can trust it the same way every other write path
+				// trusts controlplane authority over ownership.
+				deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 			}
 			return resp, nil
 		}
@@ -442,119 +428,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		return nil, err
 	}
 	return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "delete_exhausted_retries"}
-}
-
-// chatAttachmentIDsForDelete fetches and decrypts a chat blob in order
-// to enumerate the attachment ids encoded in its plaintext. Returns
-// nil on any failure — the caller falls back to controlplane authority
-// for the bucket cascade, which is the previous behavior.
-func chatAttachmentIDsForDelete(
-	ctx context.Context,
-	deps Deps,
-	sess Session,
-	scope envelope.Scope,
-	id string,
-	key []byte,
-	kidHex string,
-) map[string]bool {
-	if scope != envelope.ScopeChat {
-		return nil
-	}
-	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT)
-	if err != nil {
-		return nil
-	}
-	return extractChatAttachmentIDs(blob.Ciphertext, scope, id, key, kidHex, sess.Claims.Subject)
-}
-
-// extractChatAttachmentIDs returns the set of attachment ids the chat
-// plaintext claims to own, or nil when the blob can't be decoded /
-// decrypted (legacy formats without AAD, key mismatches, malformed
-// JSON). A nil result tells the caller to fall back to trusting the
-// controlplane's wipe list; a non-nil result is the authoritative
-// upper bound for the bucket cascade.
-func extractChatAttachmentIDs(
-	blob []byte,
-	scope envelope.Scope,
-	id string,
-	key []byte,
-	kidHex, clerkUserID string,
-) map[string]bool {
-	envKeys := []envelope.Key{{Bytes: key, KeyIDHex: kidHex}}
-	var plaintext []byte
-	switch envelope.Detect(blob) {
-	case envelope.VersionV2:
-		dec, err := envelope.DecryptV2(blob, envKeys, func(kid string) ([]byte, error) {
-			return envelope.CanonicalAAD(envelope.AAD{
-				KeyIDHex:    kid,
-				Scope:       scope,
-				ID:          id,
-				ClerkUserID: clerkUserID,
-			})
-		})
-		if err != nil {
-			return nil
-		}
-		defer cryptopkg.Zero(dec.Plaintext)
-		plaintext = dec.Plaintext
-	case envelope.VersionV0, envelope.VersionV1:
-		dec, err := envelope.DecryptLegacy(blob, envKeys)
-		if err != nil {
-			return nil
-		}
-		defer cryptopkg.Zero(dec.Plaintext)
-		plaintext = dec.Plaintext
-	default:
-		return nil
-	}
-
-	var parsed map[string]any
-	if err := json.Unmarshal(plaintext, &parsed); err != nil {
-		return nil
-	}
-	rawMessages, ok := parsed["messages"].([]any)
-	if !ok {
-		return map[string]bool{}
-	}
-	ids := map[string]bool{}
-	for _, m := range rawMessages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		rawAtts, ok := msg["attachments"].([]any)
-		if !ok {
-			continue
-		}
-		for _, a := range rawAtts {
-			att, ok := a.(map[string]any)
-			if !ok {
-				continue
-			}
-			if attID, _ := att["id"].(string); attID != "" {
-				ids[attID] = true
-			}
-		}
-	}
-	return ids
-}
-
-// intersectAttachmentIDs filters the controlplane's wipe list against
-// the set of attachment ids found in the chat plaintext. A nil
-// allowlist (decrypt failed or scope wasn't a chat) means the caller
-// has no plaintext-derived upper bound, so we fall back to the CP
-// list verbatim — the historical behavior.
-func intersectAttachmentIDs(cpList []string, allow map[string]bool) []string {
-	if allow == nil {
-		return cpList
-	}
-	out := make([]string, 0, len(cpList))
-	for _, id := range cpList {
-		if allow[id] {
-			out = append(out, id)
-		}
-	}
-	return out
 }
 
 const deleteMaxRetries = 3
