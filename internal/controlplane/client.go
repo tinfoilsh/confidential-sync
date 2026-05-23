@@ -913,6 +913,12 @@ func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]
 	if resp.StatusCode >= 400 {
 		return nil, parseError(resp.StatusCode, body)
 	}
+	// 204 No Content and any other empty 2xx response means
+	// "no orphans found"; treat it as a successful zero-row sweep
+	// instead of a decode error.
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, nil
+	}
 	var out struct {
 		AttachmentIDs []string `json:"attachment_ids"`
 	}
