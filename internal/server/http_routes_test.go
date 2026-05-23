@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -58,12 +59,18 @@ func parseShimPaths(t *testing.T, body []byte) []string {
 
 func repoRelative(t *testing.T, rel string) string {
 	t.Helper()
-	// internal/server -> repo root is two parents up.
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
+	// Resolve from the test file's own location instead of the
+	// process working directory so the path stays stable even when
+	// the test binary is invoked from somewhere other than the
+	// package directory (e.g. `go test ./...` from a parent or
+	// IDE test runners that chdir).
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
 	}
-	return filepath.Join(wd, "..", "..", rel)
+	// internal/server/http_routes_test.go -> repo root is two
+	// parents up from the file's directory.
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", rel)
 }
 
 func equalStrings(a, b []string) bool {
