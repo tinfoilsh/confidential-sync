@@ -162,6 +162,11 @@ func TestClientDeleteUsesJSONAndNoContent(t *testing.T) {
 			http.Error(w, "bad path", http.StatusBadRequest)
 			return
 		}
+		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
+			t.Errorf("authorization = %q", got)
+			http.Error(w, "bad auth", http.StatusBadRequest)
+			return
+		}
 		var body accessTokenRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
