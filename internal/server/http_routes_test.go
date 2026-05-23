@@ -7,7 +7,7 @@ import (
 	"sort"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // TestShimPathsMatchRoutes pins ExternalRoutePaths against
@@ -37,7 +37,7 @@ func TestShimPathsMatchRoutes(t *testing.T) {
 }
 
 // shimConfig captures only the fields this test cares about.
-// Unknown keys are ignored by yaml.v3's Unmarshal, so adding new
+// Unknown keys are ignored by yaml v3's Unmarshal, so adding new
 // top-level sections to tinfoil-config.yml won't break the parser.
 type shimConfig struct {
 	Shim struct {
