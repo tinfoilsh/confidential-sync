@@ -22,20 +22,30 @@ func TestClientPutUsesMultipartFormat(t *testing.T) {
 	var gotFields []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			t.Fatalf("method = %s", r.Method)
+			t.Errorf("method = %s", r.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
 		}
 		if r.URL.Path != "/put" {
-			t.Fatalf("path = %s", r.URL.Path)
+			t.Errorf("path = %s", r.URL.Path)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
-			t.Fatalf("authorization = %q", got)
+			t.Errorf("authorization = %q", got)
+			http.Error(w, "bad auth", http.StatusBadRequest)
+			return
 		}
 		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data;") {
-			t.Fatalf("content-type = %q", got)
+			t.Errorf("content-type = %q", got)
+			http.Error(w, "bad content-type", http.StatusBadRequest)
+			return
 		}
 		reader, err := r.MultipartReader()
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("multipart reader: %v", err)
+			http.Error(w, "bad multipart", http.StatusBadRequest)
+			return
 		}
 		for {
 			part, err := reader.NextPart()
@@ -43,37 +53,41 @@ func TestClientPutUsesMultipartFormat(t *testing.T) {
 				break
 			}
 			if err != nil {
-				t.Fatal(err)
+				t.Errorf("next part: %v", err)
+				http.Error(w, "bad part", http.StatusBadRequest)
+				return
 			}
 			name := part.FormName()
 			gotFields = append(gotFields, name)
 			body, err := io.ReadAll(part)
 			if err != nil {
-				t.Fatal(err)
+				t.Errorf("read part: %v", err)
+				http.Error(w, "bad read", http.StatusBadRequest)
+				return
 			}
 			switch name {
 			case "access_token":
 				if string(body) != testAccessToken {
-					t.Fatalf("access token = %q", body)
+					t.Errorf("access token = %q", body)
 				}
 			case "encryption_keys":
 				if string(body) != base64.StdEncoding.EncodeToString(key) {
-					t.Fatalf("key = %q", body)
+					t.Errorf("key = %q", body)
 				}
 			case "plaintext_length":
 				if string(body) != "5" {
-					t.Fatalf("plaintext_length = %q", body)
+					t.Errorf("plaintext_length = %q", body)
 				}
 			case "data":
 				if !bytes.Equal(body, plaintext) {
-					t.Fatalf("data = %q", body)
+					t.Errorf("data = %q", body)
 				}
 			default:
-				t.Fatalf("unexpected field %q", name)
+				t.Errorf("unexpected field %q", name)
 			}
 		}
 		if !slices.Equal(gotFields, []string{"access_token", "encryption_keys", "plaintext_length", "data"}) {
-			t.Fatalf("field order = %v", gotFields)
+			t.Errorf("field order = %v", gotFields)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -95,23 +109,31 @@ func TestClientGetUsesJSONAndReturnsRawBytes(t *testing.T) {
 	want := []byte{0, 1, 2, 255}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			t.Fatalf("method = %s", r.Method)
+			t.Errorf("method = %s", r.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
 		}
 		if r.URL.Path != "/get" {
-			t.Fatalf("path = %s", r.URL.Path)
+			t.Errorf("path = %s", r.URL.Path)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
-			t.Fatalf("authorization = %q", got)
+			t.Errorf("authorization = %q", got)
+			http.Error(w, "bad auth", http.StatusBadRequest)
+			return
 		}
 		var body getRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode body: %v", err)
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
 		}
 		if body.AccessToken != testAccessToken {
-			t.Fatalf("access token = %q", body.AccessToken)
+			t.Errorf("access token = %q", body.AccessToken)
 		}
 		if body.EncryptionKey != base64.StdEncoding.EncodeToString(key) {
-			t.Fatalf("key = %q", body.EncryptionKey)
+			t.Errorf("key = %q", body.EncryptionKey)
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(want)
@@ -131,17 +153,23 @@ func TestClientGetUsesJSONAndReturnsRawBytes(t *testing.T) {
 func TestClientDeleteUsesJSONAndNoContent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			t.Fatalf("method = %s", r.Method)
+			t.Errorf("method = %s", r.Method)
+			http.Error(w, "bad method", http.StatusBadRequest)
+			return
 		}
 		if r.URL.Path != "/delete" {
-			t.Fatalf("path = %s", r.URL.Path)
+			t.Errorf("path = %s", r.URL.Path)
+			http.Error(w, "bad path", http.StatusBadRequest)
+			return
 		}
 		var body accessTokenRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode body: %v", err)
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
 		}
 		if body.AccessToken != testAccessToken {
-			t.Fatalf("access token = %q", body.AccessToken)
+			t.Errorf("access token = %q", body.AccessToken)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
