@@ -5,7 +5,7 @@ memory: 2048
 
 containers:
   - name: "sync-enclave"
-    image: "ghcr.io/tinfoilsh/confidential-sync@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/tinfoilsh/confidential-sync@sha256:7b125db78f02a650acf81f3d01126effa000c2cb2740b616159eefe6ea403c95" # v0.0.3
     env:
       - CONTROLPLANE_URL: "https://api.tinfoil.sh"
       - BUCKETS_URL: "https://buckets.tinfoil.sh"
