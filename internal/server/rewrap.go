@@ -131,6 +131,13 @@ func rewrapChatAttachments(
 		return nil, nil
 	}
 
+	// Attempt every attachment in the chat even when one fails so the
+	// next rewrap pass starts from a smaller backlog; the chat-level
+	// re-seal still aborts as soon as any single promotion errors out,
+	// because returning a clean etag while the chat plaintext still
+	// embeds a legacy attachment would record migration success that
+	// the next read can no longer satisfy.
+	var promoteErrs []error
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -153,10 +160,15 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
-			_ = promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey)
+			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
+				promoteErrs = append(promoteErrs, err)
+			}
 		}
 	}
 
+	if len(promoteErrs) > 0 {
+		return nil, errors.Join(promoteErrs...)
+	}
 	return nil, nil
 }
 
