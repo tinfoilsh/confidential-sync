@@ -909,9 +909,16 @@ func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
 		return nil, parseError(resp.StatusCode, body)
+	}
+	// A read error on a 2xx response must not silently turn into the
+	// empty-body "no orphans" path below — a connection that died
+	// mid-stream would otherwise look identical to a real 204 and we
+	// would skip whatever ids the controlplane was about to send.
+	if readErr != nil {
+		return nil, fmt.Errorf("controlplane: read orphan attachments: %w", readErr)
 	}
 	// 204 No Content and any other empty 2xx response means
 	// "no orphans found"; treat it as a successful zero-row sweep
