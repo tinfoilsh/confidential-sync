@@ -103,12 +103,19 @@ func Detect(blob []byte) Version {
 // alg) is enforced by DecryptV2; Detect's only job is shape
 // classification. A partial / truncated JSON document fails the
 // strict Unmarshal and is therefore not v2.
+//
+// The probe struct only captures the `v` field; decoding the full
+// V2 struct here would copy the (potentially megabyte-sized) `ct`
+// base64 string into a fresh allocation on every Detect call, which
+// is wasted work because Detect never inspects it.
 func looksLikeV2(blob []byte) bool {
-	var env V2
-	if err := json.Unmarshal(blob, &env); err != nil {
+	var probe struct {
+		V int `json:"v"`
+	}
+	if err := json.Unmarshal(blob, &probe); err != nil {
 		return false
 	}
-	return env.V == int(VersionV2)
+	return probe.V == int(VersionV2)
 }
 
 // looksLikeV0 returns true when blob fully parses as JSON in the v0
