@@ -20,6 +20,11 @@ type Deps struct {
 	Controlplane *controlplane.Client
 	Buckets      *buckets.Client
 	GitSHA       string
+	// SyncEnclaveSecret is the shared secret used to verify the
+	// X-Legacy-Claim header CP stamps on legacy attachment reads.
+	// Empty in test fixtures, where the legacy-claim guard is
+	// bypassed.
+	SyncEnclaveSecret string
 }
 
 // Session is the per-request authenticated context: the bearer token (to
@@ -408,11 +413,11 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 			if scope == envelope.ScopeChat && cpResp != nil {
 				// cpResp.WipedV2Attachments is the controlplane's
 				// authoritative list of v2 attachment ids that
-				// belonged to this (user, chat). Deriving the list
-				// from the user-controlled chat plaintext would let
-				// a crafted chat name a victim's attachment id and
-				// trick the enclave into deleting it; buckets has
-				// no per-user ownership check.
+				// belonged to this (user, chat); the SQL that
+				// produces it (DeleteChatAttachmentsByChatReturningV2)
+				// filters on (clerk_user_id, chat_id) so the enclave
+				// can trust it the same way every other write path
+				// trusts controlplane authority over ownership.
 				deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
 			}
 			return resp, nil

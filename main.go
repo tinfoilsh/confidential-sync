@@ -75,7 +75,12 @@ func main() {
 		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / BUCKETS_API_KEY unset); attachment routes will return 503")
 	}
 
-	deps := server.Deps{Controlplane: cpClient, Buckets: bucketsClient, GitSHA: gitSHA}
+	deps := server.Deps{
+		Controlplane:      cpClient,
+		Buckets:           bucketsClient,
+		GitSHA:            gitSHA,
+		SyncEnclaveSecret: syncEnclaveSecret,
+	}
 	handler := server.NewHandler(deps, verifier, stdLogger{})
 	server.StartAttachmentOrphanReaper(ctx, deps, stdLogger{})
 

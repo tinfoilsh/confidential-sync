@@ -140,6 +140,24 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
 	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
 	s.mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.handleDeleteAttachmentIndex)
+	// pending-attachment-write ledger (no-op when the test fixture
+	// hasn't opted in; AttachmentPut's reserve call is best-effort).
+	s.mux.HandleFunc("POST /api/sync/pending-attachments/{aid}", s.handleReservePendingAttachment)
+	s.mux.HandleFunc("POST /api/sync/pending-attachments/sweep", s.handleSweepPendingAttachments)
+}
+
+// handleReservePendingAttachment / handleSweepPendingAttachments mirror
+// the controlplane ledger endpoints. The unit fixture only needs them
+// to return 200 so AttachmentPut's preflight reservation does not blow
+// up; production-grade behavior (atomic clear on register, sweeper
+// reaping) is exercised by the localstack stub_cp.
+func (s *cpStub) handleReservePendingAttachment(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *cpStub) handleSweepPendingAttachments(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"rows":[]}`))
 }
 
 func (s *cpStub) extractID(scope string, r *http.Request) string {

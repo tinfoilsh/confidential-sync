@@ -801,38 +801,60 @@ func IsCode(err error, code string) bool {
 // then registers a v2 index row (which nulls the BYTEA column).
 // A 404 surfaces as ErrLegacyAttachmentNotFound so the caller can
 // treat already-migrated rows as a no-op.
+//
+// Returns the ciphertext alongside the controlplane's X-Legacy-Claim
+// header so the caller can verify CP signed off on this specific
+// (user, attachment) pair before promoting it to v2.
 var ErrLegacyAttachmentNotFound = errors.New("controlplane: legacy attachment not found")
 
-func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) ([]byte, error) {
+// HeaderLegacyClaim names the response header carrying the CP-signed
+// claim that authorizes a legacy attachment re-seal for a specific
+// user. Lives in controlplane/client.go so both enclave and CP can
+// import the canonical constant.
+const HeaderLegacyClaim = "X-Legacy-Claim"
+
+// LegacyAttachmentResponse is the result of GetLegacyAttachment. Claim
+// is empty when CP did not stamp the header (only possible in dev
+// mode with no shared secret configured); the caller MUST treat the
+// missing header as a hard failure in production.
+type LegacyAttachmentResponse struct {
+	Ciphertext []byte
+	Claim      string
+}
+
+func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) (LegacyAttachmentResponse, error) {
 	if attachmentID == "" {
-		return nil, fmt.Errorf("controlplane: attachment id is required")
+		return LegacyAttachmentResponse{}, fmt.Errorf("controlplane: attachment id is required")
 	}
 	endpoint := c.baseURL + "/api/storage/attachment/" + url.PathEscape(attachmentID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	c.addAuth(httpReq, jwt)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrLegacyAttachmentNotFound
+		return LegacyAttachmentResponse{}, ErrLegacyAttachmentNotFound
 	}
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, parseError(resp.StatusCode, raw)
+		return LegacyAttachmentResponse{}, parseError(resp.StatusCode, raw)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxLegacyAttachmentBytes)+1))
 	if err != nil {
-		return nil, err
+		return LegacyAttachmentResponse{}, err
 	}
 	if len(body) > maxLegacyAttachmentBytes {
-		return nil, fmt.Errorf("controlplane: legacy attachment exceeds %d bytes", maxLegacyAttachmentBytes)
+		return LegacyAttachmentResponse{}, fmt.Errorf("controlplane: legacy attachment exceeds %d bytes", maxLegacyAttachmentBytes)
 	}
-	return body, nil
+	return LegacyAttachmentResponse{
+		Ciphertext: body,
+		Claim:      resp.Header.Get(HeaderLegacyClaim),
+	}, nil
 }
 
 // RegisterAttachmentIndex records ownership of a v2 attachment with
@@ -843,37 +865,14 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID stri
 // controlplane resolves the user from claims, exactly like every
 // other sync route.
 func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID, chatID string) error {
-	if attachmentID == "" {
-		return fmt.Errorf("controlplane: attachment id is required")
-	}
-	if chatID == "" {
-		return fmt.Errorf("controlplane: chat id is required")
-	}
-	body, err := json.Marshal(struct {
-		ChatID string `json:"chat_id"`
-	}{ChatID: chatID})
-	if err != nil {
-		return fmt.Errorf("controlplane: marshal attachment index: %w", err)
-	}
-	endpoint := c.baseURL + "/api/sync/attachment-index/" + url.PathEscape(attachmentID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	c.addAuth(httpReq, jwt)
-	httpReq.Header.Set(HeaderContentType, "application/json")
-	resp, err := c.doRequest(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return parseError(resp.StatusCode, raw)
-	}
-	// Drain the success body so the HTTP/1.1 connection can be reused.
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	return c.postAttachmentChatID(
+		ctx,
+		jwt,
+		attachmentID,
+		chatID,
+		"/api/sync/attachment-index/",
+		"attachment index",
+	)
 }
 
 func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID string) error {
@@ -898,6 +897,113 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// ReservePendingAttachmentWrite asks controlplane to stamp a guard
+// row before the enclave writes bytes to buckets. A duplicate
+// reservation for the same id is a no-op, so retries of the same
+// upload don't proliferate guard rows. The companion call
+// RegisterAttachmentIndex clears the row inside the same DB
+// transaction; the sweeper drains anything that times out.
+func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachmentID, chatID string) error {
+	return c.postAttachmentChatID(
+		ctx,
+		jwt,
+		attachmentID,
+		chatID,
+		"/api/sync/pending-attachments/",
+		"pending attachment",
+	)
+}
+
+// postAttachmentChatID is the shared transport for the two
+// attachment-scoped POSTs that take a `{chat_id}` body keyed by
+// attachment id in the URL (attachment-index registration and the
+// pending-write ledger reservation). Factored out so the two paths
+// can't drift in headers, auth, or success-body handling.
+func (c *Client) postAttachmentChatID(
+	ctx context.Context,
+	jwt, attachmentID, chatID, pathPrefix, opLabel string,
+) error {
+	if attachmentID == "" {
+		return fmt.Errorf("controlplane: attachment id is required")
+	}
+	if chatID == "" {
+		return fmt.Errorf("controlplane: chat id is required")
+	}
+	body, err := json.Marshal(struct {
+		ChatID string `json:"chat_id"`
+	}{ChatID: chatID})
+	if err != nil {
+		return fmt.Errorf("controlplane: marshal %s: %w", opLabel, err)
+	}
+	endpoint := c.baseURL + pathPrefix + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return parseError(resp.StatusCode, raw)
+	}
+	// Drain the success body so the HTTP/1.1 connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// PendingAttachmentRow is one entry from a sweep response: the
+// abandoned attachment id, its owner, and the chat it was meant for.
+// The enclave's sweeper uses (clerk_user_id, attachment_id) to drive
+// the buckets-side cleanup before logging the reconciliation.
+type PendingAttachmentRow struct {
+	AttachmentID string `json:"attachment_id"`
+	ChatID       string `json:"chat_id"`
+	ClerkUserID  string `json:"clerk_user_id"`
+}
+
+// SweepPendingAttachmentWrites pulls the next batch of expired guard
+// rows from controlplane. The rows are deleted from the pending
+// ledger by the same call, so the caller is the sole owner of the
+// cleanup obligation for the returned ids. Enclave-only — the route
+// is gated by the sync enclave service secret on the CP side.
+func (c *Client) SweepPendingAttachmentWrites(ctx context.Context, limit int) ([]PendingAttachmentRow, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	endpoint := c.baseURL + "/api/sync/pending-attachments/sweep?limit=" + strconv.Itoa(limit)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, body)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("controlplane: read pending attachments sweep: %w", readErr)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, nil
+	}
+	var out struct {
+		Rows []PendingAttachmentRow `json:"rows"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode pending attachments sweep: %w", err)
+	}
+	return out.Rows, nil
 }
 
 func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]string, error) {
