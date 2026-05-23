@@ -19,6 +19,13 @@ const (
 	minAccessTokenLength = 36
 	maxAccessTokenLength = 76
 	defaultPartSize      = 64 << 20
+	// maxStubPlaintextBytes caps the multipart `data` body the stub
+	// will buffer. Real buckets streams to object storage; the
+	// stub holds everything in memory, so an unbounded read would
+	// let a misconfigured or hostile client OOM the test harness.
+	// Pegging the cap at 256 MiB leaves plenty of headroom for the
+	// largest attachments the enclave will ever push through.
+	maxStubPlaintextBytes = 256 << 20
 )
 
 type Store struct {
@@ -172,7 +179,17 @@ func (s *Store) put(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "plaintext_length is required before data", http.StatusBadRequest)
 				return
 			}
-			value, err = io.ReadAll(part)
+			// Bound the read so a body that lies about its
+			// declared plaintext_length (or exceeds the stub's
+			// memory cap outright) cannot exhaust the test
+			// harness. Reading one extra byte lets the
+			// plaintext_length mismatch check below report the
+			// failure instead of silently truncating at the cap.
+			readLimit := plaintextLength
+			if readLimit > maxStubPlaintextBytes {
+				readLimit = maxStubPlaintextBytes
+			}
+			value, err = io.ReadAll(io.LimitReader(part, readLimit+1))
 			sawData = true
 		default:
 			http.Error(w, "unknown field", http.StatusBadRequest)
