@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -110,11 +111,20 @@ func rewrapBlob(
 // attachments with an embedded encryptionKey (legacy v0/v1 image
 // rows), and promotes them to buckets-backed v2 storage. The
 // per-attachment key is reused as the buckets slot key, and legacy
-// attachment ids are preserved as the buckets ids. The chat plaintext
-// itself is not rewritten, so inline thumbnail/base64 fields remain
-// exactly as the client stored them.
-// Returns (nil, nil) when the plaintext doesn't parse as a chat
-// envelope — letting the rewrap proceed as a pure re-seal.
+// attachment ids are preserved as the buckets ids.
+//
+// Older clients stored the per-attachment key under `att.key`
+// instead of `att.encryptionKey`. When such a row is promoted the
+// function also sets `att.encryptionKey` to the same value so that
+// post-rewrap reads address the buckets entry directly. The
+// original `att.key` field is left in place so clients that still
+// only know the legacy field name can keep reading via the legacy
+// route until they update.
+//
+// Returns the mutated plaintext when any `att.key` row had to be
+// normalized; returns (nil, nil) when the plaintext doesn't parse
+// as a chat envelope or no field renames were needed, letting the
+// rewrap proceed as a pure re-seal.
 func rewrapChatAttachments(
 	ctx context.Context,
 	deps Deps,
@@ -122,8 +132,16 @@ func rewrapChatAttachments(
 	chatID string,
 	plaintext []byte,
 ) ([]byte, error) {
+	// UseNumber preserves JSON numbers as json.Number (a
+	// string-backed type) instead of float64. Without it, large
+	// int64 fields (file sizes, Unix-ms timestamps) silently lose
+	// precision on the re-marshal below, and 1.0 becomes 1, which
+	// would silently rewrite chat plaintext bytes whenever this
+	// cascade fires.
+	dec := json.NewDecoder(bytes.NewReader(plaintext))
+	dec.UseNumber()
 	var parsed map[string]any
-	if err := json.Unmarshal(plaintext, &parsed); err != nil {
+	if err := dec.Decode(&parsed); err != nil {
 		return nil, nil
 	}
 	rawMessages, ok := parsed["messages"].([]any)
@@ -138,6 +156,7 @@ func rewrapChatAttachments(
 	// embeds a legacy attachment would record migration success that
 	// the next read can no longer satisfy.
 	var promoteErrs []error
+	fieldNormalized := false
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -157,17 +176,30 @@ func rewrapChatAttachments(
 			}
 			rawID, _ := att["id"].(string)
 			rawKey, _ := att["encryptionKey"].(string)
+			keyFromLegacyField := false
+			if rawKey == "" {
+				rawKey, _ = att["key"].(string)
+				keyFromLegacyField = rawKey != ""
+			}
 			if rawID == "" || rawKey == "" {
 				continue
 			}
 			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
 				promoteErrs = append(promoteErrs, err)
+				continue
+			}
+			if keyFromLegacyField {
+				att["encryptionKey"] = rawKey
+				fieldNormalized = true
 			}
 		}
 	}
 
 	if len(promoteErrs) > 0 {
 		return nil, errors.Join(promoteErrs...)
+	}
+	if fieldNormalized {
+		return json.Marshal(parsed)
 	}
 	return nil, nil
 }
