@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -131,8 +132,16 @@ func rewrapChatAttachments(
 	chatID string,
 	plaintext []byte,
 ) ([]byte, error) {
+	// UseNumber preserves JSON numbers as json.Number (a
+	// string-backed type) instead of float64. Without it, large
+	// int64 fields (file sizes, Unix-ms timestamps) silently lose
+	// precision on the re-marshal below, and 1.0 becomes 1, which
+	// would silently rewrite chat plaintext bytes whenever this
+	// cascade fires.
+	dec := json.NewDecoder(bytes.NewReader(plaintext))
+	dec.UseNumber()
 	var parsed map[string]any
-	if err := json.Unmarshal(plaintext, &parsed); err != nil {
+	if err := dec.Decode(&parsed); err != nil {
 		return nil, nil
 	}
 	rawMessages, ok := parsed["messages"].([]any)
