@@ -67,10 +67,19 @@ func rewrapBlob(
 		}
 	}
 
+	// Profile blobs are keyed by clerk_user_id on the controlplane,
+	// so CP's needs-migration list returns the user id as the row id.
+	// The crypto envelope, however, pins the AAD id to the canonical
+	// profile-singleton constant; if we forwarded CP's storage id we
+	// would build an AAD the next read could never reproduce.
+	aadID := id
+	if scope == envelope.ScopeProfile {
+		aadID = envelope.ProfileSingletonID
+	}
 	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
 		KeyIDHex:    targetKIDHex,
 		Scope:       scope,
-		ID:          id,
+		ID:          aadID,
 		ClerkUserID: sess.Claims.Subject,
 	})
 	if err != nil {
@@ -85,6 +94,7 @@ func rewrapBlob(
 		Scope:          string(scope),
 		ID:             id,
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
@@ -243,7 +253,7 @@ func promoteOneAttachment(
 	}
 	deps.logInfo("attachment promote begin: user=%s chat=%s att=%s",
 		sess.Claims.Subject, chatID, attID)
-	resp, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, attID)
+	resp, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, sess.Claims.Subject, attID)
 	if err != nil {
 		if errors.Is(err, controlplane.ErrLegacyAttachmentNotFound) {
 			deps.logInfo("attachment promote skip not-found: user=%s chat=%s att=%s",
@@ -277,7 +287,7 @@ func promoteOneAttachment(
 	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
 		return fmt.Errorf("rewrap: promote attachment %s to buckets: %w", attID, err)
 	}
-	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, attID, chatID); err != nil {
+	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, sess.Claims.Subject, attID, chatID); err != nil {
 		// buckets PUT succeeded but index update failed — the bytes
 		// are present, controlplane just hasn't been told they're
 		// v2 yet. A subsequent rewrap pass will retry the register

@@ -134,6 +134,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		Scope:          req.Scope,
 		ID:             req.ID,
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       kidHex,
 		IfMatch:        ifMatch,
 		IdempotencyKey: req.IdempotencyKey,
@@ -223,7 +224,7 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	case len(req.IDs) > 0:
 		ids = req.IDs
 	case req.All:
-		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, "")
+		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, "")
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +281,7 @@ func pullOne(
 	targetKey []byte,
 	targetKIDHex string,
 ) PullItem {
-	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT)
+	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		var cpe *controlplane.Error
 		if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
@@ -367,7 +368,7 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	}
 	deps.logInfo("list-status begin: user=%s scope=%s limit=%d project=%s cursor=%q",
 		sess.Claims.Subject, req.Scope, req.Limit, req.ProjectID, req.Cursor)
-	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, req.ProjectID)
+	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, req.ProjectID)
 	if err != nil {
 		deps.logError("list-status failed: user=%s scope=%s err=%v",
 			sess.Claims.Subject, req.Scope, err)
@@ -453,7 +454,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	// is independent — otherwise a replay of attempt 1 would echo
 	// "OK" even after attempt 2 actually deleted the row.
 	for attempt := 0; attempt < deleteMaxRetries; attempt++ {
-		blob, err := deps.Controlplane.GetBlob(ctx, req.Scope, req.ID, sess.RawJWT)
+		blob, err := deps.Controlplane.GetBlob(ctx, req.Scope, req.ID, sess.RawJWT, sess.Claims.Subject)
 		if err != nil {
 			var cpe *controlplane.Error
 			if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
@@ -512,6 +513,7 @@ func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest,
 		Scope:          req.Scope,
 		ID:             req.ID,
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		IfMatch:        ifMatch,
 		IdempotencyKey: req.IdempotencyKey,
 		OperationHash:  opHash,
@@ -556,6 +558,7 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 	}
 	cpReq := controlplane.RegisterKeyRequest{
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       kidHex,
 		IfMatch:        req.IfMatch,
 		CreatedVia:     req.CreatedVia,
@@ -612,6 +615,7 @@ func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleReques
 	}
 	cpReq := controlplane.AddBundleRequest{
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       req.KeyID,
 		CredentialID:   req.CredentialID,
 		KEKIV:          req.KEKIV,
@@ -664,6 +668,7 @@ func RemoveBundle(ctx context.Context, deps Deps, sess Session, req RemoveBundle
 	}
 	cpReq := controlplane.RemoveBundleRequest{
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       req.KeyID,
 		CredentialID:   req.CredentialID,
 		IdempotencyKey: req.IdempotencyKey,
@@ -721,7 +726,7 @@ func operationHashForKey(cek []byte, method, path, keyIDHex, idempotencyKey stri
 // controlplane; we re-emit that 404 here.
 func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentRequest) (*KeyCurrentResponse, error) {
 	deps.logInfo("key current begin: user=%s", sess.Claims.Subject)
-	resp, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT)
+	resp, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		deps.logError("key current failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
@@ -794,7 +799,7 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 	if len(req.IDs) > 0 {
 		ids = req.IDs
 	} else {
-		list, err := deps.Controlplane.ListNeedsMigration(ctx, req.Scope, req.Limit, sess.RawJWT)
+		list, err := deps.Controlplane.ListNeedsMigration(ctx, req.Scope, req.Limit, sess.RawJWT, sess.Claims.Subject)
 		if err != nil {
 			deps.logError("migrate list-needs failed: user=%s scope=%s err=%v",
 				sess.Claims.Subject, scope, err)
@@ -814,7 +819,7 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 			out.Migrated++
 		} else {
 			out.Blocked = append(out.Blocked, id)
-			if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT); err != nil {
+			if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject); err != nil {
 				deps.logError("migrate record-failure failed: user=%s scope=%s id=%s err=%v",
 					sess.Claims.Subject, scope, id, err)
 			}
@@ -864,6 +869,12 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 		return nil, badRequest("target.key is required")
 	}
 
+	if err := ensureCurrentKeyRegistered(ctx, deps, sess, req.Target.Key); err != nil {
+		deps.logError("migrate-all bootstrap current-key failed: user=%s err=%v",
+			sess.Claims.Subject, err)
+		return nil, err
+	}
+
 	deadline := time.Now().Add(MigrateAllBudget)
 	scopes := []envelope.Scope{
 		envelope.ScopeProfile,
@@ -905,6 +916,18 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 			})
 			cancel()
 			if err != nil {
+				// Auth-layer failures (user JWT expired without
+				// service-auth fallback, missing enclave secret,
+				// rotated keys) will hit every subsequent call
+				// the same way. Surface Partial=true so the
+				// client retries with a fresh token instead of
+				// burning the loop on a thousand 401s.
+				if isAuthError(err) {
+					deps.logError("migrate-all auth failed mid-loop, aborting: user=%s scope=%s page=%d err=%v",
+						sess.Claims.Subject, scope, pages, err)
+					out.Partial = true
+					break
+				}
 				deps.logError("migrate-all page failed: user=%s scope=%s page=%d err=%v",
 					sess.Claims.Subject, scope, pages, err)
 				return nil, err
@@ -942,6 +965,121 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 	return out, nil
 }
 
+// ensureCurrentKeyRegistered guarantees the user has a primary key on
+// the controlplane before the migration loop runs. Without it, every
+// rewrap returns STALE_KEY because controlplane gates the CAS update
+// on current_key_id, and a freshly-arrived v2 user whose `user_keys`
+// row was never written would burn the whole migration on 409s.
+//
+// Idempotent. If a current key already exists the call is a no-op,
+// even when the existing key differs from the target — the caller's
+// subsequent rewraps will surface STALE_KEY and the client can drive
+// a key-rotation flow from there.
+func ensureCurrentKeyRegistered(
+	ctx context.Context,
+	deps Deps,
+	sess Session,
+	targetKeyB64 string,
+) error {
+	current, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		return fmt.Errorf("inspect current key: %w", err)
+	}
+
+	targetBytes, err := decodeKey(targetKeyB64)
+	if err != nil {
+		return badRequest("invalid target.key: " + err.Error())
+	}
+	defer cryptopkg.Zero(targetBytes)
+
+	targetKIDBytes, err := cryptopkg.DeriveKeyID(targetBytes)
+	if err != nil {
+		return err
+	}
+	targetKIDHex := cryptopkg.KeyIDHex(targetKIDBytes)
+
+	if current != nil && current.KeyID != "" {
+		deps.logInfo("migrate-all bootstrap: user=%s current_kid=%s target_kid=%s",
+			sess.Claims.Subject, current.KeyID, targetKIDHex)
+		return nil
+	}
+
+	deps.logInfo("migrate-all bootstrap: user=%s no current key; registering target kid=%s",
+		sess.Claims.Subject, targetKIDHex)
+
+	idem := fmt.Sprintf("migrate-bootstrap:%s:%s", sess.Claims.Subject, targetKIDHex)
+	cpReq := controlplane.RegisterKeyRequest{
+		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
+		KeyIDHex:       targetKIDHex,
+		IfMatch:        controlplane.IfMatchAnyKey,
+		CreatedVia:     "recovery",
+		IdempotencyKey: idem,
+	}
+	body, err := controlplane.RegisterKeyBody(cpReq)
+	if err != nil {
+		return err
+	}
+	opKey, err := cryptopkg.DeriveOpHashKey(targetBytes)
+	if err != nil {
+		return err
+	}
+	defer cryptopkg.Zero(opKey)
+	cpReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         http.MethodPost,
+		Path:           controlplane.RegisterKeyPath,
+		KeyIDHex:       targetKIDHex,
+		IfMatch:        controlplane.IfMatchAnyKey,
+		IdempotencyKey: idem,
+		Body:           body,
+	})
+
+	resp, err := deps.Controlplane.RegisterKey(ctx, cpReq)
+	if err != nil {
+		// STALE_KEY / EXISTING_DATA_UNDER_OTHER_KEY can mean either
+		// (a) a concurrent caller registered first — in which case
+		// a current key now exists and we can proceed, or (b) the
+		// controlplane already had a *different* current key when
+		// we called and IfMatch=* still failed for some other
+		// reason. We only swallow the race in case (a), so we
+		// re-fetch the current key and require it to be set;
+		// otherwise the migration loop would silently burn on
+		// STALE_KEY for every blob.
+		if controlplane.IsCode(err, controlplane.StatusStaleKey) ||
+			controlplane.IsCode(err, controlplane.StatusExistingDataUnderOtherKey) {
+			confirm, getErr := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
+			if getErr != nil {
+				return fmt.Errorf("confirm current key after register race: %w", getErr)
+			}
+			if confirm == nil || confirm.KeyID == "" {
+				return fmt.Errorf("register target as current: %w (current key still unset)", err)
+			}
+			deps.logInfo("migrate-all bootstrap: user=%s register-key race lost; current_kid=%s; proceeding",
+				sess.Claims.Subject, confirm.KeyID)
+			return nil
+		}
+		return fmt.Errorf("register target as current: %w", err)
+	}
+	deps.logInfo("migrate-all bootstrap: user=%s registered kid=%s as current",
+		sess.Claims.Subject, targetKIDHex)
+	if resp != nil {
+		deleteBucketAttachments(ctx, deps, resp.WipedV2Attachments)
+	}
+	return nil
+}
+
+// isAuthError reports whether err originates from a 401/403 from
+// controlplane. Used to abort the migrate-all loop cleanly instead of
+// hammering CP once the auth chain has broken (expired user JWT,
+// missing service secret, rotated keys).
+func isAuthError(err error) bool {
+	var cpe *controlplane.Error
+	if !errors.As(err, &cpe) {
+		return false
+	}
+	return cpe.StatusCode == http.StatusUnauthorized || cpe.StatusCode == http.StatusForbidden
+}
+
 func migrateOne(
 	ctx context.Context,
 	deps Deps,
@@ -952,7 +1090,7 @@ func migrateOne(
 	targetKey []byte,
 	targetKIDHex string,
 ) bool {
-	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT)
+	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		deps.logError("migrate item fetch failed: user=%s scope=%s id=%s err=%v",
 			sess.Claims.Subject, scope, id, err)

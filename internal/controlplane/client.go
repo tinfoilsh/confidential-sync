@@ -76,6 +76,12 @@ const (
 	HeaderETag          = "ETag"
 	HeaderContentType   = "Content-Type"
 	HeaderServiceSecret = "X-Sync-Enclave-Secret"
+	// HeaderClerkUserID carries the user id the enclave already
+	// verified out of the user's JWT. Paired with HeaderServiceSecret
+	// it stands in for a fresh Clerk bearer token on the
+	// controlplane, so long migrations do not break when the proxied
+	// JWT expires mid-loop.
+	HeaderClerkUserID = "X-Clerk-User-Id"
 )
 
 const (
@@ -151,6 +157,11 @@ type PutBlobRequest struct {
 	Scope          string
 	ID             string
 	JWT            string
+	// ClerkUserID is the verified subject from the user JWT at the
+	// enclave's auth boundary. Forwarded as X-Clerk-User-Id so the
+	// controlplane can accept the call via service auth and skip
+	// re-verifying the proxied JWT, which may expire mid-migration.
+	ClerkUserID    string
 	KeyIDHex       string
 	IfMatch        string
 	IdempotencyKey string
@@ -191,8 +202,19 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (c *Client) addAuth(req *http.Request, rawJWT string) {
+// addAuth stamps the Authorization header and, when the caller passes
+// the user id verified at the enclave's auth boundary, the
+// X-Clerk-User-Id header that lets controlplane accept the request
+// via service auth without re-verifying a JWT that may expire
+// mid-migration. The user id is REQUIRED to be the verified
+// `sess.Claims.Subject` from the caller — never extracted from the
+// JWT payload here, so a malformed or attacker-supplied token cannot
+// influence the asserted identity.
+func (c *Client) addAuth(req *http.Request, rawJWT, clerkUserID string) {
 	req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	if clerkUserID != "" {
+		req.Header.Set(HeaderClerkUserID, clerkUserID)
+	}
 }
 
 func (c *Client) urlFor(scope, id string) (string, error) {
@@ -249,7 +271,7 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/octet-stream")
 	httpReq.Header.Set(HeaderKeyID, req.KeyIDHex)
 	if req.IfMatch != "" {
@@ -328,7 +350,7 @@ func (c *Client) rewrapBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRe
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/json")
 	if req.IdempotencyKey != "" {
 		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
@@ -362,7 +384,7 @@ func (c *Client) rewrapBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRe
 	return &PutBlobResponse{ETag: out.ETag, KeyID: out.KeyID}, nil
 }
 
-func (c *Client) GetBlob(ctx context.Context, scope, id, jwt string) (*GetBlobResponse, error) {
+func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string) (*GetBlobResponse, error) {
 	endpoint, err := c.urlFor(scope, id)
 	if err != nil {
 		return nil, err
@@ -371,7 +393,7 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt string) (*GetBlobRe
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return nil, err
@@ -395,6 +417,7 @@ type DeleteBlobRequest struct {
 	Scope          string
 	ID             string
 	JWT            string
+	ClerkUserID    string
 	IfMatch        string
 	IdempotencyKey string
 	OperationHash  string
@@ -418,7 +441,7 @@ func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*Delete
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	if req.IfMatch != "" {
 		httpReq.Header.Set(HeaderIfMatch, req.IfMatch)
 	}
@@ -449,7 +472,7 @@ func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*Delete
 	return out, nil
 }
 
-func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt string, projectID string) (*ListStatusResponse, error) {
+func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt, clerkUserID string, projectID string) (*ListStatusResponse, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
@@ -467,7 +490,7 @@ func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return nil, err
@@ -493,7 +516,7 @@ type ListNeedsMigrationResponse struct {
 	BlockedUnmigrated  int      `json:"blocked_unmigrated"`
 }
 
-func (c *Client) ListNeedsMigration(ctx context.Context, scope string, limit int, jwt string) (*ListNeedsMigrationResponse, error) {
+func (c *Client) ListNeedsMigration(ctx context.Context, scope string, limit int, jwt, clerkUserID string) (*ListNeedsMigrationResponse, error) {
 	endpoint := c.baseURL + "/api/sync/needs-migration"
 	q := url.Values{}
 	q.Set("scope", scope)
@@ -502,7 +525,7 @@ func (c *Client) ListNeedsMigration(ctx context.Context, scope string, limit int
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return nil, err
@@ -527,14 +550,14 @@ func (c *Client) ListNeedsMigration(ctx context.Context, scope string, limit int
 // decrypt the legacy blob. The controlplane stamps the row with the current
 // timestamp so it is excluded from the next batch until the 24h cooldown
 // elapses.
-func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt string) error {
+func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt, clerkUserID string) error {
 	endpoint := c.baseURL + "/api/sync/migration-failure"
 	body, _ := json.Marshal(map[string]string{"scope": scope, "id": id})
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/json")
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
@@ -565,13 +588,13 @@ type CurrentKeyBundle struct {
 	RegisteredAt  time.Time `json:"registered_at"`
 }
 
-func (c *Client) GetCurrentKey(ctx context.Context, jwt string) (*CurrentKeyResponse, error) {
+func (c *Client) GetCurrentKey(ctx context.Context, jwt, clerkUserID string) (*CurrentKeyResponse, error) {
 	endpoint := c.baseURL + "/api/sync/keys/current"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return nil, err
@@ -593,6 +616,7 @@ func (c *Client) GetCurrentKey(ctx context.Context, jwt string) (*CurrentKeyResp
 
 type RegisterKeyRequest struct {
 	JWT            string
+	ClerkUserID    string
 	KeyIDHex       string
 	IfMatch        string
 	CreatedVia     string
@@ -645,7 +669,7 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) (*Regi
 	if err != nil {
 		return nil, err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/json")
 	if req.IfMatch != "" {
 		httpReq.Header.Set(HeaderIfMatch, req.IfMatch)
@@ -676,6 +700,7 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) (*Regi
 
 type AddBundleRequest struct {
 	JWT            string
+	ClerkUserID    string
 	KeyIDHex       string
 	CredentialID   string
 	KEKIV          string
@@ -712,7 +737,7 @@ func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
 	if err != nil {
 		return err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/json")
 	if req.IdempotencyKey != "" {
 		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
@@ -734,6 +759,7 @@ func (c *Client) AddBundle(ctx context.Context, req AddBundleRequest) error {
 
 type RemoveBundleRequest struct {
 	JWT            string
+	ClerkUserID    string
 	KeyIDHex       string
 	CredentialID   string
 	IdempotencyKey string
@@ -752,7 +778,7 @@ func (c *Client) RemoveBundle(ctx context.Context, req RemoveBundleRequest) erro
 	if err != nil {
 		return err
 	}
-	c.addAuth(httpReq, req.JWT)
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	if req.IdempotencyKey != "" {
 		httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
 	}
@@ -822,7 +848,7 @@ type LegacyAttachmentResponse struct {
 	Claim      string
 }
 
-func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID string) (LegacyAttachmentResponse, error) {
+func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, clerkUserID, attachmentID string) (LegacyAttachmentResponse, error) {
 	if attachmentID == "" {
 		return LegacyAttachmentResponse{}, fmt.Errorf("controlplane: attachment id is required")
 	}
@@ -831,7 +857,7 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID stri
 	if err != nil {
 		return LegacyAttachmentResponse{}, err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return LegacyAttachmentResponse{}, err
@@ -864,10 +890,11 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, attachmentID stri
 // owned by this user, in v2 format." JWT is forwarded so the
 // controlplane resolves the user from claims, exactly like every
 // other sync route.
-func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID, chatID string) error {
+func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, clerkUserID, attachmentID, chatID string) error {
 	return c.postAttachmentChatID(
 		ctx,
 		jwt,
+		clerkUserID,
 		attachmentID,
 		chatID,
 		"/api/sync/attachment-index/",
@@ -875,7 +902,7 @@ func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, attachmentID,
 	)
 }
 
-func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID string) error {
+func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, clerkUserID, attachmentID string) error {
 	if attachmentID == "" {
 		return fmt.Errorf("controlplane: attachment id is required")
 	}
@@ -884,7 +911,7 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 	if err != nil {
 		return err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
 		return err
@@ -905,10 +932,11 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, attachmentID st
 // upload don't proliferate guard rows. The companion call
 // RegisterAttachmentIndex clears the row inside the same DB
 // transaction; the sweeper drains anything that times out.
-func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachmentID, chatID string) error {
+func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, clerkUserID, attachmentID, chatID string) error {
 	return c.postAttachmentChatID(
 		ctx,
 		jwt,
+		clerkUserID,
 		attachmentID,
 		chatID,
 		"/api/sync/pending-attachments/",
@@ -923,7 +951,7 @@ func (c *Client) ReservePendingAttachmentWrite(ctx context.Context, jwt, attachm
 // can't drift in headers, auth, or success-body handling.
 func (c *Client) postAttachmentChatID(
 	ctx context.Context,
-	jwt, attachmentID, chatID, pathPrefix, opLabel string,
+	jwt, clerkUserID, attachmentID, chatID, pathPrefix, opLabel string,
 ) error {
 	if attachmentID == "" {
 		return fmt.Errorf("controlplane: attachment id is required")
@@ -942,7 +970,7 @@ func (c *Client) postAttachmentChatID(
 	if err != nil {
 		return err
 	}
-	c.addAuth(httpReq, jwt)
+	c.addAuth(httpReq, jwt, clerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/json")
 	resp, err := c.doRequest(httpReq)
 	if err != nil {

@@ -28,6 +28,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"HeaderProjectIDSet":  {HeaderProjectIDSet, "X-Project-Id-Set"},
 			"HeaderETag":          {HeaderETag, "ETag"},
 			"HeaderLegacyClaim":   {HeaderLegacyClaim, "X-Legacy-Claim"},
+			"HeaderClerkUserID":   {HeaderClerkUserID, "X-Clerk-User-Id"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {
