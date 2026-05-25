@@ -73,6 +73,8 @@ func ShareSeal(ctx context.Context, deps Deps, sess Session, req ShareSealReques
 		return nil, badRequest("invalid plaintext base64")
 	}
 	defer cryptopkg.Zero(plaintext)
+	deps.logInfo("share seal begin: user=%s plaintext_bytes=%d",
+		sess.Claims.Subject, len(plaintext))
 	// Mirror ShareOpen's decompression cap at seal time; otherwise
 	// this endpoint can mint shares that ShareOpen will then always
 	// reject as oversized, which is a silent footgun for the caller.
@@ -94,8 +96,12 @@ func ShareSeal(ctx context.Context, deps Deps, sess Session, req ShareSealReques
 
 	ct, err := seal(key, compressed)
 	if err != nil {
+		deps.logError("share seal failed: user=%s err=%v",
+			sess.Claims.Subject, err)
 		return nil, &AppError{Status: http.StatusInternalServerError, Code: CodeInternal, Message: "seal: " + err.Error()}
 	}
+	deps.logInfo("share seal ok: user=%s ciphertext_bytes=%d",
+		sess.Claims.Subject, len(ct))
 
 	return &ShareSealResponse{
 		OK:         true,
@@ -119,17 +125,23 @@ func ShareOpen(ctx context.Context, deps Deps, req ShareOpenRequest) (*ShareOpen
 		return nil, badRequest("invalid ciphertext base64")
 	}
 
+	deps.logInfo("share open begin: ciphertext_bytes=%d", len(ct))
+
 	compressed, err := open(key, ct)
 	if err != nil {
+		deps.logError("share open decrypt failed: err=%v", err)
 		return nil, &AppError{Status: http.StatusBadRequest, Code: CodeBadRequest, Message: "share decrypt failed"}
 	}
 	defer cryptopkg.Zero(compressed)
 
 	plaintext, err := gunzipBytes(compressed)
 	if err != nil {
+		deps.logError("share open decompress failed: err=%v", err)
 		return nil, &AppError{Status: http.StatusBadRequest, Code: CodeBadRequest, Message: "share decompress failed"}
 	}
 	defer cryptopkg.Zero(plaintext)
+
+	deps.logInfo("share open ok: plaintext_bytes=%d", len(plaintext))
 
 	return &ShareOpenResponse{
 		OK:        true,
