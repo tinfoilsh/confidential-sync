@@ -814,15 +814,35 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 
 	out := &MigrateResponse{}
 	for _, id := range ids {
+		// Bail before touching CP if the run is being torn down (the
+		// detached migration job hit its budget, the enclave is
+		// shutting down, etc). Without this guard the loop would
+		// stamp every remaining id as "blocked" with a canceled
+		// fetch, burning the 24h cooldown on rows we never actually
+		// attempted.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			deps.logInfo("migrate cancellation observed: user=%s scope=%s processed=%d remaining=%d err=%v",
+				sess.Claims.Subject, scope, out.Migrated+len(out.Blocked), len(ids)-(out.Migrated+len(out.Blocked)), ctxErr)
+			break
+		}
 		ok := migrateOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex)
 		if ok {
 			out.Migrated++
-		} else {
-			out.Blocked = append(out.Blocked, id)
-			if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject); err != nil {
-				deps.logError("migrate record-failure failed: user=%s scope=%s id=%s err=%v",
-					sess.Claims.Subject, scope, id, err)
-			}
+			continue
+		}
+		// migrateOne returned false. If that was because ctx was
+		// cancelled mid-fetch (rather than a real decrypt/rewrap
+		// failure), don't record a migration failure or count the
+		// row as blocked — the row stays retryable.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			deps.logInfo("migrate cancellation observed mid-item: user=%s scope=%s id=%s err=%v",
+				sess.Claims.Subject, scope, id, ctxErr)
+			break
+		}
+		out.Blocked = append(out.Blocked, id)
+		if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject); err != nil {
+			deps.logError("migrate record-failure failed: user=%s scope=%s id=%s err=%v",
+				sess.Claims.Subject, scope, id, err)
 		}
 	}
 
@@ -861,7 +881,23 @@ const (
 	migrateAllScopeMaxBatch  = 200
 )
 
+// migrationProgressReporter is the seam between MigrateAll and the
+// background MigrationJob. The job snapshots state for HTTP polling
+// from these callbacks; passing nil disables reporting (used by
+// tests and the legacy synchronous MigrateAll entrypoint).
+type migrationProgressReporter interface {
+	reportScope(MigrateAllScopeReport)
+	markPartial()
+}
+
+// MigrateAll preserves the legacy synchronous signature for tests
+// and any direct callers; production traffic goes through the
+// background coordinator, which calls migrateAllWithProgress.
 func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequest) (*MigrateAllResponse, error) {
+	return migrateAllWithProgress(ctx, deps, sess, req, nil)
+}
+
+func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req MigrateAllRequest, progress migrationProgressReporter) (*MigrateAllResponse, error) {
 	if len(req.Keys) == 0 {
 		return nil, badRequest("keys is required and must not be empty")
 	}
@@ -893,8 +929,20 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 		pages := 0
 
 		for {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				out.Partial = true
+				if progress != nil {
+					progress.markPartial()
+				}
+				deps.logInfo("migrate-all context done: user=%s scope=%s pages=%d err=%v",
+					sess.Claims.Subject, scope, pages, ctxErr)
+				break
+			}
 			if time.Now().After(deadline) {
 				out.Partial = true
+				if progress != nil {
+					progress.markPartial()
+				}
 				deps.logInfo("migrate-all budget exhausted: user=%s scope=%s pages=%d",
 					sess.Claims.Subject, scope, pages)
 				break
@@ -902,6 +950,9 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 			budgetLeft := time.Until(deadline)
 			if budgetLeft <= 0 {
 				out.Partial = true
+				if progress != nil {
+					progress.markPartial()
+				}
 				deps.logInfo("migrate-all budget exhausted: user=%s scope=%s pages=%d",
 					sess.Claims.Subject, scope, pages)
 				break
@@ -926,6 +977,9 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 					deps.logError("migrate-all auth failed mid-loop, aborting: user=%s scope=%s page=%d err=%v",
 						sess.Claims.Subject, scope, pages, err)
 					out.Partial = true
+					if progress != nil {
+						progress.markPartial()
+					}
 					break
 				}
 				deps.logError("migrate-all page failed: user=%s scope=%s page=%d err=%v",
@@ -940,6 +994,9 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 			}
 			report.RetryableRemaining = page.RetryableRemaining
 			report.BlockedUnmigrated = page.BlockedUnmigrated
+			if progress != nil {
+				progress.reportScope(cloneScopeReport(report))
+			}
 
 			if page.Migrated == 0 || page.RetryableRemaining == 0 {
 				break
@@ -963,6 +1020,14 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 		sess.Claims.Subject, out.Migrated, out.RetryableRemaining, out.BlockedUnmigrated, out.Partial)
 
 	return out, nil
+}
+
+func cloneScopeReport(in MigrateAllScopeReport) MigrateAllScopeReport {
+	out := in
+	if len(in.Blocked) > 0 {
+		out.Blocked = append([]string(nil), in.Blocked...)
+	}
+	return out
 }
 
 // ensureCurrentKeyRegistered guarantees the user has a primary key on

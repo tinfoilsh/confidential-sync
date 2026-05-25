@@ -24,9 +24,10 @@ const MaxRequestBytes = 64 << 20
 const AttachmentRequestTimeout = 5 * time.Minute
 
 type Handler struct {
-	deps     Deps
-	verifier auth.Verifier
-	logger   Logger
+	deps        Deps
+	verifier    auth.Verifier
+	logger      Logger
+	coordinator *MigrationCoordinator
 }
 
 type Logger interface {
@@ -35,7 +36,12 @@ type Logger interface {
 }
 
 func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
-	return &Handler{deps: deps, verifier: verifier, logger: logger}
+	return &Handler{
+		deps:        deps,
+		verifier:    verifier,
+		logger:      logger,
+		coordinator: NewMigrationCoordinator(),
+	}
 }
 
 // routeSpec ties one HTTP route's wire-level path to the handler
@@ -61,9 +67,13 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/key/current", func(h *Handler) http.Handler { return h.authMiddleware(h.keyCurrent) }},
 
 		{"POST", "/v1/blobs/migrate", func(h *Handler) http.Handler { return h.authMiddleware(h.migrate) }},
-		{"POST", "/v1/blobs/migrate-all", func(h *Handler) http.Handler {
-			return h.authMiddlewareWithTimeout(h.migrateAll, MigrateAllRequestTimeout)
-		}},
+		// Migrate-all kicks off a detached background job and
+		// returns immediately so the webapp tab closing mid-call
+		// can no longer kill the loop. The handler runs under the
+		// regular auth timeout because it only mutates in-memory
+		// coordinator state before returning.
+		{"POST", "/v1/blobs/migrate-all", func(h *Handler) http.Handler { return h.authMiddleware(h.migrateAll) }},
+		{"POST", "/v1/blobs/migrate-status", func(h *Handler) http.Handler { return h.authMiddleware(h.migrateStatus) }},
 
 		{"POST", "/v1/attachment/put", func(h *Handler) http.Handler {
 			return h.authMiddlewareWithTimeout(h.attachmentPut, AttachmentRequestTimeout)
@@ -335,12 +345,32 @@ func (h *Handler) migrateAll(w http.ResponseWriter, r *http.Request, sess Sessio
 		writeError(w, err)
 		return
 	}
-	resp, err := MigrateAll(r.Context(), h.deps, sess, req)
-	if err != nil {
+	// Synchronous validation: the kickoff returns 202/200 with an
+	// async job id, so anything that would have failed the legacy
+	// synchronous handler — empty/malformed keys, wrong key length —
+	// has to surface as a 400 here rather than ten seconds later as
+	// a "failed" status payload nobody is polling for yet.
+	if err := validateMigrateAllRequest(req); err != nil {
 		writeError(w, err)
 		return
 	}
-	encode(w, http.StatusOK, resp)
+
+	job, started := h.coordinator.StartOrGet(r.Context(), h.deps, sess, req)
+	resp := buildMigrateAllStatusResponse(job)
+	status := http.StatusOK
+	if started {
+		status = http.StatusAccepted
+	}
+	encode(w, status, resp)
+}
+
+func (h *Handler) migrateStatus(w http.ResponseWriter, r *http.Request, sess Session) {
+	job := h.coordinator.Status(sess.Claims.Subject)
+	if job == nil {
+		encode(w, http.StatusOK, MigrateAllStatusResponse{Status: string(MigrationJobIdle)})
+		return
+	}
+	encode(w, http.StatusOK, buildMigrateAllStatusResponse(job))
 }
 
 func (h *Handler) attachmentPut(w http.ResponseWriter, r *http.Request, sess Session) {
