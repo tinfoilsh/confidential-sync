@@ -94,6 +94,7 @@ func rewrapBlob(
 		Scope:          string(scope),
 		ID:             id,
 		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
 		KeyIDHex:       targetKIDHex,
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
@@ -252,7 +253,7 @@ func promoteOneAttachment(
 	}
 	deps.logInfo("attachment promote begin: user=%s chat=%s att=%s",
 		sess.Claims.Subject, chatID, attID)
-	resp, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, attID)
+	resp, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, sess.Claims.Subject, attID)
 	if err != nil {
 		if errors.Is(err, controlplane.ErrLegacyAttachmentNotFound) {
 			deps.logInfo("attachment promote skip not-found: user=%s chat=%s att=%s",
@@ -286,7 +287,7 @@ func promoteOneAttachment(
 	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
 		return fmt.Errorf("rewrap: promote attachment %s to buckets: %w", attID, err)
 	}
-	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, attID, chatID); err != nil {
+	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, sess.Claims.Subject, attID, chatID); err != nil {
 		// buckets PUT succeeded but index update failed — the bytes
 		// are present, controlplane just hasn't been told they're
 		// v2 yet. A subsequent rewrap pass will retry the register

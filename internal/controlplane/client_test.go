@@ -166,7 +166,7 @@ func TestGetBlobReturnsCiphertextAndHeaders(t *testing.T) {
 		w.Write([]byte("opaque-bytes"))
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.GetBlob(context.Background(), "chat", "chat_1", "j")
+	resp, err := c.GetBlob(context.Background(), "chat", "chat_1", "j", "user_x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestListStatusEncodesQuery(t *testing.T) {
 		})
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j", "proj_1")
+	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j", "user_x", "proj_1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestProjectDocumentRouting(t *testing.T) {
 		w.Write([]byte("doc-blob"))
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.GetBlob(context.Background(), "project_document", "proj_1/doc_2", "j")
+	resp, err := c.GetBlob(context.Background(), "project_document", "proj_1/doc_2", "j", "user_x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestGetCurrentKeyNotFound(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.GetCurrentKey(context.Background(), "j")
+	resp, err := c.GetCurrentKey(context.Background(), "j", "user_x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestGetLegacyAttachmentRejectsOversizedBody(t *testing.T) {
 		_, _ = io.Copy(w, io.LimitReader(repeatingReader('x'), int64(maxLegacyAttachmentBytes+1)))
 	})
 	c := NewClient(st.server.URL, nil)
-	_, err := c.GetLegacyAttachment(context.Background(), "j", "att_1")
+	_, err := c.GetLegacyAttachment(context.Background(), "j", "user_x", "att_1")
 	if err == nil || !strings.Contains(err.Error(), "legacy attachment exceeds") {
 		t.Fatalf("expected oversized attachment error, got %v", err)
 	}
@@ -329,7 +329,7 @@ func TestGetLegacyAttachmentMapsNotFound(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	c := NewClient(st.server.URL, nil)
-	_, err := c.GetLegacyAttachment(context.Background(), "j", "missing")
+	_, err := c.GetLegacyAttachment(context.Background(), "j", "user_x", "missing")
 	if !errors.Is(err, ErrLegacyAttachmentNotFound) {
 		t.Fatalf("expected ErrLegacyAttachmentNotFound, got %v", err)
 	}
@@ -347,7 +347,7 @@ func TestDeleteAttachmentIndex(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
-	if err := c.DeleteAttachmentIndex(context.Background(), "test-jwt", "att_1"); err != nil {
+	if err := c.DeleteAttachmentIndex(context.Background(), "test-jwt", "user_x", "att_1"); err != nil {
 		t.Fatalf("delete attachment index: %v", err)
 	}
 }
@@ -375,45 +375,50 @@ func cpErrAs(err error, target **Error) bool {
 	return true
 }
 
-func TestAddAuthStampsClerkUserIDFromJWT(t *testing.T) {
+func TestAddAuthStampsClerkUserIDFromCaller(t *testing.T) {
 	st := newStub(t)
 	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get(HeaderClerkUserID); got != "user_abc123" {
 			t.Errorf("clerk-user-id header: %q, want %q", got, "user_abc123")
 		}
-		w.WriteHeader(http.StatusNoContent)
-	})
-	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
-	jwt := makeUnsignedJWT(t, map[string]any{"sub": "user_abc123"})
-	if err := c.DeleteAttachmentIndex(context.Background(), jwt, "att_1"); err != nil {
-		t.Fatalf("delete attachment index: %v", err)
-	}
-}
-
-func TestAddAuthOmitsClerkUserIDWhenJWTMalformed(t *testing.T) {
-	st := newStub(t)
-	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get(HeaderClerkUserID); got != "" {
-			t.Errorf("clerk-user-id header on malformed jwt: %q, want empty", got)
+		if got := r.Header.Get("Authorization"); got != "Bearer arbitrary-jwt" {
+			t.Errorf("authorization header: %q", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
-	if err := c.DeleteAttachmentIndex(context.Background(), "not-a-jwt", "att_1"); err != nil {
+	if err := c.DeleteAttachmentIndex(context.Background(), "arbitrary-jwt", "user_abc123", "att_1"); err != nil {
 		t.Fatalf("delete attachment index: %v", err)
 	}
 }
 
-func makeUnsignedJWT(t *testing.T, claims map[string]any) string {
-	t.Helper()
-	header, err := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
-	if err != nil {
-		t.Fatalf("marshal header: %v", err)
+func TestAddAuthOmitsClerkUserIDWhenCallerOmitsIt(t *testing.T) {
+	st := newStub(t)
+	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderClerkUserID); got != "" {
+			t.Errorf("clerk-user-id header without explicit subject: %q, want empty", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	if err := c.DeleteAttachmentIndex(context.Background(), "arbitrary-jwt", "", "att_1"); err != nil {
+		t.Fatalf("delete attachment index: %v", err)
 	}
-	body, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
+}
+
+func TestAddAuthIgnoresJWTPayloadForUserID(t *testing.T) {
+	st := newStub(t)
+	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderClerkUserID); got != "user_real" {
+			t.Errorf("clerk-user-id header must come from the caller-supplied verified subject, got %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	body := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user_spoofed"}`))
+	maliciousJWT := header + "." + body + ".sig"
+	if err := c.DeleteAttachmentIndex(context.Background(), maliciousJWT, "user_real", "att_1"); err != nil {
+		t.Fatalf("delete attachment index: %v", err)
 	}
-	enc := base64.RawURLEncoding.EncodeToString
-	return enc(header) + "." + enc(body) + ".sig"
 }

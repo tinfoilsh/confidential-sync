@@ -218,7 +218,7 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 	// reservation itself fails (CP unreachable) we surface immediately
 	// rather than risk a buckets write the sweeper can never see; the
 	// caller retries the whole upload. Idempotent on retry.
-	if err := deps.Controlplane.ReservePendingAttachmentWrite(ctx, sess.RawJWT, id, req.ChatID); err != nil {
+	if err := deps.Controlplane.ReservePendingAttachmentWrite(ctx, sess.RawJWT, sess.Claims.Subject, id, req.ChatID); err != nil {
 		deps.logError("attachment put reserve failed: user=%s chat=%s att=%s err=%v",
 			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane reserve failed: " + err.Error()}
@@ -228,7 +228,7 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets put failed: " + err.Error()}
 	}
-	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, id, req.ChatID); err != nil {
+	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, sess.Claims.Subject, id, req.ChatID); err != nil {
 		// Only roll back when we have a structured 4xx response from
 		// the controlplane — that's the one signal that proves the
 		// index row was NOT committed. Transport errors, context
@@ -341,7 +341,7 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	// which is what stops an authenticated attacker from
 	// weaponizing the bucket-delete path against victim ids they
 	// might have observed in a shared chat.
-	if err := deps.Controlplane.DeleteAttachmentIndex(ctx, sess.RawJWT, req.ID); err != nil {
+	if err := deps.Controlplane.DeleteAttachmentIndex(ctx, sess.RawJWT, sess.Claims.Subject, req.ID); err != nil {
 		var cpe *controlplane.Error
 		if errors.As(err, &cpe) && cpe.StatusCode == 404 {
 			deps.logInfo("attachment delete not-found: user=%s att=%s",
