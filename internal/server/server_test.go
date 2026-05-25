@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -1215,5 +1217,29 @@ func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	}
 	if bytes.Equal(shiftedA_Key, shiftedB_Key) {
 		t.Fatal("delimiter ambiguity: shifting bytes across field boundary derived the same key")
+	}
+}
+
+func TestIsAuthError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain error", errors.New("boom"), false},
+		{"controlplane 401", &controlplane.Error{StatusCode: http.StatusUnauthorized}, true},
+		{"controlplane 403", &controlplane.Error{StatusCode: http.StatusForbidden}, true},
+		{"controlplane 409", &controlplane.Error{StatusCode: http.StatusConflict}, false},
+		{"controlplane 500", &controlplane.Error{StatusCode: http.StatusInternalServerError}, false},
+		{"wrapped 401", fmt.Errorf("rewrap: %w", &controlplane.Error{StatusCode: http.StatusUnauthorized}), true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAuthError(tc.err); got != tc.want {
+				t.Errorf("isAuthError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

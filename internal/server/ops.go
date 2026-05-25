@@ -911,6 +911,18 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 			})
 			cancel()
 			if err != nil {
+				// Auth-layer failures (user JWT expired without
+				// service-auth fallback, missing enclave secret,
+				// rotated keys) will hit every subsequent call
+				// the same way. Surface Partial=true so the
+				// client retries with a fresh token instead of
+				// burning the loop on a thousand 401s.
+				if isAuthError(err) {
+					deps.logError("migrate-all auth failed mid-loop, aborting: user=%s scope=%s page=%d err=%v",
+						sess.Claims.Subject, scope, pages, err)
+					out.Partial = true
+					break
+				}
 				deps.logError("migrate-all page failed: user=%s scope=%s page=%d err=%v",
 					sess.Claims.Subject, scope, pages, err)
 				return nil, err
@@ -1034,6 +1046,18 @@ func ensureCurrentKeyRegistered(
 		deleteBucketAttachments(ctx, deps, resp.WipedV2Attachments)
 	}
 	return nil
+}
+
+// isAuthError reports whether err originates from a 401/403 from
+// controlplane. Used to abort the migrate-all loop cleanly instead of
+// hammering CP once the auth chain has broken (expired user JWT,
+// missing service secret, rotated keys).
+func isAuthError(err error) bool {
+	var cpe *controlplane.Error
+	if !errors.As(err, &cpe) {
+		return false
+	}
+	return cpe.StatusCode == http.StatusUnauthorized || cpe.StatusCode == http.StatusForbidden
 }
 
 func migrateOne(
