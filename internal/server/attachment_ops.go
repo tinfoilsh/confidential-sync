@@ -211,14 +211,21 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 	}
 	defer cryptopkg.Zero(attKey)
 
+	deps.logInfo("attachment put begin: user=%s chat=%s att=%s plaintext_bytes=%d",
+		sess.Claims.Subject, req.ChatID, id, len(plaintext))
+
 	// Stamp the pending-write guard before touching buckets. If the
 	// reservation itself fails (CP unreachable) we surface immediately
 	// rather than risk a buckets write the sweeper can never see; the
 	// caller retries the whole upload. Idempotent on retry.
 	if err := deps.Controlplane.ReservePendingAttachmentWrite(ctx, sess.RawJWT, id, req.ChatID); err != nil {
+		deps.logError("attachment put reserve failed: user=%s chat=%s att=%s err=%v",
+			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane reserve failed: " + err.Error()}
 	}
 	if err := deps.Buckets.Put(ctx, id, plaintext, attKey); err != nil {
+		deps.logError("attachment put buckets failed: user=%s chat=%s att=%s err=%v",
+			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets put failed: " + err.Error()}
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, id, req.ChatID); err != nil {
@@ -232,6 +239,8 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 		// path for those ambiguous cases — it cross-checks the
 		// controlplane index of record before reaping any bucket.
 		if isControlplaneRejection(err) {
+			deps.logError("attachment put index rejected, rolling back buckets: user=%s chat=%s att=%s err=%v",
+				sess.Claims.Subject, req.ChatID, id, err)
 			// Detach from the request context so a client cancellation
 			// does not also skip the cleanup it triggered, but enforce
 			// a fresh bounded deadline so a hung buckets backend
@@ -241,9 +250,14 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 				defer cancel()
 				_ = deps.Buckets.Delete(rollbackCtx, id)
 			}()
+		} else {
+			deps.logError("attachment put index failed (ambiguous, deferring to reaper): user=%s chat=%s att=%s err=%v",
+				sess.Claims.Subject, req.ChatID, id, err)
 		}
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane index failed: " + err.Error()}
 	}
+	deps.logInfo("attachment put ok: user=%s chat=%s att=%s",
+		sess.Claims.Subject, req.ChatID, id)
 	return &AttachmentPutResponse{
 		OK:     true,
 		ID:     id,
@@ -280,17 +294,22 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 		return nil, badRequest("att_key must be 32 bytes")
 	}
 
+	deps.logInfo("attachment get begin: att=%s", req.ID)
 	plaintext, err := deps.Buckets.Get(ctx, req.ID, attKey)
 	if err != nil {
 		if errors.Is(err, buckets.ErrNotFound) {
+			deps.logInfo("attachment get not-found: att=%s", req.ID)
 			return nil, &AppError{Status: 404, Code: CodeNotFound, Message: "attachment not found"}
 		}
 		if errors.Is(err, buckets.ErrForbidden) {
+			deps.logInfo("attachment get forbidden (key mismatch): att=%s", req.ID)
 			return nil, badRequest("attachment key does not match")
 		}
+		deps.logError("attachment get failed: att=%s err=%v", req.ID, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets get failed: " + err.Error()}
 	}
 	defer cryptopkg.Zero(plaintext)
+	deps.logInfo("attachment get ok: att=%s plaintext_bytes=%d", req.ID, len(plaintext))
 	return &AttachmentGetResponse{
 		OK:        true,
 		Plaintext: base64.StdEncoding.EncodeToString(plaintext),
@@ -315,6 +334,8 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	if req.ID == "" {
 		return nil, badRequest("id is required")
 	}
+	deps.logInfo("attachment delete begin: user=%s att=%s",
+		sess.Claims.Subject, req.ID)
 	// Controlplane delete runs first because it is the ownership
 	// check: it rejects callers who don't own the attachment id,
 	// which is what stops an authenticated attacker from
@@ -323,8 +344,12 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	if err := deps.Controlplane.DeleteAttachmentIndex(ctx, sess.RawJWT, req.ID); err != nil {
 		var cpe *controlplane.Error
 		if errors.As(err, &cpe) && cpe.StatusCode == 404 {
+			deps.logInfo("attachment delete not-found: user=%s att=%s",
+				sess.Claims.Subject, req.ID)
 			return nil, &AppError{Status: 404, Code: CodeNotFound, Message: "attachment not found"}
 		}
+		deps.logError("attachment delete index failed: user=%s att=%s err=%v",
+			sess.Claims.Subject, req.ID, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane attachment delete failed: " + err.Error()}
 	}
 	// The bucket delete must succeed for the user's "delete this
@@ -336,8 +361,12 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	// controlplane index is already gone still cleans up safely.
 	if deps.Buckets != nil && deps.Buckets.Configured() {
 		if err := deps.Buckets.Delete(ctx, req.ID); err != nil {
+			deps.logError("attachment delete buckets failed: user=%s att=%s err=%v",
+				sess.Claims.Subject, req.ID, err)
 			return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets attachment delete failed: " + err.Error()}
 		}
 	}
+	deps.logInfo("attachment delete ok: user=%s att=%s",
+		sess.Claims.Subject, req.ID)
 	return &OKResponse{OK: true}, nil
 }

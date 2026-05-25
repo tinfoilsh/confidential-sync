@@ -75,14 +75,16 @@ func main() {
 		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / BUCKETS_API_KEY unset); attachment routes will return 503")
 	}
 
+	logger := stdLogger{}
 	deps := server.Deps{
 		Controlplane:      cpClient,
 		Buckets:           bucketsClient,
 		GitSHA:            gitSHA,
 		SyncEnclaveSecret: syncEnclaveSecret,
+		Logger:            logger,
 	}
-	handler := server.NewHandler(deps, verifier, stdLogger{})
-	server.StartAttachmentOrphanReaper(ctx, deps, stdLogger{})
+	handler := server.NewHandler(deps, verifier, logger)
+	server.StartAttachmentOrphanReaper(ctx, deps, logger)
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to

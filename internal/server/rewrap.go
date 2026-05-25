@@ -50,10 +50,15 @@ func rewrapBlob(
 	targetKey []byte,
 	targetKIDHex string,
 ) (string, error) {
+	deps.logInfo("rewrap begin: user=%s scope=%s id=%s target_kid=%s prior_etag=%s",
+		sess.Claims.Subject, scope, id, targetKIDHex, priorETag)
+
 	finalPlaintext := plaintext
 	if scope == envelope.ScopeChat {
 		mutated, err := rewrapChatAttachments(ctx, deps, sess, id, plaintext)
 		if err != nil {
+			deps.logError("rewrap chat attachments failed: user=%s id=%s err=%v",
+				sess.Claims.Subject, id, err)
 			return "", err
 		}
 		if mutated != nil {
@@ -102,8 +107,12 @@ func rewrapBlob(
 	})
 	resp, err := deps.Controlplane.PutBlob(ctx, rewrapReq)
 	if err != nil {
+		deps.logError("rewrap put failed: user=%s scope=%s id=%s target_kid=%s err=%v",
+			sess.Claims.Subject, scope, id, targetKIDHex, err)
 		return "", err
 	}
+	deps.logInfo("rewrap ok: user=%s scope=%s id=%s target_kid=%s new_etag=%s",
+		sess.Claims.Subject, scope, id, targetKIDHex, resp.ETag)
 	return resp.ETag, nil
 }
 
@@ -157,6 +166,8 @@ func rewrapChatAttachments(
 	// the next read can no longer satisfy.
 	var promoteErrs []error
 	fieldNormalized := false
+	candidates := 0
+	promoted := 0
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -184,15 +195,24 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
+			candidates++
 			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
+				deps.logError("rewrap attachment promote failed: user=%s chat=%s att=%s legacy_field=%t err=%v",
+					sess.Claims.Subject, chatID, rawID, keyFromLegacyField, err)
 				promoteErrs = append(promoteErrs, err)
 				continue
 			}
+			promoted++
 			if keyFromLegacyField {
 				att["encryptionKey"] = rawKey
 				fieldNormalized = true
 			}
 		}
+	}
+
+	if candidates > 0 {
+		deps.logInfo("rewrap attachments scanned: user=%s chat=%s candidates=%d promoted=%d errors=%d field_normalized=%t",
+			sess.Claims.Subject, chatID, candidates, promoted, len(promoteErrs), fieldNormalized)
 	}
 
 	if len(promoteErrs) > 0 {
@@ -221,11 +241,13 @@ func promoteOneAttachment(
 	if !deps.Buckets.Configured() {
 		return errors.New("rewrap: buckets backend not configured")
 	}
+	deps.logInfo("attachment promote begin: user=%s chat=%s att=%s",
+		sess.Claims.Subject, chatID, attID)
 	resp, err := deps.Controlplane.GetLegacyAttachment(ctx, sess.RawJWT, attID)
 	if err != nil {
 		if errors.Is(err, controlplane.ErrLegacyAttachmentNotFound) {
-			// already migrated by a concurrent pass, or the row was
-			// dropped — there is nothing to promote.
+			deps.logInfo("attachment promote skip not-found: user=%s chat=%s att=%s",
+				sess.Claims.Subject, chatID, attID)
 			return nil
 		}
 		return fmt.Errorf("rewrap: fetch legacy attachment %s: %w", attID, err)
@@ -249,6 +271,8 @@ func promoteOneAttachment(
 		return fmt.Errorf("rewrap: decrypt legacy attachment %s: %w", attID, err)
 	}
 	defer cryptopkg.Zero(plaintext)
+	deps.logInfo("attachment promote decrypted: user=%s chat=%s att=%s ciphertext_bytes=%d plaintext_bytes=%d",
+		sess.Claims.Subject, chatID, attID, len(resp.Ciphertext), len(plaintext))
 
 	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
 		return fmt.Errorf("rewrap: promote attachment %s to buckets: %w", attID, err)
@@ -260,6 +284,8 @@ func promoteOneAttachment(
 		// (Put is idempotent on the same id+key).
 		return fmt.Errorf("rewrap: register attachment index %s: %w", attID, err)
 	}
+	deps.logInfo("attachment promote ok: user=%s chat=%s att=%s",
+		sess.Claims.Subject, chatID, attID)
 	return nil
 }
 
@@ -277,15 +303,21 @@ func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
 	if !deps.Buckets.Configured() {
 		return
 	}
+	if len(ids) == 0 {
+		return
+	}
+	deps.logInfo("buckets cleanup begin: count=%d", len(ids))
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsDeleteCleanupTimeout)
 	defer cancel()
+	deleted := 0
 	for _, attID := range ids {
-		// Buckets Delete is idempotent on 404 (legacy v1 rows that
-		// were never promoted to buckets simply aren't there).
-		// Issuing the call is cheaper than figuring out
-		// per-attachment which generation it's on.
-		_ = deps.Buckets.Delete(cleanupCtx, attID)
+		if err := deps.Buckets.Delete(cleanupCtx, attID); err != nil {
+			deps.logError("buckets cleanup failed: att=%s err=%v", attID, err)
+			continue
+		}
+		deleted++
 	}
+	deps.logInfo("buckets cleanup done: requested=%d deleted=%d", len(ids), deleted)
 }
 
 // legacyAttachmentClaimPayload is the canonical JSON the enclave HMACs
