@@ -67,10 +67,19 @@ func rewrapBlob(
 		}
 	}
 
+	// Profile blobs are keyed by clerk_user_id on the controlplane,
+	// so CP's needs-migration list returns the user id as the row id.
+	// The crypto envelope, however, pins the AAD id to the canonical
+	// profile-singleton constant; if we forwarded CP's storage id we
+	// would build an AAD the next read could never reproduce.
+	aadID := id
+	if scope == envelope.ScopeProfile {
+		aadID = envelope.ProfileSingletonID
+	}
 	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
 		KeyIDHex:    targetKIDHex,
 		Scope:       scope,
-		ID:          id,
+		ID:          aadID,
 		ClerkUserID: sess.Claims.Subject,
 	})
 	if err != nil {
