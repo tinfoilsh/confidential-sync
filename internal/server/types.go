@@ -206,6 +206,25 @@ type MigrateAllResponse struct {
 	Scopes             []MigrateAllScopeReport `json:"scopes"`
 }
 
+// MigrateAllStatusResponse is what /v1/blobs/migrate-all and
+// /v1/blobs/migrate-status return. It is a strict superset of
+// MigrateAllResponse so existing clients that only inspect
+// migrated/retryable_remaining/partial keep working: while the
+// background job is in flight Partial is held at true so the
+// webapp's drain loop keeps polling.
+type MigrateAllStatusResponse struct {
+	JobID              string                  `json:"job_id,omitempty"`
+	Status             string                  `json:"status"`
+	StartedAt          string                  `json:"started_at,omitempty"`
+	UpdatedAt          string                  `json:"updated_at,omitempty"`
+	Migrated           int                     `json:"migrated"`
+	RetryableRemaining int                     `json:"retryable_remaining"`
+	BlockedUnmigrated  int                     `json:"blocked_unmigrated"`
+	Partial            bool                    `json:"partial"`
+	Scopes             []MigrateAllScopeReport `json:"scopes"`
+	Error              string                  `json:"error,omitempty"`
+}
+
 type HealthResponse struct {
 	Status string `json:"status"`
 	GitSHA string `json:"git_sha,omitempty"`

@@ -30,6 +30,7 @@ shim:
     - /v1/key/current
     - /v1/blobs/migrate
     - /v1/blobs/migrate-all
+    - /v1/blobs/migrate-status
     - /v1/attachment/put
     - /v1/attachment/get
     - /v1/attachment/delete

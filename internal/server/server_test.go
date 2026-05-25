@@ -43,6 +43,7 @@ type fixture struct {
 	cpClient   *controlplane.Client
 	bk         *bucketsStub
 	server     *httptest.Server
+	handler    *Handler
 	userKey    []byte
 	userKeyID  string
 	userKeyB64 string
@@ -555,6 +556,9 @@ func newFixture(t *testing.T) *fixture {
 
 	deps := Deps{Controlplane: cpClient, Buckets: bkClient, GitSHA: "test-sha"}
 	handler := NewHandler(deps, v, nil)
+	// Shorten retention so migrate-all kickoff tests don't leak
+	// in-memory job state across cases.
+	handler.coordinator.retention = 50 * time.Millisecond
 	srv := httptest.NewServer(handler.Routes())
 	t.Cleanup(srv.Close)
 
@@ -576,6 +580,7 @@ func newFixture(t *testing.T) *fixture {
 		cpClient:   cpClient,
 		bk:         bk,
 		server:     srv,
+		handler:    handler,
 		userKey:    rawKey,
 		userKeyID:  kidHex,
 		userKeyB64: base64.StdEncoding.EncodeToString(rawKey),
