@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -372,4 +373,47 @@ func cpErrAs(err error, target **Error) bool {
 	}
 	*target = e
 	return true
+}
+
+func TestAddAuthStampsClerkUserIDFromJWT(t *testing.T) {
+	st := newStub(t)
+	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderClerkUserID); got != "user_abc123" {
+			t.Errorf("clerk-user-id header: %q, want %q", got, "user_abc123")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	jwt := makeUnsignedJWT(t, map[string]any{"sub": "user_abc123"})
+	if err := c.DeleteAttachmentIndex(context.Background(), jwt, "att_1"); err != nil {
+		t.Fatalf("delete attachment index: %v", err)
+	}
+}
+
+func TestAddAuthOmitsClerkUserIDWhenJWTMalformed(t *testing.T) {
+	st := newStub(t)
+	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderClerkUserID); got != "" {
+			t.Errorf("clerk-user-id header on malformed jwt: %q, want empty", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	if err := c.DeleteAttachmentIndex(context.Background(), "not-a-jwt", "att_1"); err != nil {
+		t.Fatalf("delete attachment index: %v", err)
+	}
+}
+
+func makeUnsignedJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header, err := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	body, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc(header) + "." + enc(body) + ".sig"
 }

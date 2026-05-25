@@ -76,6 +76,12 @@ const (
 	HeaderETag          = "ETag"
 	HeaderContentType   = "Content-Type"
 	HeaderServiceSecret = "X-Sync-Enclave-Secret"
+	// HeaderClerkUserID carries the user id the enclave already
+	// verified out of the user's JWT. Paired with HeaderServiceSecret
+	// it stands in for a fresh Clerk bearer token on the
+	// controlplane, so long migrations do not break when the proxied
+	// JWT expires mid-loop.
+	HeaderClerkUserID = "X-Clerk-User-Id"
 )
 
 const (
@@ -193,6 +199,36 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 
 func (c *Client) addAuth(req *http.Request, rawJWT string) {
 	req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	// The enclave verified this JWT at its own boundary, so the
+	// subject claim is trustworthy by the time we get here. Echo it
+	// to controlplane so the sync surface can accept the call via
+	// service auth and stop re-verifying a token that may expire
+	// before a long migration completes.
+	if sub := jwtSubjectUnverified(rawJWT); sub != "" {
+		req.Header.Set(HeaderClerkUserID, sub)
+	}
+}
+
+// jwtSubjectUnverified returns the `sub` claim from a JWT without
+// verifying the signature. Safe to use here because the caller has
+// already verified the token at the enclave entrypoint; we only need
+// the subject string to forward.
+func jwtSubjectUnverified(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Sub
 }
 
 func (c *Client) urlFor(scope, id string) (string, error) {
