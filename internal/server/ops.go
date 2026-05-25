@@ -864,6 +864,12 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 		return nil, badRequest("target.key is required")
 	}
 
+	if err := ensureCurrentKeyRegistered(ctx, deps, sess, req.Target.Key); err != nil {
+		deps.logError("migrate-all bootstrap current-key failed: user=%s err=%v",
+			sess.Claims.Subject, err)
+		return nil, err
+	}
+
 	deadline := time.Now().Add(MigrateAllBudget)
 	scopes := []envelope.Scope{
 		envelope.ScopeProfile,
@@ -940,6 +946,94 @@ func MigrateAll(ctx context.Context, deps Deps, sess Session, req MigrateAllRequ
 		sess.Claims.Subject, out.Migrated, out.RetryableRemaining, out.BlockedUnmigrated, out.Partial)
 
 	return out, nil
+}
+
+// ensureCurrentKeyRegistered guarantees the user has a primary key on
+// the controlplane before the migration loop runs. Without it, every
+// rewrap returns STALE_KEY because controlplane gates the CAS update
+// on current_key_id, and a freshly-arrived v2 user whose `user_keys`
+// row was never written would burn the whole migration on 409s.
+//
+// Idempotent. If a current key already exists the call is a no-op,
+// even when the existing key differs from the target — the caller's
+// subsequent rewraps will surface STALE_KEY and the client can drive
+// a key-rotation flow from there.
+func ensureCurrentKeyRegistered(
+	ctx context.Context,
+	deps Deps,
+	sess Session,
+	targetKeyB64 string,
+) error {
+	current, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT)
+	if err != nil {
+		return fmt.Errorf("inspect current key: %w", err)
+	}
+
+	targetBytes, err := decodeKey(targetKeyB64)
+	if err != nil {
+		return badRequest("invalid target.key: " + err.Error())
+	}
+	defer cryptopkg.Zero(targetBytes)
+
+	targetKIDBytes, err := cryptopkg.DeriveKeyID(targetBytes)
+	if err != nil {
+		return err
+	}
+	targetKIDHex := cryptopkg.KeyIDHex(targetKIDBytes)
+
+	if current != nil && current.KeyID != "" {
+		deps.logInfo("migrate-all bootstrap: user=%s current_kid=%s target_kid=%s",
+			sess.Claims.Subject, current.KeyID, targetKIDHex)
+		return nil
+	}
+
+	deps.logInfo("migrate-all bootstrap: user=%s no current key; registering target kid=%s",
+		sess.Claims.Subject, targetKIDHex)
+
+	idem := fmt.Sprintf("migrate-bootstrap:%s:%s", sess.Claims.Subject, targetKIDHex)
+	cpReq := controlplane.RegisterKeyRequest{
+		JWT:            sess.RawJWT,
+		KeyIDHex:       targetKIDHex,
+		IfMatch:        controlplane.IfMatchAnyKey,
+		CreatedVia:     "recovery",
+		IdempotencyKey: idem,
+	}
+	body, err := controlplane.RegisterKeyBody(cpReq)
+	if err != nil {
+		return err
+	}
+	opKey, err := cryptopkg.DeriveOpHashKey(targetBytes)
+	if err != nil {
+		return err
+	}
+	defer cryptopkg.Zero(opKey)
+	cpReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         http.MethodPost,
+		Path:           controlplane.RegisterKeyPath,
+		KeyIDHex:       targetKIDHex,
+		IfMatch:        controlplane.IfMatchAnyKey,
+		IdempotencyKey: idem,
+		Body:           body,
+	})
+
+	resp, err := deps.Controlplane.RegisterKey(ctx, cpReq)
+	if err != nil {
+		// A concurrent caller registered first — verify a current
+		// key now exists and treat the race as success.
+		if controlplane.IsCode(err, controlplane.StatusStaleKey) ||
+			controlplane.IsCode(err, controlplane.StatusExistingDataUnderOtherKey) {
+			deps.logInfo("migrate-all bootstrap: user=%s register-key race lost; proceeding",
+				sess.Claims.Subject)
+			return nil
+		}
+		return fmt.Errorf("register target as current: %w", err)
+	}
+	deps.logInfo("migrate-all bootstrap: user=%s registered kid=%s as current",
+		sess.Claims.Subject, targetKIDHex)
+	if resp != nil {
+		deleteBucketAttachments(ctx, deps, resp.WipedV2Attachments)
+	}
+	return nil
 }
 
 func migrateOne(
