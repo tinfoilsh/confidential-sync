@@ -855,18 +855,20 @@ func TestRegisterKeyExistingDataConflict(t *testing.T) {
 func TestAddBundleForwards(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
+	canonicalIV := strings.Repeat("0", canonicalBundleKEKIVHexLen)
+	canonicalCT := strings.Repeat("a", canonicalBundleEncryptedKeysHexLen)
 	resp, body := f.post("/v1/key/add-bundle", AddBundleRequest{
 		KeyID:          f.userKeyID,
 		Key:            f.userKeyB64,
 		CredentialID:   "cred-x",
-		KEKIV:          "iv",
-		EncryptedKeys:  "ct",
+		KEKIV:          canonicalIV,
+		EncryptedKeys:  canonicalCT,
 		IdempotencyKey: "idem-add-1",
 	}, tok)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("add-bundle: %d %s", resp.StatusCode, body)
 	}
-	if got, ok := f.cp.bundles[f.userKeyID]; !ok || got["cred-x"].EncryptedKeys != "ct" {
+	if got, ok := f.cp.bundles[f.userKeyID]; !ok || got["cred-x"].EncryptedKeys != canonicalCT {
 		t.Fatalf("bundle not stored: %+v", f.cp.bundles)
 	}
 }
@@ -880,15 +882,91 @@ func TestAddBundleRejectsMismatchedKeyID(t *testing.T) {
 		KeyID:          f.userKeyID,
 		Key:            base64.StdEncoding.EncodeToString(otherKey),
 		CredentialID:   "cred-x",
-		KEKIV:          "iv",
-		EncryptedKeys:  "ct",
+		KEKIV:          strings.Repeat("0", canonicalBundleKEKIVHexLen),
+		EncryptedKeys:  strings.Repeat("a", canonicalBundleEncryptedKeysHexLen),
 		IdempotencyKey: "idem-add-1",
 	}, tok)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d %s", resp.StatusCode, body)
 	}
-	if got, ok := f.cp.bundles[f.userKeyID]; ok && got["cred-x"].EncryptedKeys == "ct" {
+	if _, ok := f.cp.bundles[f.userKeyID]; ok {
 		t.Fatalf("mismatched bundle was stored: %+v", f.cp.bundles)
+	}
+}
+
+// Canonical bundle shape: AES-256-GCM wraps a raw 32-byte CEK using
+// a 12-byte IV, producing a 48-byte ciphertext+tag. The hex-encoded
+// wire is 24 hex chars for the IV and 96 hex chars for the ciphertext.
+// Both write endpoints reject anything outside that shape so legacy
+// JSON-envelope bundles can never sneak back in via newer clients.
+func TestRegisterKeyRejectsNonCanonicalBundle(t *testing.T) {
+	cases := []struct {
+		name string
+		iv   string
+		ct   string
+	}{
+		{
+			name: "iv too short",
+			iv:   "00",
+			ct:   strings.Repeat("a", canonicalBundleEncryptedKeysHexLen),
+		},
+		{
+			name: "ciphertext too long",
+			iv:   strings.Repeat("0", canonicalBundleKEKIVHexLen),
+			ct:   strings.Repeat("a", canonicalBundleEncryptedKeysHexLen+2),
+		},
+		{
+			name: "iv has uppercase hex",
+			iv:   strings.Repeat("A", canonicalBundleKEKIVHexLen),
+			ct:   strings.Repeat("a", canonicalBundleEncryptedKeysHexLen),
+		},
+		{
+			name: "ciphertext has non-hex chars",
+			iv:   strings.Repeat("0", canonicalBundleKEKIVHexLen),
+			ct:   strings.Repeat("z", canonicalBundleEncryptedKeysHexLen),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			tok := f.jwt()
+			resp, body := f.post("/v1/key/register", KeyRegisterRequest{
+				Key:            f.userKeyB64,
+				IfMatch:        "*",
+				CreatedVia:     "passkey",
+				IdempotencyKey: "reg-bad-bundle",
+				InitialBundle: &KeyRegisterBundleInput{
+					CredentialID:  "cred-x",
+					KEKIV:         tc.iv,
+					EncryptedKeys: tc.ct,
+				},
+			}, tok)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d %s", resp.StatusCode, body)
+			}
+			if _, ok := f.cp.keys[f.userKeyID]; ok {
+				t.Fatalf("key registered despite invalid bundle: %v", f.cp.keys)
+			}
+		})
+	}
+}
+
+func TestAddBundleRejectsNonCanonicalBundle(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	resp, body := f.post("/v1/key/add-bundle", AddBundleRequest{
+		KeyID:          f.userKeyID,
+		Key:            f.userKeyB64,
+		CredentialID:   "cred-x",
+		KEKIV:          "not-hex",
+		EncryptedKeys:  strings.Repeat("a", canonicalBundleEncryptedKeysHexLen),
+		IdempotencyKey: "idem-add-bad",
+	}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d %s", resp.StatusCode, body)
+	}
+	if _, ok := f.cp.bundles[f.userKeyID]; ok {
+		t.Fatalf("non-canonical bundle was stored: %+v", f.cp.bundles)
 	}
 }
 

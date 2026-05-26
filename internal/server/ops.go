@@ -553,6 +553,15 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 
 	var bundle *controlplane.RegisterKeyBundle
 	if req.InitialBundle != nil {
+		if req.InitialBundle.CredentialID == "" {
+			return nil, badRequest("initial_bundle.credential_id is required when initial_bundle is set")
+		}
+		if err := validateCanonicalBundleShape(
+			req.InitialBundle.KEKIV,
+			req.InitialBundle.EncryptedKeys,
+		); err != nil {
+			return nil, err
+		}
 		bundle = &controlplane.RegisterKeyBundle{
 			CredentialID:  req.InitialBundle.CredentialID,
 			KEKIV:         req.InitialBundle.KEKIV,
@@ -612,6 +621,9 @@ func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleReques
 	}
 	if req.CredentialID == "" || req.KEKIV == "" || req.EncryptedKeys == "" {
 		return nil, badRequest("credential_id, kek_iv, encrypted_keys are required")
+	}
+	if err := validateCanonicalBundleShape(req.KEKIV, req.EncryptedKeys); err != nil {
+		return nil, err
 	}
 	if req.IdempotencyKey == "" {
 		return nil, badRequest("idempotency_key is required")
@@ -1334,4 +1346,28 @@ func isLowerHex(s string) bool {
 		}
 	}
 	return true
+}
+
+// Bundle wire shape. A canonical passkey bundle is AES-256-GCM over
+// the user's raw 32-byte CEK with a 12-byte random IV. AES-GCM
+// produces a 16-byte authentication tag appended to the ciphertext,
+// so the wrapped payload is always (32 + 16) = 48 bytes -> 96 hex
+// chars; the IV is 12 bytes -> 24 hex chars. Validating these on
+// write keeps non-canonical legacy envelope blobs from being
+// silently registered by future clients while leaving read paths
+// fully back-compatible for existing rows.
+const (
+	canonicalBundleKEKIVHexLen         = 24
+	canonicalBundleEncryptedKeysHexLen = 96
+)
+
+func validateCanonicalBundleShape(kekIV, encryptedKeys string) error {
+	if len(kekIV) != canonicalBundleKEKIVHexLen || !isLowerHex(kekIV) {
+		return badRequest("kek_iv must be 24 lower-hex characters (12 raw bytes)")
+	}
+	if len(encryptedKeys) != canonicalBundleEncryptedKeysHexLen ||
+		!isLowerHex(encryptedKeys) {
+		return badRequest("encrypted_keys must be 96 lower-hex characters (raw CEK wrapped with AES-GCM)")
+	}
+	return nil
 }
