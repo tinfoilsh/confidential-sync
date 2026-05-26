@@ -61,6 +61,10 @@ type ListStatusRequest struct {
 	Cursor    string `json:"cursor,omitempty"`
 	Limit     int    `json:"limit,omitempty"`
 	ProjectID string `json:"project_id,omitempty"`
+	// Direction controls sort order: "" or "asc" walks oldest -> newest
+	// (the default), "desc" walks newest -> oldest. The control plane
+	// validates the value; the enclave just forwards it.
+	Direction string `json:"direction,omitempty"`
 }
 
 type ListStatusResponse struct {

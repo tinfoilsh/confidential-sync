@@ -472,7 +472,7 @@ func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*Delete
 	return out, nil
 }
 
-func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt, clerkUserID string, projectID string) (*ListStatusResponse, error) {
+func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt, clerkUserID, projectID, direction string) (*ListStatusResponse, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
@@ -485,6 +485,9 @@ func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int
 	}
 	if projectID != "" {
 		q.Set("project_id", projectID)
+	}
+	if direction != "" {
+		q.Set("direction", direction)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
 	if err != nil {

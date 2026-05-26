@@ -224,7 +224,7 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	case len(req.IDs) > 0:
 		ids = req.IDs
 	case req.All:
-		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, "")
+		list, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, "", "")
 		if err != nil {
 			return nil, err
 		}
@@ -363,12 +363,15 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	if req.ProjectID != "" && envelope.Scope(req.Scope) != envelope.ScopeChat {
 		return nil, badRequest("project_id filter is only valid for chat scope")
 	}
+	if req.Direction != "" && req.Direction != "asc" && req.Direction != "desc" {
+		return nil, badRequest("invalid direction (must be 'asc' or 'desc')")
+	}
 	if req.Limit <= 0 || req.Limit > 500 {
 		req.Limit = 100
 	}
-	deps.logInfo("list-status begin: user=%s scope=%s limit=%d project=%s cursor=%q",
-		sess.Claims.Subject, req.Scope, req.Limit, req.ProjectID, req.Cursor)
-	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, req.ProjectID)
+	deps.logInfo("list-status begin: user=%s scope=%s limit=%d project=%s direction=%q cursor=%q",
+		sess.Claims.Subject, req.Scope, req.Limit, req.ProjectID, req.Direction, req.Cursor)
+	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, req.ProjectID, req.Direction)
 	if err != nil {
 		deps.logError("list-status failed: user=%s scope=%s err=%v",
 			sess.Claims.Subject, req.Scope, err)
