@@ -193,18 +193,35 @@ func TestListStatusEncodesQuery(t *testing.T) {
 		if r.URL.Query().Get("project_id") != "proj_1" {
 			t.Errorf("project_id: %q", r.URL.Query().Get("project_id"))
 		}
+		if r.URL.Query().Get("direction") != "" {
+			t.Errorf("direction should be omitted when empty: %q", r.URL.Query().Get("direction"))
+		}
 		json.NewEncoder(w).Encode(ListStatusResponse{
 			Updates:    []BlobMeta{{ID: "a", ETag: "1", KeyID: strings.Repeat("a", 32)}},
 			NextCursor: "c2",
 		})
 	})
 	c := NewClient(st.server.URL, nil)
-	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j", "user_x", "proj_1")
+	resp, err := c.ListStatus(context.Background(), "chat", "c1", 50, "j", "user_x", "proj_1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(resp.Updates) != 1 || resp.NextCursor != "c2" {
 		t.Fatalf("response: %+v", resp)
+	}
+}
+
+func TestListStatusEncodesDirection(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/sync/list-status", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("direction"); got != "desc" {
+			t.Errorf("direction: got %q want desc", got)
+		}
+		json.NewEncoder(w).Encode(ListStatusResponse{})
+	})
+	c := NewClient(st.server.URL, nil)
+	if _, err := c.ListStatus(context.Background(), "project", "", 50, "j", "user_x", "", "desc"); err != nil {
+		t.Fatal(err)
 	}
 }
 
