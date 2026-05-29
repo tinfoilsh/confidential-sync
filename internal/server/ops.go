@@ -769,7 +769,9 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 		}
 		if !b.RegisteredAt.IsZero() {
 			ent := out.Bundles[cid]
-			ent.UpdatedAt = b.RegisteredAt.Format("2006-01-02T15:04:05.000Z")
+			registeredAt := b.RegisteredAt.Format("2006-01-02T15:04:05.000Z")
+			ent.CreatedAt = registeredAt
+			ent.UpdatedAt = registeredAt
 			out.Bundles[cid] = ent
 		}
 	}
