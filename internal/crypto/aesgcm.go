@@ -14,6 +14,17 @@ const (
 
 var ErrCipher = errors.New("aes-gcm: cipher operation failed")
 
+// RandomKey returns a fresh cryptographically-random 32-byte key. It is
+// used to mint per-message data keys (DEKs) that the envelope layer seals
+// the payload under before wrapping the DEK with the user's CEK.
+func RandomKey() ([]byte, error) {
+	k := make([]byte, KeySize)
+	if _, err := rand.Read(k); err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
 func Seal(key, plaintext, aad []byte) (nonce, ciphertext []byte, err error) {
 	if len(key) != KeySize {
 		return nil, nil, ErrKeySize

@@ -591,7 +591,7 @@ func newFixture(t *testing.T) *fixture {
 func TestBlobOperationHashIgnoresRandomizedEnvelopeBytes(t *testing.T) {
 	f := newFixture(t)
 	plaintext := []byte(`{"id":"chat_1","messages":[]}`)
-	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
+	aadBytes, err := envelope.CanonicalPayloadAAD(envelope.AAD{
 		KeyIDHex:    f.userKeyID,
 		Scope:       envelope.ScopeChat,
 		ID:          "chat_1",

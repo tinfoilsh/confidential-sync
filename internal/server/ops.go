@@ -94,17 +94,18 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
+	aad := envelope.AAD{
 		KeyIDHex:    kidHex,
 		Scope:       scope,
 		ID:          req.ID,
 		ClerkUserID: sess.Claims.Subject,
-	})
+	}
+	payloadAAD, err := envelope.CanonicalPayloadAAD(aad)
 	if err != nil {
 		return nil, badRequest("invalid envelope inputs: " + err.Error())
 	}
 
-	envBlob, err := envelope.Encrypt(key, plaintext, aadBytes, kidHex)
+	envBlob, err := envelope.Encrypt(key, plaintext, aad)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +114,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, aadBytes, plaintext)
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, payloadAAD, plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -295,13 +296,10 @@ func pullOne(
 
 	switch envelope.Detect(blob.Ciphertext) {
 	case envelope.VersionV2:
-		dec, err := envelope.DecryptV2(blob.Ciphertext, keys, func(kid string) ([]byte, error) {
-			return envelope.CanonicalAAD(envelope.AAD{
-				KeyIDHex:    kid,
-				Scope:       scope,
-				ID:          id,
-				ClerkUserID: sess.Claims.Subject,
-			})
+		dec, err := envelope.DecryptV2(blob.Ciphertext, keys, envelope.AAD{
+			Scope:       scope,
+			ID:          id,
+			ClerkUserID: sess.Claims.Subject,
 		})
 		if err != nil {
 			if errors.Is(err, envelope.ErrNoMatchingKey) {
@@ -1261,13 +1259,10 @@ func messageCountFromMetadata(scope string, metadata map[string]any) *int {
 func decryptAnyVersion(ciphertext []byte, keys []envelope.Key, scope envelope.Scope, id, clerkUserID string) ([]byte, bool) {
 	switch envelope.Detect(ciphertext) {
 	case envelope.VersionV2:
-		dec, err := envelope.DecryptV2(ciphertext, keys, func(kid string) ([]byte, error) {
-			return envelope.CanonicalAAD(envelope.AAD{
-				KeyIDHex:    kid,
-				Scope:       scope,
-				ID:          id,
-				ClerkUserID: clerkUserID,
-			})
+		dec, err := envelope.DecryptV2(ciphertext, keys, envelope.AAD{
+			Scope:       scope,
+			ID:          id,
+			ClerkUserID: clerkUserID,
 		})
 		if err != nil {
 			return nil, false

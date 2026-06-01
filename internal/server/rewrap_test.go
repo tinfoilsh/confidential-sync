@@ -224,13 +224,10 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	if envelope.Detect(afterBlob) != envelope.VersionV2 {
 		t.Fatalf("stored row not v2: %s", afterBlob)
 	}
-	dec, err := envelope.DecryptV2(afterBlob, []envelope.Key{{Bytes: f.userKey, KeyIDHex: f.userKeyID}}, func(kid string) ([]byte, error) {
-		return envelope.CanonicalAAD(envelope.AAD{
-			KeyIDHex:    kid,
-			Scope:       envelope.ScopeChat,
-			ID:          "c1",
-			ClerkUserID: f.userSub,
-		})
+	dec, err := envelope.DecryptV2(afterBlob, []envelope.Key{{Bytes: f.userKey, KeyIDHex: f.userKeyID}}, envelope.AAD{
+		Scope:       envelope.ScopeChat,
+		ID:          "c1",
+		ClerkUserID: f.userSub,
 	})
 	if err != nil {
 		t.Fatalf("decrypt stored v2: %v", err)
@@ -291,16 +288,13 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 		},
 	}
 	chatBytes, _ := json.Marshal(chat)
-	aad, err := envelope.CanonicalAAD(envelope.AAD{
+	aad := envelope.AAD{
 		KeyIDHex:    f.userKeyID,
 		Scope:       envelope.ScopeChat,
 		ID:          "c2",
 		ClerkUserID: f.userSub,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	v2blob, err := envelope.Encrypt(f.userKey, chatBytes, aad, f.userKeyID)
+	v2blob, err := envelope.Encrypt(f.userKey, chatBytes, aad)
 	if err != nil {
 		t.Fatal(err)
 	}

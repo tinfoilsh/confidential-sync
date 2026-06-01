@@ -76,16 +76,17 @@ func rewrapBlob(
 	if scope == envelope.ScopeProfile {
 		aadID = envelope.ProfileSingletonID
 	}
-	aadBytes, err := envelope.CanonicalAAD(envelope.AAD{
+	aad := envelope.AAD{
 		KeyIDHex:    targetKIDHex,
 		Scope:       scope,
 		ID:          aadID,
 		ClerkUserID: sess.Claims.Subject,
-	})
+	}
+	payloadAAD, err := envelope.CanonicalPayloadAAD(aad)
 	if err != nil {
 		return "", err
 	}
-	envBlob, err := envelope.Encrypt(targetKey, finalPlaintext, aadBytes, targetKIDHex)
+	envBlob, err := envelope.Encrypt(targetKey, finalPlaintext, aad)
 	if err != nil {
 		return "", err
 	}
@@ -113,7 +114,7 @@ func rewrapBlob(
 		IfMatch:        priorETag,
 		IdempotencyKey: idem,
 		Body:           finalPlaintext,
-		AAD:            aadBytes,
+		AAD:            payloadAAD,
 	})
 	resp, err := deps.Controlplane.PutBlob(ctx, rewrapReq)
 	if err != nil {
