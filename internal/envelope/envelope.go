@@ -307,6 +307,10 @@ func DecryptV2(blob []byte, keys []Key, aad AAD) (DecryptResult, error) {
 		return DecryptResult{}, err
 	}
 	defer crypto.Zero(dek)
+	// The authenticated unwrap proves the DEK bytes are exactly what was
+	// sealed, so a wrong length signals a broken seal-side invariant rather
+	// than tampering. Fail closed with a specific error here instead of
+	// letting the payload open below surface a generic key-size error.
 	if len(dek) != crypto.KeySize {
 		return DecryptResult{}, ErrV2Malformed
 	}
