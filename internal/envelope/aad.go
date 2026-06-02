@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	AADDomain       = "tinfoil-sync-envelope-v2"
-	BundleAADDomain = "tinfoil-key-bundle-v2"
-	EnvelopeVersion = 2
-	AlgAESGCM       = "AES-256-GCM"
+	AADDomain        = "tinfoil-sync-envelope-v2"
+	DEKWrapAADDomain = "tinfoil-dek-wrap-v2"
+	BundleAADDomain  = "tinfoil-key-bundle-v2"
+	EnvelopeVersion  = 2
+	AlgAESGCM        = "AES-256-GCM"
 
 	// ProfileSingletonID is the canonical AAD `id` for a user's
 	// profile row. The controlplane keys profile blobs by
@@ -52,16 +53,14 @@ var (
 	ErrAADInvalid = errors.New("invalid AAD inputs")
 )
 
-// CanonicalAAD returns a deterministic byte sequence used as AES-GCM AAD.
-// JSON: sorted keys, no insignificant whitespace, UTF-8, lowercase hex.
-func CanonicalAAD(a AAD) ([]byte, error) {
+// CanonicalPayloadAAD returns the AAD that binds the payload layer of a v2
+// envelope — the gzipped plaintext sealed under the per-message data key.
+// It deliberately omits the CEK key id so the payload ciphertext is
+// independent of which CEK is current; that is what lets a CEK rotation
+// rewrap only the data key and leave the (potentially large) payload
+// untouched. JSON: sorted keys, no insignificant whitespace, UTF-8.
+func CanonicalPayloadAAD(a AAD) ([]byte, error) {
 	if !a.Scope.Valid() {
-		return nil, ErrAADInvalid
-	}
-	if len(a.KeyIDHex) != 32 {
-		return nil, ErrAADInvalid
-	}
-	if !isLowerHex(a.KeyIDHex) {
 		return nil, ErrAADInvalid
 	}
 	if a.ClerkUserID == "" {
@@ -78,6 +77,39 @@ func CanonicalAAD(a AAD) ([]byte, error) {
 		{"alg", AlgAESGCM},
 		{"clerk_user_id", a.ClerkUserID},
 		{"domain", AADDomain},
+		{"id", a.ID},
+		{"scope", string(a.Scope)},
+		{"v", EnvelopeVersion},
+	}
+	return marshalCanonical(fields)
+}
+
+// CanonicalDEKWrapAAD returns the AAD that binds the key-wrap layer of a v2
+// envelope — the per-message data key sealed under the user's CEK. It binds
+// the wrap to the owning user, the row, the scope, and the specific CEK key
+// id, so a stored wrapped data key cannot be lifted onto another row, user,
+// scope, or key. The kid is the only field that changes across a CEK
+// rotation, which is why it lives here and not in the payload AAD.
+func CanonicalDEKWrapAAD(a AAD) ([]byte, error) {
+	if !a.Scope.Valid() {
+		return nil, ErrAADInvalid
+	}
+	if len(a.KeyIDHex) != 32 || !isLowerHex(a.KeyIDHex) {
+		return nil, ErrAADInvalid
+	}
+	if a.ClerkUserID == "" {
+		return nil, ErrAADInvalid
+	}
+	if a.Scope == ScopeProfile && a.ID != ProfileSingletonID {
+		return nil, ErrAADInvalid
+	}
+	if a.ID == "" {
+		return nil, ErrAADInvalid
+	}
+
+	fields := []kv{
+		{"clerk_user_id", a.ClerkUserID},
+		{"domain", DEKWrapAADDomain},
 		{"id", a.ID},
 		{"kid", a.KeyIDHex},
 		{"scope", string(a.Scope)},

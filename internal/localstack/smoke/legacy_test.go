@@ -83,13 +83,10 @@ func TestT12_LegacyV0BlobInlineRewrapsOnPull(t *testing.T) {
 	if stored == nil {
 		t.Fatalf("blob disappeared after legacy pull")
 	}
-	res, err := envelope.DecryptV2(stored.Body, []envelope.Key{{Bytes: f.cek, KeyIDHex: f.cekKID}}, func(kid string) ([]byte, error) {
-		return envelope.CanonicalAAD(envelope.AAD{
-			KeyIDHex:    kid,
-			Scope:       envelope.ScopeChat,
-			ID:          "legacy_1",
-			ClerkUserID: f.userSub,
-		})
+	res, err := envelope.DecryptV2(stored.Body, []envelope.Key{{Bytes: f.cek, KeyIDHex: f.cekKID}}, envelope.AAD{
+		Scope:       envelope.ScopeChat,
+		ID:          "legacy_1",
+		ClerkUserID: f.userSub,
 	})
 	if err != nil {
 		t.Fatalf("expected promoted blob to be a valid v2 envelope: %v; body=%s", err, stored.Body)

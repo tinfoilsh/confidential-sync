@@ -46,56 +46,91 @@ func keyFromHex(t *testing.T, rawHex string) Key {
 	return Key{Bytes: raw, KeyIDHex: cryptopkg.KeyIDHex(id)}
 }
 
-func TestCanonicalAADStable(t *testing.T) {
+func TestCanonicalPayloadAADStable(t *testing.T) {
 	a := AAD{
 		KeyIDHex:    strings.Repeat("ab", 16),
 		Scope:       ScopeChat,
 		ID:          "chat_abc",
 		ClerkUserID: "user_xyz",
 	}
-	b1, err := CanonicalAAD(a)
+	b1, err := CanonicalPayloadAAD(a)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b2, err := CanonicalAAD(a)
+	b2, err := CanonicalPayloadAAD(a)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(b1, b2) {
 		t.Fatalf("not stable: %s vs %s", b1, b2)
 	}
-	want := `{"alg":"AES-256-GCM","clerk_user_id":"user_xyz","domain":"tinfoil-sync-envelope-v2","id":"chat_abc","kid":"abababababababababababababababab","scope":"chat","v":2}`
+	// The payload AAD deliberately omits the CEK key id so the payload
+	// ciphertext survives a CEK rotation unchanged.
+	want := `{"alg":"AES-256-GCM","clerk_user_id":"user_xyz","domain":"tinfoil-sync-envelope-v2","id":"chat_abc","scope":"chat","v":2}`
 	if string(b1) != want {
-		t.Fatalf("canonical AAD mismatch:\n got:  %s\n want: %s", b1, want)
+		t.Fatalf("canonical payload AAD mismatch:\n got:  %s\n want: %s", b1, want)
 	}
 }
 
-func TestCanonicalAADRejectsInvalid(t *testing.T) {
+func TestCanonicalDEKWrapAADStable(t *testing.T) {
+	a := AAD{
+		KeyIDHex:    strings.Repeat("ab", 16),
+		Scope:       ScopeChat,
+		ID:          "chat_abc",
+		ClerkUserID: "user_xyz",
+	}
+	out, err := CanonicalDEKWrapAAD(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The wrap AAD binds the CEK key id (the only field a rotation
+	// rewrites) plus the owning user, row, and scope.
+	want := `{"clerk_user_id":"user_xyz","domain":"tinfoil-dek-wrap-v2","id":"chat_abc","kid":"abababababababababababababababab","scope":"chat","v":2}`
+	if string(out) != want {
+		t.Fatalf("canonical wrap AAD mismatch:\n got:  %s\n want: %s", out, want)
+	}
+}
+
+func TestCanonicalPayloadAADRejectsInvalid(t *testing.T) {
 	cases := []AAD{
-		{Scope: "chat", KeyIDHex: "tooShort", ID: "x", ClerkUserID: "u"},
-		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: ""},
-		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
-		{Scope: "profile", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
-		{Scope: "project", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
-		{Scope: "project_document", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
-		{Scope: "bogus", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: "u"},
-		{Scope: "chat", KeyIDHex: strings.Repeat("A", 32), ID: "x", ClerkUserID: "u"},
+		{Scope: "chat", ID: "x", ClerkUserID: ""},
+		{Scope: "chat", ID: "", ClerkUserID: "u"},
+		{Scope: "profile", ID: "", ClerkUserID: "u"},
+		{Scope: "project", ID: "", ClerkUserID: "u"},
+		{Scope: "project_document", ID: "", ClerkUserID: "u"},
+		{Scope: "bogus", ID: "x", ClerkUserID: "u"},
 	}
 	for i, c := range cases {
-		if _, err := CanonicalAAD(c); err == nil {
+		if _, err := CanonicalPayloadAAD(c); err == nil {
 			t.Fatalf("case %d: expected error", i)
 		}
 	}
 }
 
-func TestCanonicalAADRequiresExplicitProfileID(t *testing.T) {
+func TestCanonicalDEKWrapAADRejectsInvalid(t *testing.T) {
+	cases := []AAD{
+		{Scope: "chat", KeyIDHex: "tooShort", ID: "x", ClerkUserID: "u"},
+		{Scope: "chat", KeyIDHex: strings.Repeat("A", 32), ID: "x", ClerkUserID: "u"},
+		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: ""},
+		{Scope: "chat", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
+		{Scope: "profile", KeyIDHex: strings.Repeat("a", 32), ID: "", ClerkUserID: "u"},
+		{Scope: "bogus", KeyIDHex: strings.Repeat("a", 32), ID: "x", ClerkUserID: "u"},
+	}
+	for i, c := range cases {
+		if _, err := CanonicalDEKWrapAAD(c); err == nil {
+			t.Fatalf("case %d: expected error", i)
+		}
+	}
+}
+
+func TestCanonicalPayloadAADRequiresExplicitProfileID(t *testing.T) {
 	a := AAD{
 		KeyIDHex:    strings.Repeat("c", 32),
 		Scope:       ScopeProfile,
 		ID:          ProfileSingletonID,
 		ClerkUserID: "u",
 	}
-	out, err := CanonicalAAD(a)
+	out, err := CanonicalPayloadAAD(a)
 	if err != nil {
 		t.Fatalf("explicit profile id should succeed: %v", err)
 	}
@@ -108,7 +143,7 @@ func TestCanonicalAADRequiresExplicitProfileID(t *testing.T) {
 		Scope:       ScopeProfile,
 		ClerkUserID: "u",
 	}
-	if _, err := CanonicalAAD(missing); err == nil {
+	if _, err := CanonicalPayloadAAD(missing); err == nil {
 		t.Fatal("profile AAD without explicit id must fail")
 	}
 
@@ -118,7 +153,7 @@ func TestCanonicalAADRequiresExplicitProfileID(t *testing.T) {
 		ID:          "typo",
 		ClerkUserID: "u",
 	}
-	if _, err := CanonicalAAD(wrong); err == nil {
+	if _, err := CanonicalPayloadAAD(wrong); err == nil {
 		t.Fatal("profile AAD with non-canonical id must fail")
 	}
 }
@@ -146,24 +181,15 @@ func TestV2RoundTrip(t *testing.T) {
 		ID:          "chat_1",
 		ClerkUserID: "user_a",
 	}
-	aadBytes, err := CanonicalAAD(aad)
-	if err != nil {
-		t.Fatal(err)
-	}
 	pt := []byte("the quick brown fox")
-	blob, err := Encrypt(k.Bytes, pt, aadBytes, k.KeyIDHex)
+	blob, err := Encrypt(k.Bytes, pt, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if Detect(blob) != VersionV2 {
 		t.Fatalf("detect: %v", Detect(blob))
 	}
-	res, err := DecryptV2(blob, []Key{k}, func(kid string) ([]byte, error) {
-		if kid != k.KeyIDHex {
-			t.Fatalf("aadFor called with wrong kid: %s", kid)
-		}
-		return aadBytes, nil
-	})
+	res, err := DecryptV2(blob, []Key{k}, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,17 +212,36 @@ func TestV2RoundTrip(t *testing.T) {
 func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
-	if err != nil {
-		t.Fatal(err)
-	}
 	plaintext := bytes.Repeat([]byte("compress-me-"), 256)
-	blob, err := Encrypt(k.Bytes, plaintext, aadBytes, k.KeyIDHex)
+	blob, err := Encrypt(k.Bytes, plaintext, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var env V2
 	if err := json.Unmarshal(blob, &env); err != nil {
+		t.Fatal(err)
+	}
+	// The payload is sealed under a per-message data key, not the CEK, so
+	// unwrap the data key first (CEK + wrap AAD), then open the payload
+	// (data key + payload AAD) and assert the gzip header is inside.
+	wrapAAD, err := CanonicalDEKWrapAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapIV, err := hex.DecodeString(env.WIV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrappedDEK, err := base64.StdEncoding.DecodeString(env.WDEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, err := cryptopkg.Open(k.Bytes, wrapIV, wrappedDEK, wrapAAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadAAD, err := CanonicalPayloadAAD(aad)
+	if err != nil {
 		t.Fatal(err)
 	}
 	iv, err := hex.DecodeString(env.IV)
@@ -207,7 +252,7 @@ func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inner, err := cryptopkg.Open(k.Bytes, iv, ct, aadBytes)
+	inner, err := cryptopkg.Open(dek, iv, ct, payloadAAD)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,26 +267,39 @@ func TestV2EnvelopeIsGzippedBeforeEncrypt(t *testing.T) {
 func TestV2DecryptRejectsCorruptGzip(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
+	payloadAAD, err := CanonicalPayloadAAD(aad)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Build a v2 envelope whose AES-GCM plaintext is NOT gzip (simulating an
-	// older v2-without-gzip blob produced before this change). The decrypt
-	// path must hard-fail per syncplan §X4.
-	nonce, ct, err := cryptopkg.Seal(k.Bytes, []byte(`{"hello":"world"}`), aadBytes)
+	wrapAAD, err := CanonicalDEKWrapAAD(aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build a well-formed v2 envelope whose payload plaintext is NOT gzip.
+	// The decrypt path must hard-fail rather than hand back non-gzip bytes.
+	dek, err := cryptopkg.RandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadIV, payloadCT, err := cryptopkg.Seal(dek, []byte(`{"hello":"world"}`), payloadAAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapIV, wrappedDEK, err := cryptopkg.Seal(k.Bytes, dek, wrapAAD)
 	if err != nil {
 		t.Fatal(err)
 	}
 	env := V2{
-		V:   int(VersionV2),
-		KID: k.KeyIDHex,
-		Alg: AlgAESGCM,
-		IV:  hex.EncodeToString(nonce),
-		CT:  base64.StdEncoding.EncodeToString(ct),
+		V:    int(VersionV2),
+		Alg:  AlgAESGCM,
+		KID:  k.KeyIDHex,
+		WDEK: base64.StdEncoding.EncodeToString(wrappedDEK),
+		WIV:  hex.EncodeToString(wrapIV),
+		IV:   hex.EncodeToString(payloadIV),
+		CT:   base64.StdEncoding.EncodeToString(payloadCT),
 	}
 	blob, _ := json.Marshal(env)
-	_, err = DecryptV2(blob, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+	_, err = DecryptV2(blob, []Key{k}, aad)
 	if !errors.Is(err, ErrV2Malformed) {
 		t.Fatalf("expected ErrV2Malformed for non-gzip v2 payload, got %v", err)
 	}
@@ -250,20 +308,12 @@ func TestV2DecryptRejectsCorruptGzip(t *testing.T) {
 func TestV2AADMismatchFails(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blob, err := Encrypt(k.Bytes, []byte("hi"), aadBytes, k.KeyIDHex)
+	blob, err := Encrypt(k.Bytes, []byte("hi"), aad)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wrong := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeProfile, ID: "profile", ClerkUserID: "u"}
-	wrongBytes, err := CanonicalAAD(wrong)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = DecryptV2(blob, []Key{k}, func(string) ([]byte, error) { return wrongBytes, nil })
+	_, err = DecryptV2(blob, []Key{k}, wrong)
 	if err == nil {
 		t.Fatalf("expected AAD mismatch decrypt failure")
 	}
@@ -281,10 +331,6 @@ func TestV2AADMismatchFails(t *testing.T) {
 func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Sweep payload sizes so we exercise every `0-, 1-, 2-pad`
 	// base64 trailing group; each one needs to be caught by the
@@ -292,7 +338,7 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 	// remaining padding shape leak through.
 	covered := map[string]bool{"=": false, "==": false}
 	for size := 1; size <= 24; size++ {
-		blob, err := Encrypt(k.Bytes, bytes.Repeat([]byte{0xAB}, size), aadBytes, k.KeyIDHex)
+		blob, err := Encrypt(k.Bytes, bytes.Repeat([]byte{0xAB}, size), aad)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -310,7 +356,7 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 		}
 		env.CT = nonCanonical
 		mutated, _ := json.Marshal(env)
-		_, err = DecryptV2(mutated, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+		_, err = DecryptV2(mutated, []Key{k}, aad)
 		if !errors.Is(err, ErrV2Malformed) {
 			t.Fatalf("expected ErrV2Malformed for non-canonical base64 ct (pad=%q size=%d), got %v", pad, size, err)
 		}
@@ -334,11 +380,7 @@ func TestV2RejectsNonCanonicalBase64CT(t *testing.T) {
 func TestV2RejectsWhitespaceInBase64CT(t *testing.T) {
 	k := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
-	if err != nil {
-		t.Fatal(err)
-	}
-	blob, err := Encrypt(k.Bytes, []byte("hello world"), aadBytes, k.KeyIDHex)
+	blob, err := Encrypt(k.Bytes, []byte("hello world"), aad)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +397,7 @@ func TestV2RejectsWhitespaceInBase64CT(t *testing.T) {
 		}
 		env.CT = env.CT[:4] + inject + env.CT[4:]
 		mutated, _ := json.Marshal(env)
-		_, err = DecryptV2(mutated, []Key{k}, func(string) ([]byte, error) { return aadBytes, nil })
+		_, err = DecryptV2(mutated, []Key{k}, aad)
 		if !errors.Is(err, ErrV2Malformed) {
 			t.Fatalf("expected ErrV2Malformed for ct containing %q, got %v", inject, err)
 		}
@@ -421,15 +463,11 @@ func TestV2NoMatchingKey(t *testing.T) {
 	k := newKey(t)
 	other := newKey(t)
 	aad := AAD{KeyIDHex: k.KeyIDHex, Scope: ScopeChat, ID: "c", ClerkUserID: "u"}
-	aadBytes, err := CanonicalAAD(aad)
+	blob, err := Encrypt(k.Bytes, []byte("hi"), aad)
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob, err := Encrypt(k.Bytes, []byte("hi"), aadBytes, k.KeyIDHex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = DecryptV2(blob, []Key{other}, func(string) ([]byte, error) { return aadBytes, nil })
+	_, err = DecryptV2(blob, []Key{other}, aad)
 	if !errors.Is(err, ErrNoMatchingKey) {
 		t.Fatalf("expected ErrNoMatchingKey, got %v", err)
 	}
@@ -638,16 +676,13 @@ func TestRewrapV1WebappFixture(t *testing.T) {
 		t.Fatalf("legacy v1 must signal needs_rewrap")
 	}
 
-	aad, err := CanonicalAAD(AAD{
+	aad := AAD{
 		KeyIDHex:    newKey.KeyIDHex,
 		Scope:       ScopeChat,
 		ID:          chatID,
 		ClerkUserID: clerkUserID,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	v2Blob, err := Encrypt(newKey.Bytes, res.Plaintext, aad, newKey.KeyIDHex)
+	v2Blob, err := Encrypt(newKey.Bytes, res.Plaintext, aad)
 	if err != nil {
 		t.Fatalf("rewrap encrypt: %v", err)
 	}
@@ -655,13 +690,10 @@ func TestRewrapV1WebappFixture(t *testing.T) {
 		t.Fatalf("rewrap output should be v2")
 	}
 
-	got, err := DecryptV2(v2Blob, []Key{newKey}, func(kid string) ([]byte, error) {
-		return CanonicalAAD(AAD{
-			KeyIDHex:    kid,
-			Scope:       ScopeChat,
-			ID:          chatID,
-			ClerkUserID: clerkUserID,
-		})
+	got, err := DecryptV2(v2Blob, []Key{newKey}, AAD{
+		Scope:       ScopeChat,
+		ID:          chatID,
+		ClerkUserID: clerkUserID,
 	})
 	if err != nil {
 		t.Fatalf("decrypt v2: %v", err)
@@ -712,10 +744,12 @@ func TestDecryptLegacyFailsWhenNoKeyWorks(t *testing.T) {
 }
 
 func TestEncryptRejectsBadInputs(t *testing.T) {
-	if _, err := Encrypt(make([]byte, 16), []byte("x"), nil, strings.Repeat("a", 32)); err == nil {
+	valid := AAD{KeyIDHex: strings.Repeat("a", 32), Scope: ScopeChat, ID: "x", ClerkUserID: "u"}
+	if _, err := Encrypt(make([]byte, 16), []byte("x"), valid); err == nil {
 		t.Fatalf("expected key size error")
 	}
-	if _, err := Encrypt(make([]byte, cryptopkg.KeySize), []byte("x"), nil, "short"); err == nil {
+	badKID := AAD{KeyIDHex: "short", Scope: ScopeChat, ID: "x", ClerkUserID: "u"}
+	if _, err := Encrypt(make([]byte, cryptopkg.KeySize), []byte("x"), badKID); err == nil {
 		t.Fatalf("expected kid error")
 	}
 }

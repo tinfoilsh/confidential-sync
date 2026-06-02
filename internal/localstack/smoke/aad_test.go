@@ -20,7 +20,7 @@ import (
 // chat/X envelope at project/X slot → AAD mismatch on unseal →
 // AEAD fail.
 //
-// Regression caught: a change that drops `scope` from CanonicalAAD,
+// Regression caught: a change that drops `scope` from CanonicalPayloadAAD,
 // or accidentally builds the AAD with the wrong scope on the read
 // path.
 func TestT03_AADBindsScope(t *testing.T) {
@@ -124,7 +124,7 @@ func TestT04_AADBindsUserSub(t *testing.T) {
 // Invariant: AAD includes `id`, so the swap is detected at unseal
 // time.
 //
-// Regression caught: a change that drops `id` from CanonicalAAD,
+// Regression caught: a change that drops `id` from CanonicalPayloadAAD,
 // or that uses the storage key (not the canonical id) when
 // computing AAD on the read path.
 func TestT05_AADBindsID(t *testing.T) {

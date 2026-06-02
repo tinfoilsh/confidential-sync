@@ -24,10 +24,19 @@ const (
 
 type V2 struct {
 	V   int    `json:"v"`
-	KID string `json:"kid"`
 	Alg string `json:"alg"`
-	IV  string `json:"iv"`
-	CT  string `json:"ct"`
+	// KID identifies the CEK that wrapped the data key (WDEK), not the
+	// key the payload is sealed under. It selects which key unwraps the
+	// data key on read and is the single field a CEK rotation rewrites.
+	KID string `json:"kid"`
+	// WDEK is the per-message data key sealed under the CEK
+	// (AES-256-GCM ciphertext+tag, base64). WIV is its 12-byte nonce, hex.
+	WDEK string `json:"wdek"`
+	WIV  string `json:"wiv"`
+	// IV / CT are the payload nonce (hex) and the gzipped plaintext
+	// sealed under the data key (AES-256-GCM ciphertext+tag, base64).
+	IV string `json:"iv"`
+	CT string `json:"ct"`
 }
 
 type legacyV0 struct {
@@ -150,19 +159,30 @@ type DecryptResult struct {
 	NeedsRewrap bool
 }
 
-// Encrypt produces a v2 envelope around plaintext using key+AAD. The caller
-// is responsible for zeroing plaintext after the returned envelope is
+// Encrypt produces a v2 envelope around plaintext. The payload is sealed
+// under a fresh random per-message data key (DEK); that DEK is then wrapped
+// under the caller's key (the user's CEK, identified by aad.KeyIDHex). The
+// caller is responsible for zeroing plaintext after the returned envelope is
 // transmitted; the envelope JSON itself contains only ciphertext.
 //
-// Pipeline: gzip(plaintext) → AES-GCM-Seal(...) → v2 envelope.
-// Compression happens before encryption because ciphertext is random and
-// will not compress further at any downstream layer.
-func Encrypt(key []byte, plaintext, aad []byte, keyIDHex string) ([]byte, error) {
+// Pipeline: gzip(plaintext) → AES-GCM-Seal(DEK, …) for the payload, and
+// AES-GCM-Seal(CEK, DEK, …) for the wrapped key. Splitting the content key
+// from the CEK lets a CEK rotation rewrap only the small data key and leave
+// the (potentially large) payload ciphertext untouched — which is also why
+// the payload AAD is independent of the CEK key id. Compression happens
+// before encryption because ciphertext will not compress at any downstream
+// layer.
+func Encrypt(key []byte, plaintext []byte, aad AAD) ([]byte, error) {
 	if len(key) != crypto.KeySize {
 		return nil, crypto.ErrKeySize
 	}
-	if len(keyIDHex) != 32 || !isLowerHex(keyIDHex) {
-		return nil, ErrInvalidEnvelope
+	payloadAAD, err := CanonicalPayloadAAD(aad)
+	if err != nil {
+		return nil, err
+	}
+	wrapAAD, err := CanonicalDEKWrapAAD(aad)
+	if err != nil {
+		return nil, err
 	}
 	// Reject plaintexts that won't fit under the decompress cap.
 	// Without this check a write can succeed at seal time and then
@@ -180,23 +200,37 @@ func Encrypt(key []byte, plaintext, aad []byte, keyIDHex string) ([]byte, error)
 	// out so we don't leave plaintext-derived material lying in
 	// enclave memory longer than necessary.
 	defer crypto.Zero(compressed)
-	nonce, ct, err := crypto.Seal(key, compressed, aad)
+	dek, err := crypto.RandomKey()
+	if err != nil {
+		return nil, err
+	}
+	defer crypto.Zero(dek)
+	payloadIV, payloadCT, err := crypto.Seal(dek, compressed, payloadAAD)
+	if err != nil {
+		return nil, err
+	}
+	wrapIV, wrappedDEK, err := crypto.Seal(key, dek, wrapAAD)
 	if err != nil {
 		return nil, err
 	}
 	env := V2{
-		V:   int(VersionV2),
-		KID: keyIDHex,
-		Alg: AlgAESGCM,
-		IV:  hex.EncodeToString(nonce),
-		CT:  base64.StdEncoding.EncodeToString(ct),
+		V:    int(VersionV2),
+		Alg:  AlgAESGCM,
+		KID:  aad.KeyIDHex,
+		WDEK: base64.StdEncoding.EncodeToString(wrappedDEK),
+		WIV:  hex.EncodeToString(wrapIV),
+		IV:   hex.EncodeToString(payloadIV),
+		CT:   base64.StdEncoding.EncodeToString(payloadCT),
 	}
 	return json.Marshal(env)
 }
 
-// DecryptV2 parses and decrypts a v2 envelope. The supplied keys are tried
-// by matching `kid`; only one key is used so the operation is constant-cost.
-func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, error)) (DecryptResult, error) {
+// DecryptV2 parses and decrypts a v2 envelope. The envelope's `kid` selects
+// which of the supplied keys unwraps the per-message data key; that data key
+// then opens the payload. Only one key is used, so the operation is
+// constant-cost. `aad` supplies the scope/id/clerk_user_id the two AAD layers
+// are rebuilt from; the kid for the wrap AAD comes from the envelope itself.
+func DecryptV2(blob []byte, keys []Key, aad AAD) (DecryptResult, error) {
 	var env V2
 	if err := json.Unmarshal(blob, &env); err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
@@ -210,18 +244,22 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	if len(env.KID) != 32 || !isLowerHex(env.KID) {
 		return DecryptResult{}, ErrV2Malformed
 	}
-	if len(env.IV) != crypto.NonceSize*2 {
+	if len(env.IV) != crypto.NonceSize*2 || len(env.WIV) != crypto.NonceSize*2 {
 		return DecryptResult{}, ErrV2Malformed
 	}
 	iv, err := hex.DecodeString(env.IV)
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
 	}
-	// The `ct` field must be exact-canonical RFC 4648 standard
-	// base64: only the 64-char alphabet plus `=` padding at the
-	// tail, and no non-zero "spare" bits in the final group. The
-	// canonical form is necessary because two different aspects
-	// of a permissive decoder both produce
+	wrapIV, err := hex.DecodeString(env.WIV)
+	if err != nil {
+		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
+	}
+	// Both `ct` (payload) and `wdek` (wrapped data key) must be
+	// exact-canonical RFC 4648 standard base64: only the 64-char
+	// alphabet plus `=` padding at the tail, and no non-zero "spare"
+	// bits in the final group. The canonical form is necessary because
+	// two different aspects of a permissive decoder both produce
 	// equal-decoded-bytes-different-wire-bytes ambiguity:
 	//
 	//   1. Spare bits in the last data char of a 1- or 2-pad
@@ -229,15 +267,19 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	//      and Z differ only in their low 2 or 4 bits).
 	//   2. Embedded whitespace — `\n`, `\r` — which `Strict()`
 	//      still silently skips, so a tampered JSON envelope
-	//      could carry a `ct` string with `\n` injected anywhere
-	//      and decrypt to the same plaintext.
+	//      could carry a base64 string with `\n` injected anywhere
+	//      and decrypt to the same bytes.
 	//
 	// `Strict()` catches (1) but not (2); the explicit alphabet
 	// pre-check below catches (2) without an extra allocation.
-	if !isCanonicalStdBase64(env.CT) {
+	if !isCanonicalStdBase64(env.CT) || !isCanonicalStdBase64(env.WDEK) {
 		return DecryptResult{}, ErrV2Malformed
 	}
 	ct, err := base64.StdEncoding.Strict().DecodeString(env.CT)
+	if err != nil {
+		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
+	}
+	wrappedDEK, err := base64.StdEncoding.Strict().DecodeString(env.WDEK)
 	if err != nil {
 		return DecryptResult{}, fmt.Errorf("%w: %v", ErrV2Malformed, err)
 	}
@@ -251,11 +293,32 @@ func DecryptV2(blob []byte, keys []Key, aadFor func(keyIDHex string) ([]byte, er
 	if match == nil {
 		return DecryptResult{KeyIDHex: env.KID}, ErrNoMatchingKey
 	}
-	aad, err := aadFor(env.KID)
+	wrapAAD, err := CanonicalDEKWrapAAD(AAD{
+		KeyIDHex:    env.KID,
+		Scope:       aad.Scope,
+		ID:          aad.ID,
+		ClerkUserID: aad.ClerkUserID,
+	})
 	if err != nil {
 		return DecryptResult{}, err
 	}
-	compressed, err := crypto.Open(match.Bytes, iv, ct, aad)
+	dek, err := crypto.Open(match.Bytes, wrapIV, wrappedDEK, wrapAAD)
+	if err != nil {
+		return DecryptResult{}, err
+	}
+	defer crypto.Zero(dek)
+	// The authenticated unwrap proves the DEK bytes are exactly what was
+	// sealed, so a wrong length signals a broken seal-side invariant rather
+	// than tampering. Fail closed with a specific error here instead of
+	// letting the payload open below surface a generic key-size error.
+	if len(dek) != crypto.KeySize {
+		return DecryptResult{}, ErrV2Malformed
+	}
+	payloadAAD, err := CanonicalPayloadAAD(aad)
+	if err != nil {
+		return DecryptResult{}, err
+	}
+	compressed, err := crypto.Open(dek, iv, ct, payloadAAD)
 	if err != nil {
 		return DecryptResult{}, err
 	}
