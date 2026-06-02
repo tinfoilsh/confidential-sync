@@ -72,10 +72,7 @@ func rewrapBlob(
 	// The crypto envelope, however, pins the AAD id to the canonical
 	// profile-singleton constant; if we forwarded CP's storage id we
 	// would build an AAD the next read could never reproduce.
-	aadID := id
-	if scope == envelope.ScopeProfile {
-		aadID = envelope.ProfileSingletonID
-	}
+	aadID := aadIDForScope(scope, id)
 	aad := envelope.AAD{
 		KeyIDHex:    targetKIDHex,
 		Scope:       scope,
