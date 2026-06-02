@@ -62,6 +62,7 @@ type cpStub struct {
 	needsMigration    []cpNeedsMigration
 	legacyAttachments map[string][]byte // attachmentID → ciphertext (set by tests)
 	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
+	attachmentOwner   map[string]string // attachmentID → clerkUserID (set by tests)
 	// wipedAttachments seeds the start_fresh response so tests can
 	// exercise the enclave-side buckets cleanup cascade. Real
 	// controlplane returns the ids of the v2 attachments it nulled
@@ -143,6 +144,7 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
 	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
 	s.mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.handleDeleteAttachmentIndex)
+	s.mux.HandleFunc("GET /api/sync/attachment-owner/{aid}", s.handleAttachmentOwner)
 	// pending-attachment-write ledger (no-op when the test fixture
 	// hasn't opted in; AttachmentPut's reserve call is best-effort).
 	s.mux.HandleFunc("POST /api/sync/pending-attachments/{aid}", s.handleReservePendingAttachment)
@@ -457,6 +459,22 @@ func (s *cpStub) handleDeleteAttachmentIndex(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleAttachmentOwner mirrors GET /api/sync/attachment-owner/{id}:
+// the enclave's read path resolves the owning user here so the buckets
+// tenant prefix comes from a trusted source, not the caller. Runs
+// under the stub's mutex (held by the server wrapper), so it reads the
+// map without locking.
+func (s *cpStub) handleAttachmentOwner(w http.ResponseWriter, r *http.Request) {
+	aid := r.PathValue("aid")
+	owner := s.attachmentOwner[aid]
+	if owner == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"clerk_user_id": owner})
+}
+
 // handleRewrap mirrors the controlplane's /api/sync/rewrap endpoint:
 // JSON body in, replaces the blob ciphertext + key_id, bumps etag,
 // returns {ok, etag, key_id}. Mid-test rewrap CAS mismatches are
@@ -552,7 +570,7 @@ func newFixture(t *testing.T) *fixture {
 	cpClient := controlplane.NewClient(cp.server.URL, nil)
 
 	bk := newBucketsStub(t)
-	bkClient := buckets.NewClient(bk.server.URL, "test-api-key", nil)
+	bkClient := buckets.NewClient(bk.server.URL, nil)
 
 	deps := Deps{Controlplane: cpClient, Buckets: bkClient, GitSHA: "test-sha"}
 	handler := NewHandler(deps, v, nil)
@@ -1289,7 +1307,12 @@ func TestAttachmentDeleteDropsIndexAndBucket(t *testing.T) {
 	tok := f.jwt()
 	attID := "123e4567-e89b-12d3-a456-426614174111"
 
+	ownerTenant, err := buckets.TenantForUser(f.userSub)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.bk.items.Put(attID, bucketsItem{
+		Tenant:         ownerTenant,
 		Value:          []byte("payload"),
 		EncryptionKeys: [][]byte{bytes.Repeat([]byte{1}, 32)},
 	})

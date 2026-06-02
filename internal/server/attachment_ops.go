@@ -223,7 +223,7 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "controlplane reserve failed: " + err.Error()}
 	}
-	if err := deps.Buckets.Put(ctx, id, plaintext, attKey); err != nil {
+	if err := deps.Buckets.Put(ctx, sess.Claims.Subject, id, plaintext, attKey); err != nil {
 		deps.logError("attachment put buckets failed: user=%s chat=%s att=%s err=%v",
 			sess.Claims.Subject, req.ChatID, id, err)
 		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets put failed: " + err.Error()}
@@ -248,7 +248,7 @@ func AttachmentPut(ctx context.Context, deps Deps, sess Session, req AttachmentP
 			func() {
 				rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
 				defer cancel()
-				_ = deps.Buckets.Delete(rollbackCtx, id)
+				_ = deps.Buckets.Delete(rollbackCtx, sess.Claims.Subject, id)
 			}()
 		} else {
 			deps.logError("attachment put index failed (ambiguous, deferring to reaper): user=%s chat=%s att=%s err=%v",
@@ -295,7 +295,21 @@ func AttachmentGet(ctx context.Context, deps Deps, req AttachmentGetRequest) (*A
 	}
 
 	deps.logInfo("attachment get begin: att=%s", req.ID)
-	plaintext, err := deps.Buckets.Get(ctx, req.ID, attKey)
+	// Resolve the owning user from the controlplane index so the
+	// buckets tenant prefix is derived from a trusted source, never
+	// the caller. This path serves both the owner and (via
+	// /v1/attachment/get-public) share recipients who are not the
+	// owner, so the request itself carries no owner identity.
+	owner, err := deps.Controlplane.ResolveAttachmentOwner(ctx, req.ID)
+	if err != nil {
+		if errors.Is(err, controlplane.ErrAttachmentNotFound) {
+			deps.logInfo("attachment get not-found (no index): att=%s", req.ID)
+			return nil, &AppError{Status: 404, Code: CodeNotFound, Message: "attachment not found"}
+		}
+		deps.logError("attachment get resolve owner failed: att=%s err=%v", req.ID, err)
+		return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "resolve attachment owner failed: " + err.Error()}
+	}
+	plaintext, err := deps.Buckets.Get(ctx, owner, req.ID, attKey)
 	if err != nil {
 		if errors.Is(err, buckets.ErrNotFound) {
 			deps.logInfo("attachment get not-found: att=%s", req.ID)
@@ -360,7 +374,7 @@ func AttachmentDelete(ctx context.Context, deps Deps, sess Session, req Attachme
 	// buckets.Delete is idempotent on 404, so a retry after the
 	// controlplane index is already gone still cleans up safely.
 	if deps.Buckets != nil && deps.Buckets.Configured() {
-		if err := deps.Buckets.Delete(ctx, req.ID); err != nil {
+		if err := deps.Buckets.Delete(ctx, sess.Claims.Subject, req.ID); err != nil {
 			deps.logError("attachment delete buckets failed: user=%s att=%s err=%v",
 				sess.Claims.Subject, req.ID, err)
 			return nil, &AppError{Status: 502, Code: CodeUpstream, Message: "buckets attachment delete failed: " + err.Error()}

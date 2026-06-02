@@ -1037,7 +1037,15 @@ func (c *Client) SweepPendingAttachmentWrites(ctx context.Context, limit int) ([
 	return out.Rows, nil
 }
 
-func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]string, error) {
+// OrphanAttachmentRow pairs an orphaned v2 attachment id with its
+// owning user so the reaper can address the buckets object under the
+// owner's per-user tenant prefix.
+type OrphanAttachmentRow struct {
+	AttachmentID string `json:"attachment_id"`
+	ClerkUserID  string `json:"clerk_user_id"`
+}
+
+func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]OrphanAttachmentRow, error) {
 	if limit <= 0 {
 		limit = 500
 	}
@@ -1069,10 +1077,56 @@ func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]
 		return nil, nil
 	}
 	var out struct {
-		AttachmentIDs []string `json:"attachment_ids"`
+		Attachments []OrphanAttachmentRow `json:"attachments"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, fmt.Errorf("controlplane: decode orphan attachments: %w", err)
 	}
-	return out.AttachmentIDs, nil
+	return out.Attachments, nil
+}
+
+// ErrAttachmentNotFound is returned by ResolveAttachmentOwner when the
+// controlplane has no index row for the requested attachment id.
+var ErrAttachmentNotFound = errors.New("controlplane: attachment not found")
+
+// ResolveAttachmentOwner returns the clerk user id that owns the given
+// v2 attachment id. The read paths (/v1/attachment/get and the
+// unauthenticated /v1/attachment/get-public) use it to derive the
+// buckets tenant prefix from a trusted source instead of the caller.
+// Enclave-only: authenticated with the service secret. A 404 surfaces
+// as ErrAttachmentNotFound so the caller can return a clean 404.
+func (c *Client) ResolveAttachmentOwner(ctx context.Context, attachmentID string) (string, error) {
+	if attachmentID == "" {
+		return "", errors.New("controlplane: attachment id is required")
+	}
+	endpoint := c.baseURL + "/api/sync/attachment-owner/" + url.PathEscape(attachmentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return "", ErrAttachmentNotFound
+	}
+	if resp.StatusCode >= 400 {
+		return "", parseError(resp.StatusCode, body)
+	}
+	if readErr != nil {
+		return "", fmt.Errorf("controlplane: read attachment owner: %w", readErr)
+	}
+	var out struct {
+		ClerkUserID string `json:"clerk_user_id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("controlplane: decode attachment owner: %w", err)
+	}
+	if out.ClerkUserID == "" {
+		return "", ErrAttachmentNotFound
+	}
+	return out.ClerkUserID, nil
 }

@@ -1,38 +1,44 @@
-// Package buckets is the sync-enclave's HTTP client for
-// buckets.tinfoil.sh. Attachments live in a single Tinfoil-owned
-// tenant; per-user separation comes from two layers stacked on top
-// of the API key:
+// Package buckets is the sync-enclave's client for the colocated
+// tinfoil-buckets-sidecar, an S3-compatible service that runs on
+// enclave loopback. Each user's attachments live under their own
+// tenant namespace (`user-<clerkId>/<attId>`):
 //
 //  1. The access token is the attachment's enclave-minted id,
 //     globally non-colliding and unguessable to any party that does
 //     not already see the controlplane's `chat_attachments.id`
-//     column.
-//  2. The bytes stored at the slot are sealed by buckets under a
+//     column. It is the S3 object key under the owner's tenant prefix.
+//  2. The bytes stored at the slot are sealed by the sidecar under a
 //     per-attachment AES-256-GCM key the enclave mints fresh on
-//     upload. The enclave never persists that key itself: it
-//     returns the key to the webapp on PUT so the webapp embeds it
-//     in the chat JSON (in `attachments[i].encryptionKey`), exactly
-//     like the legacy v0/v1 attachment scheme. The chat JSON is
-//     sealed under the user's CEK, so the per-attachment keys
-//     inherit confidentiality from the chat envelope.
+//     upload and supplies per request via the X-Tinfoil-Encryption-Key
+//     header. The enclave never persists that key itself: it returns
+//     the key to the webapp on PUT so the webapp embeds it in the
+//     chat JSON (in `attachments[i].encryptionKey`), exactly like the
+//     legacy v0/v1 attachment scheme. The chat JSON is sealed under
+//     the user's CEK, so the per-attachment keys inherit
+//     confidentiality from the chat envelope.
 //
-// Because the per-attachment key lives in the chat JSON, sharing
-// works out of the box: re-sealing only the chat plaintext under a
-// fresh share key automatically grants the recipient access to all
-// the attachment keys without re-encrypting any blob.
+// The per-user tenant prefix is not a confidentiality boundary — the
+// per-attachment key is — but a storage namespace that scopes every
+// read and delete to the owning user, so a forged or mismatched
+// attachment id can only ever address the caller's own objects.
+//
+// The sidecar runs in multitenant mode, which requires every request
+// to carry both X-Tinfoil-Tenant-Id and a base64 32-byte
+// X-Tinfoil-Encryption-Key. Single deletes carry a throwaway key
+// because the resolver mandates the header on every request but never
+// uses it to decrypt on that path.
 package buckets
 
 import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
-	"strconv"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -41,189 +47,175 @@ import (
 // present in buckets. Callers map this to a 404.
 var ErrNotFound = errors.New("buckets: item not found")
 
-// ErrForbidden is returned when buckets rejects the supplied slot key.
+// ErrForbidden is returned when the sidecar cannot decrypt the object
+// with the supplied key (S3 error code DecryptionFailed).
 var ErrForbidden = errors.New("buckets: forbidden")
 
-const defaultRequestTimeout = 5 * time.Minute
+const (
+	defaultRequestTimeout = 5 * time.Minute
 
-// Client talks to buckets.tinfoil.sh on behalf of the enclave.
-// Authentication is a single static Tinfoil API key the enclave
-// holds; every request is attributed to that key's tenant in R2.
+	// encryptionKeySize is the AES-256 key length the sidecar's
+	// multitenant resolver requires; it rejects any key that does not
+	// decode to exactly 32 bytes with a 400.
+	encryptionKeySize = 32
+
+	// tenantPrefix namespaces every object under the owning user
+	// (`user-<clerkId>/<accessToken>`). The combined tenant id must
+	// match the sidecar's [A-Za-z0-9_-]{1,64} rule.
+	tenantPrefix = "user-"
+
+	// bucketPathSegment is the {bucket} segment of the path-style S3
+	// URL. The sidecar ignores it and routes to its own configured
+	// BUCKET, so the value is cosmetic; it only has to be a valid
+	// non-empty path segment.
+	bucketPathSegment = "bucket"
+
+	headerTenantID      = "X-Tinfoil-Tenant-Id"
+	headerEncryptionKey = "X-Tinfoil-Encryption-Key"
+
+	// s3CodeDecryptionFailed is the error code the sidecar returns
+	// (with HTTP 400) when the supplied key cannot decrypt the
+	// requested object.
+	s3CodeDecryptionFailed = "DecryptionFailed"
+)
+
+// tenantIDPattern mirrors the sidecar's MultiTenantResolver rule. A
+// derived tenant that fails this would be rejected with a 400, so the
+// client validates locally and fails loudly instead.
+var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// deleteKeyPlaceholder satisfies the sidecar's mandatory
+// X-Tinfoil-Encryption-Key header on the delete path, which never
+// decrypts. The resolver rejects any request whose key does not decode
+// to 32 bytes; a fixed all-zero key keeps the id-only delete working
+// without a real per-attachment key.
+var deleteKeyPlaceholder = make([]byte, encryptionKeySize)
+
+// Client talks to the colocated buckets sidecar over its
+// S3-compatible API. No authentication is required: the sidecar runs
+// on enclave loopback and authorizes by the per-request tenant id and
+// encryption key headers.
 type Client struct {
 	baseURL    string
-	apiKey     string
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, apiKey string, httpClient *http.Client) *Client {
+func NewClient(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
 		httpClient: httpClient,
 	}
 }
 
-// Configured reports whether the client has both a URL and an API
-// key. Callers use this to fail fast with a clean 503 when the
-// service isn't wired up (local dev, smoke tests).
+// Configured reports whether the client has a sidecar URL. Callers use
+// this to fail fast with a clean 503 when the service isn't wired up
+// (local dev, smoke tests).
 func (c *Client) Configured() bool {
-	return c != nil && c.baseURL != "" && c.apiKey != ""
+	return c != nil && c.baseURL != ""
 }
 
-type getRequest struct {
-	AccessToken   string `json:"access_token"`
-	EncryptionKey string `json:"encryption_key"`
-}
-
-type accessTokenRequest struct {
-	AccessToken string `json:"access_token"`
-}
-
-type putResponse struct {
-	PlaintextLength int64  `json:"plaintext_length"`
-	Version         int64  `json:"version"`
-	CreatedAt       string `json:"created_at"`
-}
-
-// Put stores a value at the given access token, encrypted server-side
-// under the supplied 32-byte key. The multipart body is streamed via
-// an io.Pipe so the full plaintext is never buffered in memory a
-// second time — attachments can be up to the request-size cap and
-// doubling that cost during the upload would push us into OOM territory.
-func (c *Client) Put(ctx context.Context, accessToken string, plaintext, key []byte) error {
+// Put stores plaintext for owner at the given access token, encrypted
+// by the sidecar under the supplied 32-byte key. The body is a single
+// path-style S3 PutObject; the sidecar requires Content-Length, which
+// the request carries explicitly.
+func (c *Client) Put(ctx context.Context, owner, accessToken string, plaintext, key []byte) error {
 	if !c.Configured() {
 		return errors.New("buckets: client not configured")
 	}
-	if len(key) != 32 {
-		return fmt.Errorf("buckets: encryption key must be 32 bytes, got %d", len(key))
+	if len(key) != encryptionKeySize {
+		return fmt.Errorf("buckets: encryption key must be %d bytes, got %d", encryptionKeySize, len(key))
 	}
-
-	bodyReader, bodyWriter := io.Pipe()
-	writer := multipart.NewWriter(bodyWriter)
-
-	// Goroutine writes the multipart sections into the pipe; the
-	// HTTP transport reads them out. Closing the writer side with
-	// an error makes the transport surface that error verbatim
-	// instead of emitting a truncated request body.
-	go func() {
-		err := func() error {
-			if err := writer.WriteField("access_token", accessToken); err != nil {
-				return fmt.Errorf("buckets: write access token: %w", err)
-			}
-			if err := writer.WriteField("encryption_keys", base64.StdEncoding.EncodeToString(key)); err != nil {
-				return fmt.Errorf("buckets: write encryption key: %w", err)
-			}
-			if err := writer.WriteField("plaintext_length", strconv.Itoa(len(plaintext))); err != nil {
-				return fmt.Errorf("buckets: write plaintext length: %w", err)
-			}
-			dataPart, err := writer.CreateFormField("data")
-			if err != nil {
-				return fmt.Errorf("buckets: create data field: %w", err)
-			}
-			if _, err := dataPart.Write(plaintext); err != nil {
-				return fmt.Errorf("buckets: write data: %w", err)
-			}
-			if err := writer.Close(); err != nil {
-				return fmt.Errorf("buckets: close multipart: %w", err)
-			}
-			return nil
-		}()
-		_ = bodyWriter.CloseWithError(err)
-	}()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/put"), bodyReader)
+	tenant, err := tenantForUser(owner)
 	if err != nil {
-		_ = bodyReader.Close()
 		return err
 	}
-	c.setAuth(req)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.objectURL(accessToken), bytes.NewReader(plaintext))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(plaintext))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	c.setTenantHeaders(req, tenant, key)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("buckets: put request: %w", err)
 	}
 	defer resp.Body.Close()
-	if err := c.expectOK(resp); err != nil {
-		return err
-	}
-	var pr putResponse
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return fmt.Errorf("buckets: decode put: %w", err)
-	}
-	if pr.PlaintextLength != int64(len(plaintext)) {
-		return fmt.Errorf("buckets: put length mismatch: got %d, want %d", pr.PlaintextLength, len(plaintext))
-	}
-	return nil
+	return c.expectOK(resp)
 }
 
-// Get fetches and returns the plaintext for the given access token.
-// The supplied key must match one of the slots registered at PUT.
-func (c *Client) Get(ctx context.Context, accessToken string, key []byte) ([]byte, error) {
+// Get fetches and returns the plaintext owner stored at the given
+// access token. The supplied key must be the one the object was sealed
+// under at PUT.
+func (c *Client) Get(ctx context.Context, owner, accessToken string, key []byte) ([]byte, error) {
 	if !c.Configured() {
 		return nil, errors.New("buckets: client not configured")
 	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("buckets: encryption key must be 32 bytes, got %d", len(key))
+	if len(key) != encryptionKeySize {
+		return nil, fmt.Errorf("buckets: encryption key must be %d bytes, got %d", encryptionKeySize, len(key))
 	}
-	body, err := json.Marshal(getRequest{
-		AccessToken:   accessToken,
-		EncryptionKey: base64.StdEncoding.EncodeToString(key),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("buckets: marshal get: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/get"), bytes.NewReader(body))
+	tenant, err := tenantForUser(owner)
 	if err != nil {
 		return nil, err
 	}
-	c.setAuth(req)
-	req.Header.Set("Content-Type", "application/json")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.objectURL(accessToken), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setTenantHeaders(req, tenant, key)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("buckets: get request: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		// Drain the 404 body so the HTTP/1.1 connection can be
-		// reused; otherwise repeated cache misses keep stacking
-		// new TCP connections.
+	switch resp.StatusCode {
+	case http.StatusOK:
+		plaintext, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("buckets: read get: %w", err)
+		}
+		return plaintext, nil
+	case http.StatusNotFound:
+		// Drain the body so the HTTP/1.1 connection can be reused;
+		// otherwise repeated cache misses keep stacking new TCP
+		// connections.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, ErrNotFound
+	case http.StatusBadRequest:
+		// The only 400 a well-formed GET can trigger is a key/object
+		// mismatch (DecryptionFailed); the headers we send are always
+		// valid. Confirm the S3 error code before mapping so genuine
+		// InvalidArgument bugs aren't silently treated as forbidden.
+		code, msg := s3Error(resp.Body)
+		if code == s3CodeDecryptionFailed {
+			return nil, ErrForbidden
+		}
+		return nil, fmt.Errorf("buckets: get status 400: %s", joinCodeMessage(code, msg))
+	default:
+		code, msg := s3Error(resp.Body)
+		return nil, fmt.Errorf("buckets: get status %d: %s", resp.StatusCode, joinCodeMessage(code, msg))
 	}
-	if resp.StatusCode == http.StatusForbidden {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil, ErrForbidden
-	}
-	if err := c.expectOK(resp); err != nil {
-		return nil, err
-	}
-	plaintext, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("buckets: read get: %w", err)
-	}
-	return plaintext, nil
 }
 
-// Delete removes the item at the given access token. A 404 from
-// buckets is treated as success: callers want an idempotent delete
+// Delete removes owner's item at the given access token. A 404 from
+// the sidecar is treated as success: callers want an idempotent delete
 // and the item being already-gone is the desired terminal state.
-func (c *Client) Delete(ctx context.Context, accessToken string) error {
+func (c *Client) Delete(ctx context.Context, owner, accessToken string) error {
 	if !c.Configured() {
 		return errors.New("buckets: client not configured")
 	}
-	body, err := json.Marshal(accessTokenRequest{AccessToken: accessToken})
-	if err != nil {
-		return fmt.Errorf("buckets: marshal delete: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL("/delete"), bytes.NewReader(body))
+	tenant, err := tenantForUser(owner)
 	if err != nil {
 		return err
 	}
-	c.setAuth(req)
-	req.Header.Set("Content-Type", "application/json")
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.objectURL(accessToken), nil)
+	if err != nil {
+		return err
+	}
+	c.setTenantHeaders(req, tenant, deleteKeyPlaceholder)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("buckets: delete request: %w", err)
@@ -233,26 +225,73 @@ func (c *Client) Delete(ctx context.Context, accessToken string) error {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := c.expectOK(resp); err != nil {
-		return err
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
+	return c.expectOK(resp)
 }
 
-func (c *Client) endpointURL(path string) string {
-	return c.baseURL + path
+func (c *Client) objectURL(accessToken string) string {
+	return c.baseURL + "/" + bucketPathSegment + "/" + accessToken
 }
 
-func (c *Client) setAuth(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+func (c *Client) setTenantHeaders(req *http.Request, tenant string, key []byte) {
+	req.Header.Set(headerTenantID, tenant)
+	req.Header.Set(headerEncryptionKey, base64.StdEncoding.EncodeToString(key))
 }
 
 func (c *Client) expectOK(resp *http.Response) error {
 	if resp.StatusCode/100 == 2 {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	preview, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return fmt.Errorf("buckets: status %d: %s", resp.StatusCode, strings.TrimSpace(string(preview)))
+	code, msg := s3Error(resp.Body)
+	return fmt.Errorf("buckets: status %d: %s", resp.StatusCode, joinCodeMessage(code, msg))
+}
+
+// TenantForUser exposes the per-user tenant derivation so test
+// harnesses can address objects under the same prefix the client
+// uses without duplicating the prefix rule.
+func TenantForUser(owner string) (string, error) {
+	return tenantForUser(owner)
+}
+
+// tenantForUser derives and validates the per-user tenant id. A
+// malformed owner (empty, or one that pushes the tenant past the
+// sidecar's character/length rule) fails here instead of as an opaque
+// 400 from the sidecar.
+func tenantForUser(owner string) (string, error) {
+	if owner == "" {
+		return "", errors.New("buckets: owner is required")
+	}
+	tenant := tenantPrefix + owner
+	if !tenantIDPattern.MatchString(tenant) {
+		return "", fmt.Errorf("buckets: owner %q yields invalid tenant id", owner)
+	}
+	return tenant, nil
+}
+
+type s3ErrorBody struct {
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+// s3Error reads a bounded S3 XML error body and returns its Code and
+// Message. On a body that isn't parseable XML it returns an empty code
+// and the trimmed raw text so the caller can still surface something.
+func s3Error(r io.Reader) (code, message string) {
+	raw, _ := io.ReadAll(io.LimitReader(r, 8192))
+	var e s3ErrorBody
+	if err := xml.Unmarshal(raw, &e); err == nil && e.Code != "" {
+		return e.Code, e.Message
+	}
+	return "", strings.TrimSpace(string(raw))
+}
+
+func joinCodeMessage(code, message string) string {
+	switch {
+	case code != "" && message != "":
+		return code + ": " + message
+	case code != "":
+		return code
+	default:
+		return message
+	}
 }
