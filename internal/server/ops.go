@@ -298,7 +298,7 @@ func pullOne(
 	case envelope.VersionV2:
 		dec, err := envelope.DecryptV2(blob.Ciphertext, keys, envelope.AAD{
 			Scope:       scope,
-			ID:          id,
+			ID:          aadIDForScope(scope, id),
 			ClerkUserID: sess.Claims.Subject,
 		})
 		if err != nil {
@@ -1253,6 +1253,26 @@ func messageCountFromMetadata(scope string, metadata map[string]any) *int {
 	}
 }
 
+// aadIDForScope maps a controlplane storage id to the canonical
+// envelope AAD id. Profile is the only scope where the two differ: the
+// controlplane keys a user's profile row by clerk_user_id, so its list
+// and needs-migration endpoints return the user id as the row id, while
+// the envelope pins the profile AAD id to a fixed singleton. Every
+// internal path that builds a v2 AAD from a controlplane-supplied id —
+// the migration read, the inline pull read, and the rewrap write — must
+// run the id through here, or the read and write AADs disagree for
+// profiles and the row can never be decrypted again.
+//
+// The client-facing Push path deliberately does not use this: it keeps
+// the fail-closed AAD guard so a client that forgets to send the
+// profile singleton id gets a loud error instead of a silent normalize.
+func aadIDForScope(scope envelope.Scope, storageID string) string {
+	if scope == envelope.ScopeProfile {
+		return envelope.ProfileSingletonID
+	}
+	return storageID
+}
+
 // decryptAnyVersion picks the right decrypt path for whichever
 // envelope version the ciphertext is in. Returns the plaintext (caller
 // owns the buffer and must zeroize) and ok=true on success.
@@ -1261,7 +1281,7 @@ func decryptAnyVersion(ciphertext []byte, keys []envelope.Key, scope envelope.Sc
 	case envelope.VersionV2:
 		dec, err := envelope.DecryptV2(ciphertext, keys, envelope.AAD{
 			Scope:       scope,
-			ID:          id,
+			ID:          aadIDForScope(scope, id),
 			ClerkUserID: clerkUserID,
 		})
 		if err != nil {

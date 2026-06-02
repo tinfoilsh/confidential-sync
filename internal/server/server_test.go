@@ -1052,6 +1052,91 @@ func TestMigrateLegacyBlob(t *testing.T) {
 	}
 }
 
+// TestMigrateV2ProfileAddressedByClerkUserID pins the read-side half
+// of the profile AAD-id contract. The controlplane addresses profile
+// rows by clerk_user_id, so its needs-migration list returns the user
+// id as the row id — but a v2 profile envelope is sealed with the AAD
+// id fixed to the profile singleton. The migrate read path must
+// normalize the storage id back to that singleton before rebuilding
+// the AAD; otherwise a v2 profile (e.g. one being re-sealed under a
+// rotated CEK) fails to decrypt and the migration silently blocks.
+func TestMigrateV2ProfileAddressedByClerkUserID(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	// Seal a profile blob exactly as the write path does: AAD id
+	// pinned to the profile singleton, not the clerk_user_id the
+	// controlplane stores the row under.
+	profilePT := []byte(`{"language":"English","theme":"dark"}`)
+	v2blob, err := envelope.Encrypt(f.userKey, profilePT, envelope.AAD{
+		KeyIDHex:    f.userKeyID,
+		Scope:       envelope.ScopeProfile,
+		ID:          envelope.ProfileSingletonID,
+		ClerkUserID: f.userSub,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mint the rotation target key the migrate re-seals under.
+	targetRaw := make([]byte, cryptopkg.KeySize)
+	if _, err := rand.Read(targetRaw); err != nil {
+		t.Fatal(err)
+	}
+	targetB64 := base64.StdEncoding.EncodeToString(targetRaw)
+	targetKIDBytes, _ := cryptopkg.DeriveKeyID(targetRaw)
+	targetKID := cryptopkg.KeyIDHex(targetKIDBytes)
+
+	// The profile row lives under "profile/profile" in the stub, but
+	// the needs-migration list reports it by clerk_user_id, mirroring
+	// the real controlplane.
+	f.cp.mu.Lock()
+	f.cp.blobs["profile/profile"] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: v2blob}
+	f.cp.needsMigration = []cpNeedsMigration{{ID: f.userSub}}
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/blobs/migrate", MigrateRequest{
+		Scope:  "profile",
+		Limit:  10,
+		Keys:   []PullKey{{Key: f.userKeyB64}},
+		Target: MigrateTarget{Key: targetB64},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("migrate: %d %s", resp.StatusCode, body)
+	}
+	var mr MigrateResponse
+	if err := json.Unmarshal(body, &mr); err != nil {
+		t.Fatal(err)
+	}
+	if mr.Migrated != 1 || len(mr.Blocked) != 0 {
+		t.Fatalf("profile v2 migrate blocked (read AAD id not normalized?): %+v", mr)
+	}
+
+	// The re-sealed row must decrypt under the target key with the
+	// AAD id still pinned to the profile singleton.
+	f.cp.mu.Lock()
+	after := f.cp.blobs["profile/profile"]
+	f.cp.mu.Unlock()
+	if envelope.Detect(after.Body) != envelope.VersionV2 {
+		t.Fatalf("profile row not v2 after migrate")
+	}
+	if after.KeyID != targetKID {
+		t.Fatalf("profile row key id = %q, want target %q", after.KeyID, targetKID)
+	}
+	targetKey := envelope.Key{Bytes: targetRaw, KeyIDHex: targetKID}
+	dec, err := envelope.DecryptV2(after.Body, []envelope.Key{targetKey}, envelope.AAD{
+		Scope:       envelope.ScopeProfile,
+		ID:          envelope.ProfileSingletonID,
+		ClerkUserID: f.userSub,
+	})
+	if err != nil {
+		t.Fatalf("decrypt migrated profile under target key: %v", err)
+	}
+	if !bytes.Equal(dec.Plaintext, profilePT) {
+		t.Fatalf("profile plaintext changed across migrate: got %q want %q", dec.Plaintext, profilePT)
+	}
+}
+
 func TestMigrateBlobBumpsAttemptsOnFailure(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
