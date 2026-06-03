@@ -1,40 +1,49 @@
+// Package bucketstub is an in-memory stand-in for the colocated
+// tinfoil-buckets-sidecar's S3-compatible API. It implements just the
+// surface the enclave's buckets.Client exercises: path-style
+// PutObject/GetObject/DeleteObject, all gated on the multitenant
+// X-Tinfoil-Tenant-Id and X-Tinfoil-Encryption-Key headers. Objects
+// are namespaced by tenant, and GET verifies the supplied key matches
+// the one declared at PUT — the same model the real sidecar uses (a
+// wrong key surfaces as a 400 DecryptionFailed instead of decrypting).
 package bucketstub
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
+	"encoding/xml"
 	"io"
-	"mime/multipart"
 	"net/http"
-	"strconv"
-	"strings"
+	"regexp"
 	"sync"
 	"time"
 )
 
 const (
-	minAccessTokenLength = 36
-	maxAccessTokenLength = 76
-	defaultPartSize      = 64 << 20
-	// maxStubPlaintextBytes caps the multipart `data` body the stub
-	// will buffer. Real buckets streams to object storage; the
-	// stub holds everything in memory, so an unbounded read would
-	// let a misconfigured or hostile client OOM the test harness.
-	// Pegging the cap at 256 MiB leaves plenty of headroom for the
-	// largest attachments the enclave will ever push through.
+	defaultPartSize = 64 << 20
+	// maxStubPlaintextBytes caps the object body the stub will buffer.
+	// The real sidecar streams to object storage; the stub holds
+	// everything in memory, so an unbounded read would let a
+	// misconfigured or hostile client OOM the test harness.
 	maxStubPlaintextBytes = 256 << 20
+
+	headerTenantID      = "X-Tinfoil-Tenant-Id"
+	headerEncryptionKey = "X-Tinfoil-Encryption-Key"
+	encryptionKeySize   = 32
 )
 
+var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 type Store struct {
-	mu     sync.Mutex
-	apiKey string
-	items  map[string]Item
+	mu    sync.Mutex
+	items map[string]Item
 }
 
+// Item is a stored object. Tenant namespaces it; Value is the
+// plaintext; EncryptionKeys holds the key it was sealed under so GET
+// can reject a mismatched key.
 type Item struct {
+	Tenant         string
 	Value          []byte
 	EncryptionKeys [][]byte
 	Version        int64
@@ -42,36 +51,13 @@ type Item struct {
 	PartSize       int64
 }
 
-func NewStore(apiKey string) *Store {
-	return &Store{
-		apiKey: apiKey,
-		items:  map[string]Item{},
-	}
+func NewStore() *Store {
+	return &Store{items: map[string]Item{}}
 }
 
-func (s *Store) Handle(w http.ResponseWriter, r *http.Request) {
-	if got := r.Header.Get("Authorization"); got != "Bearer "+s.apiKey {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	switch r.URL.Path {
-	case "/put":
-		s.put(w, r)
-	case "/get":
-		s.get(w, r)
-	case "/delete":
-		s.delete(w, r)
-	default:
-		http.NotFound(w, r)
-	}
-}
-
+// Put pre-seeds an object by token. Tests use it to stage attachments
+// without going through an HTTP PUT; set Item.Tenant to the owning
+// user's tenant so tenant-scoped GET/DELETE address it.
 func (s *Store) Put(token string, item Item) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,6 +73,8 @@ func (s *Store) Put(token string, item Item) {
 	s.items[token] = cloneItem(item)
 }
 
+// Has reports whether any tenant holds the token. Attachment ids are
+// globally unique, so tests assert presence by token alone.
 func (s *Store) Has(token string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,109 +102,36 @@ func (s *Store) Tokens() []string {
 	return tokens
 }
 
-func (s *Store) put(w http.ResponseWriter, r *http.Request) {
-	reader, err := r.MultipartReader()
+// Handle dispatches the S3-style request. Harnesses register it for
+// both "/{bucket}/{key}" (object ops) and "/{bucket}" (bucket ops).
+func (s *Store) Handle(w http.ResponseWriter, r *http.Request) {
+	tenant, key, ok := resolveTenant(w, r)
+	if !ok {
+		return
+	}
+	objectKey := r.PathValue("key")
+	switch {
+	case objectKey != "" && r.Method == http.MethodPut:
+		s.putObject(w, r, tenant, key, objectKey)
+	case objectKey != "" && r.Method == http.MethodGet:
+		s.getObject(w, tenant, key, objectKey)
+	case objectKey != "" && r.Method == http.MethodDelete:
+		s.deleteObject(w, tenant, objectKey)
+	default:
+		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "unsupported operation")
+	}
+}
+
+func (s *Store) putObject(w http.ResponseWriter, r *http.Request, tenant string, key []byte, token string) {
+	value, err := io.ReadAll(io.LimitReader(r.Body, maxStubPlaintextBytes+1))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", err.Error())
 		return
 	}
-
-	var (
-		token           string
-		keys            [][]byte
-		value           []byte
-		plaintextLength int64 = -1
-		partSize              = int64(defaultPartSize)
-		sawData         bool
-	)
-	for {
-		part, err := reader.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if sawData {
-			http.Error(w, "data must be last", http.StatusBadRequest)
-			return
-		}
-		name := part.FormName()
-		switch name {
-		case "access_token":
-			token, err = readPartString(part)
-		case "encryption_keys":
-			var encoded string
-			encoded, err = readPartString(part)
-			if err == nil {
-				var key []byte
-				key, err = base64.StdEncoding.DecodeString(encoded)
-				if err == nil && len(key) != 32 {
-					err = errBadKey
-				}
-				if err == nil {
-					keys = append(keys, key)
-				}
-			}
-		case "part_size":
-			var encoded string
-			encoded, err = readPartString(part)
-			if err == nil {
-				partSize, err = strconv.ParseInt(encoded, 10, 64)
-				if err == nil && partSize <= 0 {
-					err = errBadPartSize
-				}
-			}
-		case "plaintext_length":
-			var encoded string
-			encoded, err = readPartString(part)
-			if err == nil {
-				plaintextLength, err = strconv.ParseInt(encoded, 10, 64)
-			}
-		case "data":
-			if plaintextLength < 0 {
-				http.Error(w, "plaintext_length is required before data", http.StatusBadRequest)
-				return
-			}
-			// Bound the read so a body that lies about its
-			// declared plaintext_length (or exceeds the stub's
-			// memory cap outright) cannot exhaust the test
-			// harness. Reading one extra byte lets the
-			// plaintext_length mismatch check below report the
-			// failure instead of silently truncating at the cap.
-			readLimit := plaintextLength
-			if readLimit > maxStubPlaintextBytes {
-				readLimit = maxStubPlaintextBytes
-			}
-			value, err = io.ReadAll(io.LimitReader(part, readLimit+1))
-			sawData = true
-		default:
-			http.Error(w, "unknown field", http.StatusBadRequest)
-			return
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-	if !validAccessToken(token) {
-		http.Error(w, "bad access token", http.StatusBadRequest)
+	if int64(len(value)) > maxStubPlaintextBytes {
+		writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "object exceeds stub buffer")
 		return
 	}
-	if len(keys) == 0 {
-		http.Error(w, "bad key", http.StatusBadRequest)
-		return
-	}
-	if plaintextLength < 0 || !sawData {
-		http.Error(w, "missing data", http.StatusBadRequest)
-		return
-	}
-	if int64(len(value)) != plaintextLength {
-		http.Error(w, "plaintext_length mismatch", http.StatusBadRequest)
-		return
-	}
-
 	s.mu.Lock()
 	version := int64(1)
 	createdAt := time.Now().UTC()
@@ -227,95 +142,65 @@ func (s *Store) put(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.items[token] = cloneItem(Item{
+		Tenant:         tenant,
 		Value:          value,
-		EncryptionKeys: keys,
+		EncryptionKeys: [][]byte{key},
 		Version:        version,
 		CreatedAt:      createdAt,
-		PartSize:       partSize,
+		PartSize:       defaultPartSize,
 	})
 	s.mu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
-		PlaintextLength int64  `json:"plaintext_length"`
-		Version         int64  `json:"version"`
-		CreatedAt       string `json:"created_at"`
-	}{
-		PlaintextLength: plaintextLength,
-		Version:         version,
-		CreatedAt:       createdAt.Format(time.RFC3339Nano),
-	})
+	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Store) get(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		AccessToken   string `json:"access_token"`
-		EncryptionKey string `json:"encryption_key"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if !validAccessToken(body.AccessToken) {
-		http.Error(w, "bad access token", http.StatusBadRequest)
-		return
-	}
-	item, ok := s.Item(body.AccessToken)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	supplied, err := base64.StdEncoding.DecodeString(body.EncryptionKey)
-	if err != nil {
-		http.Error(w, "bad key", http.StatusBadRequest)
-		return
-	}
-	if len(supplied) != 32 {
-		http.Error(w, "bad key", http.StatusBadRequest)
+func (s *Store) getObject(w http.ResponseWriter, tenant string, key []byte, token string) {
+	item, ok := s.Item(token)
+	if !ok || item.Tenant != tenant {
+		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "object not found")
 		return
 	}
 	match := false
 	for _, k := range item.EncryptionKeys {
-		if bytes.Equal(k, supplied) {
+		if bytes.Equal(k, key) {
 			match = true
 			break
 		}
 	}
 	if !match {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		writeS3Error(w, http.StatusBadRequest, "DecryptionFailed", "the provided encryption key cannot decrypt this object")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Version", strconv.FormatInt(item.Version, 10))
-	w.Header().Set("X-Created-At", item.CreatedAt.Format(time.RFC3339Nano))
-	w.Header().Set("X-Num-Encryption-Keys", strconv.Itoa(len(item.EncryptionKeys)))
-	w.Header().Set("X-Encryption-Key-Fingerprints", encryptionKeyFingerprints(item.EncryptionKeys))
-	w.Header().Set("X-Plaintext-Length", strconv.Itoa(len(item.Value)))
-	w.Header().Set("X-Part-Size", strconv.FormatInt(item.PartSize, 10))
-	w.Header().Set("Content-Length", strconv.Itoa(len(item.Value)))
+	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(item.Value)
 }
 
-func (s *Store) delete(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if !validAccessToken(body.AccessToken) {
-		http.Error(w, "bad access token", http.StatusBadRequest)
-		return
-	}
+func (s *Store) deleteObject(w http.ResponseWriter, tenant, token string) {
 	s.mu.Lock()
-	delete(s.items, body.AccessToken)
+	if item, ok := s.items[token]; ok && item.Tenant == tenant {
+		delete(s.items, token)
+	}
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func resolveTenant(w http.ResponseWriter, r *http.Request) (tenant string, key []byte, ok bool) {
+	tenant = r.Header.Get(headerTenantID)
+	if tenant == "" || !tenantIDPattern.MatchString(tenant) {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "missing or invalid "+headerTenantID)
+		return "", nil, false
+	}
+	key, err := base64.StdEncoding.DecodeString(r.Header.Get(headerEncryptionKey))
+	if err != nil || len(key) != encryptionKeySize {
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "missing or invalid "+headerEncryptionKey)
+		return "", nil, false
+	}
+	return tenant, key, true
+}
+
 func cloneItem(item Item) Item {
 	cp := Item{
+		Tenant:         item.Tenant,
 		Value:          append([]byte(nil), item.Value...),
 		EncryptionKeys: make([][]byte, len(item.EncryptionKeys)),
 		Version:        item.Version,
@@ -328,54 +213,14 @@ func cloneItem(item Item) Item {
 	return cp
 }
 
-var (
-	errBadKey      = &badRequestError{message: "bad key"}
-	errBadPartSize = &badRequestError{message: "part_size must be positive"}
-)
-
-type badRequestError struct {
-	message string
+type s3Error struct {
+	XMLName xml.Name `xml:"Error"`
+	Code    string   `xml:"Code"`
+	Message string   `xml:"Message"`
 }
 
-func (e *badRequestError) Error() string {
-	return e.message
-}
-
-func readPartString(part *multipart.Part) (string, error) {
-	b, err := io.ReadAll(part)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-func validAccessToken(token string) bool {
-	if len(token) < minAccessTokenLength || len(token) > maxAccessTokenLength {
-		return false
-	}
-	for _, ch := range token {
-		if ch >= 'a' && ch <= 'z' {
-			continue
-		}
-		if ch >= 'A' && ch <= 'Z' {
-			continue
-		}
-		if ch >= '0' && ch <= '9' {
-			continue
-		}
-		if ch == '_' || ch == '-' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func encryptionKeyFingerprints(keys [][]byte) string {
-	fingerprints := make([]string, 0, len(keys))
-	for _, key := range keys {
-		sum := sha256.Sum256(key)
-		fingerprints = append(fingerprints, hex.EncodeToString(sum[:]))
-	}
-	return strings.Join(fingerprints, ",")
+func writeS3Error(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	_ = xml.NewEncoder(w).Encode(s3Error{Code: code, Message: message})
 }

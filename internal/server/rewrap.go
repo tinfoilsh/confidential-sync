@@ -282,7 +282,7 @@ func promoteOneAttachment(
 	deps.logInfo("attachment promote decrypted: user=%s chat=%s att=%s ciphertext_bytes=%d plaintext_bytes=%d",
 		sess.Claims.Subject, chatID, attID, len(resp.Ciphertext), len(plaintext))
 
-	if err := deps.Buckets.Put(ctx, attID, plaintext, legacyKey); err != nil {
+	if err := deps.Buckets.Put(ctx, sess.Claims.Subject, attID, plaintext, legacyKey); err != nil {
 		return fmt.Errorf("rewrap: promote attachment %s to buckets: %w", attID, err)
 	}
 	if err := deps.Controlplane.RegisterAttachmentIndex(ctx, sess.RawJWT, sess.Claims.Subject, attID, chatID); err != nil {
@@ -301,13 +301,15 @@ func promoteOneAttachment(
 // attachment id supplied by the controlplane's chat-delete response.
 // The ids MUST come from the controlplane (via
 // `DeleteBlobResponse.WipedV2Attachments`), never from the
-// user-controlled chat plaintext: buckets has no per-user ownership
-// check, so trusting JSON ids would let a crafted chat delete an
-// unrelated victim's attachment whose id the attacker happened to
-// know. Failures are swallowed; an orphan in buckets is
-// unaddressable without the per-attachment slot key, which lived in
-// the (now-deleted) chat envelope.
-func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
+// user-controlled chat plaintext: trusting JSON ids would let a
+// crafted chat name an unrelated victim's attachment id. Deletion is
+// scoped to the owner's tenant prefix, so a mismatched id at most
+// targets a non-existent object in the caller's own namespace, but
+// the controlplane remains the only authoritative source of ids.
+// Failures are swallowed; an orphan in buckets is unaddressable
+// without the per-attachment slot key, which lived in the
+// (now-deleted) chat envelope.
+func deleteBucketAttachments(ctx context.Context, deps Deps, owner string, ids []string) {
 	if !deps.Buckets.Configured() {
 		return
 	}
@@ -319,7 +321,7 @@ func deleteBucketAttachments(ctx context.Context, deps Deps, ids []string) {
 	defer cancel()
 	deleted := 0
 	for _, attID := range ids {
-		if err := deps.Buckets.Delete(cleanupCtx, attID); err != nil {
+		if err := deps.Buckets.Delete(cleanupCtx, owner, attID); err != nil {
 			deps.logError("buckets cleanup failed: att=%s err=%v", attID, err)
 			continue
 		}

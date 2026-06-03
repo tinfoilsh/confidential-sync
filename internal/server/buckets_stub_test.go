@@ -8,15 +8,14 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/bucketstub"
 )
 
-// bucketsStub mirrors the subset of buckets.tinfoil.sh that the
-// enclave's buckets.Client talks to: a single tenant keyed by API
-// key, with POSTs to /put, /get, and /delete. Values are stored
-// in-memory along with the encryption keys the caller declared at
-// PUT-time, and GET verifies the supplied encryption_key matches one
-// of the slots — same model real buckets uses.
+// bucketsStub mirrors the subset of the colocated buckets sidecar
+// that the enclave's buckets.Client talks to: path-style object
+// PUT/GET/DELETE plus ListObjectsV2 and bulk delete, namespaced by the
+// X-Tinfoil-Tenant-Id header. Values are stored in-memory along with
+// the encryption key the caller declared at PUT-time, and GET verifies
+// the supplied key matches — same model the real sidecar uses.
 type bucketsStub struct {
 	t      *testing.T
-	apiKey string
 	items  *bucketstub.Store
 	server *httptest.Server
 }
@@ -26,14 +25,12 @@ type bucketsItem = bucketstub.Item
 func newBucketsStub(t *testing.T) *bucketsStub {
 	t.Helper()
 	s := &bucketsStub{
-		t:      t,
-		apiKey: "test-api-key",
+		t: t,
 	}
-	s.items = bucketstub.NewStore(s.apiKey)
+	s.items = bucketstub.NewStore()
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /put", s.items.Handle)
-	mux.HandleFunc("POST /get", s.items.Handle)
-	mux.HandleFunc("POST /delete", s.items.Handle)
+	mux.HandleFunc("/bucket/{key}", s.items.Handle)
+	mux.HandleFunc("/bucket", s.items.Handle)
 	s.server = httptest.NewServer(mux)
 	t.Cleanup(s.server.Close)
 	return s

@@ -4,227 +4,180 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"slices"
-	"strings"
 	"testing"
+
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/bucketstub"
 )
 
-const testAccessToken = "123e4567-e89b-12d3-a456-426614174000"
+const (
+	testOwner      = "user_test"
+	testOtherOwner = "user_other"
+	testToken      = "************************************"
+)
 
-func TestClientPutUsesMultipartFormat(t *testing.T) {
-	key := bytes.Repeat([]byte{7}, 32)
-	plaintext := []byte("hello")
-	var gotFields []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s", r.Method)
-			http.Error(w, "bad method", http.StatusBadRequest)
-			return
-		}
-		if r.URL.Path != "/put" {
-			t.Errorf("path = %s", r.URL.Path)
-			http.Error(w, "bad path", http.StatusBadRequest)
-			return
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
-			t.Errorf("authorization = %q", got)
-			http.Error(w, "bad auth", http.StatusBadRequest)
-			return
-		}
-		if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data;") {
-			t.Errorf("content-type = %q", got)
-			http.Error(w, "bad content-type", http.StatusBadRequest)
-			return
-		}
-		reader, err := r.MultipartReader()
-		if err != nil {
-			t.Errorf("multipart reader: %v", err)
-			http.Error(w, "bad multipart", http.StatusBadRequest)
-			return
-		}
-		for {
-			part, err := reader.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				t.Errorf("next part: %v", err)
-				http.Error(w, "bad part", http.StatusBadRequest)
-				return
-			}
-			name := part.FormName()
-			gotFields = append(gotFields, name)
-			body, err := io.ReadAll(part)
-			if err != nil {
-				t.Errorf("read part: %v", err)
-				http.Error(w, "bad read", http.StatusBadRequest)
-				return
-			}
-			switch name {
-			case "access_token":
-				if string(body) != testAccessToken {
-					t.Errorf("access token = %q", body)
-				}
-			case "encryption_keys":
-				if string(body) != base64.StdEncoding.EncodeToString(key) {
-					t.Errorf("key = %q", body)
-				}
-			case "plaintext_length":
-				if string(body) != "5" {
-					t.Errorf("plaintext_length = %q", body)
-				}
-			case "data":
-				if !bytes.Equal(body, plaintext) {
-					t.Errorf("data = %q", body)
-				}
-			default:
-				t.Errorf("unexpected field %q", name)
-			}
-		}
-		if !slices.Equal(gotFields, []string{"access_token", "encryption_keys", "plaintext_length", "data"}) {
-			t.Errorf("field order = %v", gotFields)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"plaintext_length": len(plaintext),
-			"version":          1,
-			"created_at":       "2026-04-10T12:00:00Z",
-		})
-	}))
+// newStubbedClient wires a client to an in-memory sidecar stub that
+// speaks the same path-style, multitenant S3 surface as the real
+// colocated buckets sidecar.
+func newStubbedClient(t *testing.T) (*bucketstub.Store, *Client) {
+	t.Helper()
+	store := bucketstub.NewStore()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bucket/{key}", store.Handle)
+	mux.HandleFunc("/bucket", store.Handle)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	if err := c.Put(context.Background(), testAccessToken, plaintext, key); err != nil {
-		t.Fatalf("put: %v", err)
-	}
+	return store, NewClient(srv.URL, srv.Client())
 }
 
-func TestClientGetUsesJSONAndReturnsRawBytes(t *testing.T) {
-	key := bytes.Repeat([]byte{3}, 32)
-	want := []byte{0, 1, 2, 255}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s", r.Method)
-			http.Error(w, "bad method", http.StatusBadRequest)
-			return
-		}
-		if r.URL.Path != "/get" {
-			t.Errorf("path = %s", r.URL.Path)
-			http.Error(w, "bad path", http.StatusBadRequest)
-			return
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
-			t.Errorf("authorization = %q", got)
-			http.Error(w, "bad auth", http.StatusBadRequest)
-			return
-		}
-		var body getRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode body: %v", err)
-			http.Error(w, "bad body", http.StatusBadRequest)
-			return
-		}
-		if body.AccessToken != testAccessToken {
-			t.Errorf("access token = %q", body.AccessToken)
-		}
-		if body.EncryptionKey != base64.StdEncoding.EncodeToString(key) {
-			t.Errorf("key = %q", body.EncryptionKey)
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(want)
-	}))
-	t.Cleanup(srv.Close)
+func TestClientPutGetRoundTrip(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, encryptionKeySize)
+	plaintext := []byte("hello buckets")
+	_, c := newStubbedClient(t)
 
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	got, err := c.Get(context.Background(), testAccessToken, key)
+	if err := c.Put(context.Background(), testOwner, testToken, plaintext, key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, err := c.Get(context.Background(), testOwner, testToken, key)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("got %v want %v", got, want)
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("got %q want %q", got, plaintext)
 	}
 }
 
-func TestClientDeleteUsesJSONAndNoContent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s", r.Method)
-			http.Error(w, "bad method", http.StatusBadRequest)
-			return
-		}
-		if r.URL.Path != "/delete" {
-			t.Errorf("path = %s", r.URL.Path)
-			http.Error(w, "bad path", http.StatusBadRequest)
-			return
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
-			t.Errorf("authorization = %q", got)
-			http.Error(w, "bad auth", http.StatusBadRequest)
-			return
-		}
-		var body accessTokenRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode body: %v", err)
-			http.Error(w, "bad body", http.StatusBadRequest)
-			return
-		}
-		if body.AccessToken != testAccessToken {
-			t.Errorf("access token = %q", body.AccessToken)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(srv.Close)
+func TestClientGetEmptyValue(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, encryptionKeySize)
+	_, c := newStubbedClient(t)
 
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	if err := c.Delete(context.Background(), testAccessToken); err != nil {
-		t.Fatalf("delete: %v", err)
+	if err := c.Put(context.Background(), testOwner, testToken, nil, key); err != nil {
+		t.Fatalf("put: %v", err)
 	}
-}
-
-func TestClientPreservesForbidden(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "wrong key"})
-	}))
-	t.Cleanup(srv.Close)
-
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	_, err := c.Get(context.Background(), testAccessToken, make([]byte, 32))
-	if !errors.Is(err, ErrForbidden) {
-		t.Fatalf("expected ErrForbidden, got %v", err)
-	}
-}
-
-func TestClientPreservesNotFound(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	_, err := c.Get(context.Background(), testAccessToken, make([]byte, 32))
-	if !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-func TestClientAllowsEmptyRawValue(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-	}))
-	t.Cleanup(srv.Close)
-
-	c := NewClient(srv.URL, "api-key", srv.Client())
-	got, err := c.Get(context.Background(), testAccessToken, make([]byte, 32))
+	got, err := c.Get(context.Background(), testOwner, testToken, key)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("empty value decoded to %d bytes", len(got))
+	}
+}
+
+func TestClientGetWrongKeyIsForbidden(t *testing.T) {
+	key := bytes.Repeat([]byte{2}, encryptionKeySize)
+	wrong := bytes.Repeat([]byte{3}, encryptionKeySize)
+	_, c := newStubbedClient(t)
+
+	if err := c.Put(context.Background(), testOwner, testToken, []byte("secret"), key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := c.Get(context.Background(), testOwner, testToken, wrong); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func TestClientGetMissingIsNotFound(t *testing.T) {
+	_, c := newStubbedClient(t)
+	if _, err := c.Get(context.Background(), testOwner, testToken, make([]byte, encryptionKeySize)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestClientDeleteRemovesObject(t *testing.T) {
+	key := bytes.Repeat([]byte{4}, encryptionKeySize)
+	_, c := newStubbedClient(t)
+
+	if err := c.Put(context.Background(), testOwner, testToken, []byte("bye"), key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := c.Delete(context.Background(), testOwner, testToken); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := c.Get(context.Background(), testOwner, testToken, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+}
+
+func TestClientDeleteIsIdempotent(t *testing.T) {
+	_, c := newStubbedClient(t)
+	if err := c.Delete(context.Background(), testOwner, testToken); err != nil {
+		t.Fatalf("delete of absent object should be a no-op, got %v", err)
+	}
+}
+
+// TestClientTenantIsolation proves the per-user prefix is a real
+// boundary: an object written under one owner is invisible to a
+// request that resolves to a different owner, even with the same
+// access token and key.
+func TestClientTenantIsolation(t *testing.T) {
+	key := bytes.Repeat([]byte{5}, encryptionKeySize)
+	_, c := newStubbedClient(t)
+
+	if err := c.Put(context.Background(), testOwner, testToken, []byte("mine"), key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := c.Get(context.Background(), testOtherOwner, testToken, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant get should be ErrNotFound, got %v", err)
+	}
+}
+
+func TestClientRejectsInvalidOwner(t *testing.T) {
+	_, c := newStubbedClient(t)
+	if err := c.Put(context.Background(), "", testToken, []byte("x"), make([]byte, encryptionKeySize)); err == nil {
+		t.Fatal("expected an error for an empty owner")
+	}
+}
+
+// TestClientPutWireContract locks the on-the-wire shape the sidecar
+// requires: a path-style PUT to /{bucket}/{key}, the two multitenant
+// headers, a 32-byte base64 key, and an explicit Content-Length.
+func TestClientPutWireContract(t *testing.T) {
+	key := bytes.Repeat([]byte{9}, encryptionKeySize)
+	plaintext := []byte("xyz")
+	var (
+		gotMethod string
+		gotPath   string
+		gotTenant string
+		gotKeyHdr string
+		gotLen    int64
+		gotBody   []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotTenant = r.Header.Get(headerTenantID)
+		gotKeyHdr = r.Header.Get(headerEncryptionKey)
+		gotLen = r.ContentLength
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, srv.Client())
+	if err := c.Put(context.Background(), testOwner, testToken, plaintext, key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", gotMethod)
+	}
+	if want := "/" + bucketPathSegment + "/" + testToken; gotPath != want {
+		t.Errorf("path = %s, want %s", gotPath, want)
+	}
+	if want := tenantPrefix + testOwner; gotTenant != want {
+		t.Errorf("tenant = %s, want %s", gotTenant, want)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(gotKeyHdr)
+	if err != nil || len(decoded) != encryptionKeySize {
+		t.Errorf("encryption key header = %q (decode err %v, len %d)", gotKeyHdr, err, len(decoded))
+	}
+	if gotLen != int64(len(plaintext)) {
+		t.Errorf("content-length = %d, want %d", gotLen, len(plaintext))
+	}
+	if !bytes.Equal(gotBody, plaintext) {
+		t.Errorf("body = %q, want %q", gotBody, plaintext)
 	}
 }

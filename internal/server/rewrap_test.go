@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 )
@@ -306,7 +307,11 @@ func TestDeleteChatCascadesAttachmentsToBuckets(t *testing.T) {
 	// real put/get path uses a per-attachment key as the slot key,
 	// but Delete needs only the access token, so any slot key
 	// works for this fixture.
-	f.bk.items.Put(attID, bucketsItem{Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}})
+	ownerTenant, tErr := buckets.TenantForUser(f.userSub)
+	if tErr != nil {
+		t.Fatal(tErr)
+	}
+	f.bk.items.Put(attID, bucketsItem{Tenant: ownerTenant, Value: []byte("payload"), EncryptionKeys: [][]byte{bytes.Repeat([]byte{0}, 32)}})
 	if !f.bk.has(attID) {
 		t.Fatalf("precondition: bucket not seeded")
 	}

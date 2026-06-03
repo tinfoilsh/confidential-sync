@@ -62,15 +62,15 @@ func runAttachmentOrphanSweep(ctx context.Context, deps Deps, logger Logger) {
 }
 
 func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
-	ids, err := deps.Controlplane.DeleteOrphanedV2Attachments(ctx, attachmentOrphanReaperLimit)
+	rows, err := deps.Controlplane.DeleteOrphanedV2Attachments(ctx, attachmentOrphanReaperLimit)
 	if err != nil {
 		return 0, err
 	}
 	swept := 0
 	var deleteErrs []error
-	for _, id := range ids {
-		if err := deps.Buckets.Delete(ctx, id); err != nil {
-			deleteErrs = append(deleteErrs, fmt.Errorf("delete bucket attachment %s: %w", id, err))
+	for _, row := range rows {
+		if err := deps.Buckets.Delete(ctx, row.ClerkUserID, row.AttachmentID); err != nil {
+			deleteErrs = append(deleteErrs, fmt.Errorf("delete bucket attachment %s: %w", row.AttachmentID, err))
 			continue
 		}
 		swept++
@@ -102,7 +102,7 @@ func runPendingAttachmentSweep(ctx context.Context, deps Deps, logger Logger) {
 		// removed every row in `rows` from the pending ledger, so a
 		// dropped delete here is a wasted blob, not data corruption.
 		deleteCtx, cancelDelete := context.WithTimeout(ctx, AttachmentRequestTimeout)
-		err := deps.Buckets.Delete(deleteCtx, row.AttachmentID)
+		err := deps.Buckets.Delete(deleteCtx, row.ClerkUserID, row.AttachmentID)
 		cancelDelete()
 		if err != nil {
 			if logger != nil {

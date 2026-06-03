@@ -51,7 +51,7 @@ type StubCP struct {
 
 	buckets             *bucketstub.Store
 	legacyAttachments   map[string][]byte
-	attachmentIndex     map[string]string
+	attachmentIndex     map[string]attachmentMeta
 	pendingAttachments  map[string]pendingAttachment
 	pendingExpiryWindow time.Duration
 
@@ -75,6 +75,14 @@ type pendingAttachment struct {
 	createdAt   time.Time
 }
 
+// attachmentMeta mirrors the chat_attachments index row the stub needs
+// to answer ownership queries: which chat an attachment belongs to and
+// which user owns it.
+type attachmentMeta struct {
+	chatID      string
+	clerkUserID string
+}
+
 // NewStubCP returns a stub controlplane ready to serve.
 func NewStubCP() *StubCP {
 	s := &StubCP{
@@ -82,9 +90,9 @@ func NewStubCP() *StubCP {
 		keys:                map[string]struct{}{},
 		bundles:             map[string]map[string]controlplane.CurrentKeyBundle{},
 		deletes:             map[string]time.Time{},
-		buckets:             bucketstub.NewStore(BucketsStubAPIKey),
+		buckets:             bucketstub.NewStore(),
 		legacyAttachments:   map[string][]byte{},
-		attachmentIndex:     map[string]string{},
+		attachmentIndex:     map[string]attachmentMeta{},
 		pendingAttachments:  map[string]pendingAttachment{},
 		pendingExpiryWindow: 15 * time.Minute,
 		onFirstDelete:       map[string]func(){},
@@ -113,11 +121,11 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/storage/attachment/{aid}", s.getLegacyAttachment)
 	mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.registerAttachmentIndex)
 	mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.deleteAttachmentIndex)
+	mux.HandleFunc("GET /api/sync/attachment-owner/{aid}", s.attachmentOwner)
 	mux.HandleFunc("POST /api/sync/pending-attachments/{aid}", s.reservePendingAttachment)
 	mux.HandleFunc("POST /api/sync/pending-attachments/sweep", s.sweepPendingAttachments)
-	mux.HandleFunc("POST /put", s.buckets.Handle)
-	mux.HandleFunc("POST /get", s.buckets.Handle)
-	mux.HandleFunc("POST /delete", s.buckets.Handle)
+	mux.HandleFunc("/bucket/{key}", s.buckets.Handle)
+	mux.HandleFunc("/bucket", s.buckets.Handle)
 	s.mux = mux
 	return s
 }
@@ -129,14 +137,6 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mux.ServeHTTP(w, r)
 }
-
-// BucketsStubAPIKey is the static credential the buckets stub
-// expects on every buckets call. Smoke tests configure the
-// enclave's buckets.Client with this same value; tightening the
-// check here catches missing-Authorization regressions that the
-// real buckets backend would surface as 401. Exported so the
-// stack wiring uses the same constant.
-const BucketsStubAPIKey = "local-stack-buckets-key"
 
 const LocalStackSyncEnclaveSecret = "local-stack-sync-enclave-secret"
 
@@ -324,8 +324,8 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 		s.deletes[key] = time.Now().UTC()
 		wipedV2 := []string{}
 		if scope == "chat" {
-			for aid, cid := range s.attachmentIndex {
-				if cid == id {
+			for aid, meta := range s.attachmentIndex {
+				if meta.chatID == id {
 					wipedV2 = append(wipedV2, aid)
 					delete(s.attachmentIndex, aid)
 				}
@@ -523,10 +523,30 @@ func (s *StubCP) registerAttachmentIndex(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	s.attachmentIndex[aid] = body.ChatID
+	s.attachmentIndex[aid] = attachmentMeta{
+		chatID:      body.ChatID,
+		clerkUserID: stubClerkUserIDFromAuth(r.Header.Get("Authorization")),
+	}
 	delete(s.legacyAttachments, aid)
 	delete(s.pendingAttachments, aid)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// attachmentOwner answers the enclave's ResolveAttachmentOwner lookup
+// so the read path can derive the buckets tenant prefix from a trusted
+// source instead of the caller. Service-secret gated like the rest of
+// /api/sync/*.
+func (s *StubCP) attachmentOwner(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	aid := r.PathValue("aid")
+	meta, ok := s.attachmentIndex[aid]
+	if !ok || meta.clerkUserID == "" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"clerk_user_id": meta.clerkUserID})
 }
 
 func (s *StubCP) reservePendingAttachment(w http.ResponseWriter, r *http.Request) {

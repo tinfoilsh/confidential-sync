@@ -441,7 +441,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 			return nil, err
 		}
 		if scope == envelope.ScopeChat && cpResp != nil {
-			deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
+			deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 		}
 		deps.logInfo("delete ok: user=%s scope=%s id=%s", sess.Claims.Subject, scope, req.ID)
 		return resp, nil
@@ -483,7 +483,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// filters on (clerk_user_id, chat_id) so the enclave
 				// can trust it the same way every other write path
 				// trusts controlplane authority over ownership.
-				deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
+				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 			}
 			deps.logInfo("delete ok: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, req.ID, attempt)
@@ -609,7 +609,7 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 	// entries (unreachable to anyone without the old CEK + AAD),
 	// so the cascade is fire-and-forget per-id and never fails the
 	// register-key call.
-	deleteBucketAttachments(ctx, deps, cpResp.WipedV2Attachments)
+	deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
 }
 
@@ -1143,7 +1143,7 @@ func ensureCurrentKeyRegistered(
 	deps.logInfo("migrate-all bootstrap: user=%s registered kid=%s as current",
 		sess.Claims.Subject, targetKIDHex)
 	if resp != nil {
-		deleteBucketAttachments(ctx, deps, resp.WipedV2Attachments)
+		deleteBucketAttachments(ctx, deps, sess.Claims.Subject, resp.WipedV2Attachments)
 	}
 	return nil
 }

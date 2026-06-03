@@ -8,11 +8,21 @@ containers:
     image: "ghcr.io/tinfoilsh/confidential-sync@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
     env:
       - CONTROLPLANE_URL: "https://api.tinfoil.sh"
-      - BUCKETS_URL: "https://buckets.tinfoil.sh"
+      - BUCKETS_URL: "http://localhost:9000"
       - CLERK_ISSUER: "https://clerk.tinfoil.sh"
     secrets:
-      - BUCKETS_API_KEY
       - SYNC_ENCLAVE_SECRET
+
+  - name: "buckets"
+    image: "ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:a0f5fd6a3dbdb0a95799ae687e127bb544b7998221458ae1face3fc8c3f43f30" # v0.0.5
+    env:
+      - PORT: "9000"
+      - BUCKET: "tinfoil-bucket-273354634536-us-east-2-an"
+      - AWS_REGION: "us-east-2"
+      - MULTITENANT: "true"
+    secrets:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
 
 shim:
   listen-port: 443
