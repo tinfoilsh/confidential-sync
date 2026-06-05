@@ -164,6 +164,11 @@ type KeyCurrentResponse struct {
 	Bundles    map[string]KeyCurrentBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via,omitempty"`
 	CreatedAt  string                      `json:"created_at,omitempty"`
+	// HasData reports whether the user owns encrypted blobs not sealed
+	// under the reported key. When KeyID is null it means the user has
+	// legacy (key_id IS NULL) data, so the client should route to
+	// recovery rather than first-time setup.
+	HasData bool `json:"has_data"`
 }
 
 type MigrateRequest struct {

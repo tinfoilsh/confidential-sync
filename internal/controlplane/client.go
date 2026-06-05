@@ -154,9 +154,9 @@ type ListStatusResponse struct {
 }
 
 type PutBlobRequest struct {
-	Scope          string
-	ID             string
-	JWT            string
+	Scope string
+	ID    string
+	JWT   string
 	// ClerkUserID is the verified subject from the user JWT at the
 	// enclave's auth boundary. Forwarded as X-Clerk-User-Id so the
 	// controlplane can accept the call via service auth and skip
@@ -582,6 +582,7 @@ type CurrentKeyResponse struct {
 	Bundles    map[string]CurrentKeyBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via"`
 	CreatedAt  time.Time                   `json:"created_at"`
+	HasData    bool                        `json:"has_data"`
 }
 
 type CurrentKeyBundle struct {

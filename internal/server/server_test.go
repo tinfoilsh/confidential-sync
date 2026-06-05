@@ -51,11 +51,14 @@ type fixture struct {
 }
 
 type cpStub struct {
-	t                 *testing.T
-	mu                sync.Mutex
-	blobs             map[string]*cpBlob  // scope/id → blob
-	keys              map[string]struct{} // hex KeyIDs registered
-	currentKID        string
+	t          *testing.T
+	mu         sync.Mutex
+	blobs      map[string]*cpBlob  // scope/id → blob
+	keys       map[string]struct{} // hex KeyIDs registered
+	currentKID string
+	// noKeyHasData simulates a newer controlplane that answers the
+	// no-key case with 200 + has_data instead of a bare 404.
+	noKeyHasData      bool
 	bundles           map[string]map[string]controlplane.CurrentKeyBundle
 	registeredOps     map[string]bool
 	migrationFailures map[string]int
@@ -386,6 +389,13 @@ func (s *cpStub) handleAddBundle(w http.ResponseWriter, r *http.Request) {
 
 func (s *cpStub) handleCurrentKey(w http.ResponseWriter, r *http.Request) {
 	if s.currentKID == "" {
+		if s.noKeyHasData {
+			json.NewEncoder(w).Encode(controlplane.CurrentKeyResponse{
+				Bundles: map[string]controlplane.CurrentKeyBundle{},
+				HasData: true,
+			})
+			return
+		}
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
