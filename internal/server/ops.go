@@ -1084,68 +1084,22 @@ func ensureCurrentKeyRegistered(
 		return nil
 	}
 
-	deps.logInfo("migrate-all bootstrap: user=%s no current key; registering target kid=%s",
+	// No current key is registered. Do NOT bootstrap one here: the
+	// register-key path (passkey / manual / start-fresh) is the only
+	// place that also persists a key bundle. Registering a bundleless
+	// current key strands the account — a key_id with no bundle hides
+	// the user's legacy passkey and forces manual recovery. The client
+	// must register the primary key (with its bundle) before driving
+	// migration, so surface a precondition error instead of stamping a
+	// key the user can never unlock.
+	deps.logError("migrate-all bootstrap: user=%s no current key registered; refusing to migrate target kid=%s",
 		sess.Claims.Subject, targetKIDHex)
-
-	idem := fmt.Sprintf("migrate-bootstrap:%s:%s", sess.Claims.Subject, targetKIDHex)
-	cpReq := controlplane.RegisterKeyRequest{
-		JWT:            sess.RawJWT,
-		ClerkUserID:    sess.Claims.Subject,
-		KeyIDHex:       targetKIDHex,
-		IfMatch:        controlplane.IfMatchAnyKey,
-		CreatedVia:     "recovery",
-		IdempotencyKey: idem,
+	return &AppError{
+		Status:  http.StatusConflict,
+		Code:    CodeUnknownKey,
+		Reason:  "no_current_key",
+		Message: "no current key registered; register the primary key before migrating",
 	}
-	body, err := controlplane.RegisterKeyBody(cpReq)
-	if err != nil {
-		return err
-	}
-	opKey, err := cryptopkg.DeriveOpHashKey(targetBytes)
-	if err != nil {
-		return err
-	}
-	defer cryptopkg.Zero(opKey)
-	cpReq.OperationHash = cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
-		Method:         http.MethodPost,
-		Path:           controlplane.RegisterKeyPath,
-		KeyIDHex:       targetKIDHex,
-		IfMatch:        controlplane.IfMatchAnyKey,
-		IdempotencyKey: idem,
-		Body:           body,
-	})
-
-	resp, err := deps.Controlplane.RegisterKey(ctx, cpReq)
-	if err != nil {
-		// STALE_KEY / EXISTING_DATA_UNDER_OTHER_KEY can mean either
-		// (a) a concurrent caller registered first — in which case
-		// a current key now exists and we can proceed, or (b) the
-		// controlplane already had a *different* current key when
-		// we called and IfMatch=* still failed for some other
-		// reason. We only swallow the race in case (a), so we
-		// re-fetch the current key and require it to be set;
-		// otherwise the migration loop would silently burn on
-		// STALE_KEY for every blob.
-		if controlplane.IsCode(err, controlplane.StatusStaleKey) ||
-			controlplane.IsCode(err, controlplane.StatusExistingDataUnderOtherKey) {
-			confirm, getErr := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
-			if getErr != nil {
-				return fmt.Errorf("confirm current key after register race: %w", getErr)
-			}
-			if confirm == nil || confirm.KeyID == "" {
-				return fmt.Errorf("register target as current: %w (current key still unset)", err)
-			}
-			deps.logInfo("migrate-all bootstrap: user=%s register-key race lost; current_kid=%s; proceeding",
-				sess.Claims.Subject, confirm.KeyID)
-			return nil
-		}
-		return fmt.Errorf("register target as current: %w", err)
-	}
-	deps.logInfo("migrate-all bootstrap: user=%s registered kid=%s as current",
-		sess.Claims.Subject, targetKIDHex)
-	if resp != nil {
-		deleteBucketAttachments(ctx, deps, sess.Claims.Subject, resp.WipedV2Attachments)
-	}
-	return nil
 }
 
 // isAuthError reports whether err originates from a 401/403 from

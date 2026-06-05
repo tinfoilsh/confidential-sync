@@ -592,6 +592,46 @@ func TestMigrateAllHandlerRejectsMalformedKeysSynchronously(t *testing.T) {
 	}
 }
 
+func TestMigrateAllRefusesWhenNoCurrentKeyRegistered(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	// The fixture's controlplane stub starts with no current key
+	// registered. Driving migrate-all in that state must refuse to
+	// bootstrap a bundleless current key (which would strand the
+	// account and hide the user's legacy passkey) and instead return a
+	// precondition error.
+	sess := Session{RawJWT: f.jwt(), Claims: auth.Claims{Subject: f.userSub}}
+	_, err := MigrateAll(context.Background(), f.handler.deps, sess, MigrateAllRequest{
+		Keys:   []PullKey{{Key: f.userKeyB64}},
+		Target: MigrateTarget{Key: f.userKeyB64},
+	})
+	if err == nil {
+		t.Fatal("expected migrate-all to fail when no current key is registered")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected *AppError, got %T: %v", err, err)
+	}
+	if appErr.Status != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d", appErr.Status)
+	}
+	if appErr.Code != CodeUnknownKey {
+		t.Fatalf("expected code %s, got %s", CodeUnknownKey, appErr.Code)
+	}
+	if appErr.Reason != "no_current_key" {
+		t.Fatalf("expected reason no_current_key, got %q", appErr.Reason)
+	}
+
+	// The refusal must not register a key as a side effect.
+	f.cp.mu.Lock()
+	gotKID := f.cp.currentKID
+	f.cp.mu.Unlock()
+	if gotKID != "" {
+		t.Fatalf("expected no current key to be registered, got %q", gotKID)
+	}
+}
+
 func TestMigrateStatusReturnsIdleWhenNoJob(t *testing.T) {
 	t.Parallel()
 
