@@ -744,9 +744,22 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 		deps.logError("key current failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
 	}
-	if resp == nil {
-		deps.logInfo("key current absent: user=%s", sess.Claims.Subject)
-		return nil, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "no current key"}
+	// No registered key. Older controlplanes answer with a 404 (resp ==
+	// nil); newer ones return 200 with an empty key_id plus has_data.
+	// Either way, surface the null-key shape with has_data so the client
+	// can tell a brand-new user apart from a legacy user whose blobs
+	// predate the key registry.
+	if resp == nil || resp.KeyID == "" {
+		hasData := false
+		if resp != nil {
+			hasData = resp.HasData
+		}
+		deps.logInfo("key current absent: user=%s has_data=%t", sess.Claims.Subject, hasData)
+		return &KeyCurrentResponse{
+			KeyID:   nil,
+			Bundles: map[string]KeyCurrentBundle{},
+			HasData: hasData,
+		}, nil
 	}
 	deps.logInfo("key current ok: user=%s kid=%s bundles=%d created_via=%s",
 		sess.Claims.Subject, resp.KeyID, len(resp.Bundles), resp.CreatedVia)
@@ -755,6 +768,7 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 		ETag:       resp.ETag,
 		CreatedVia: resp.CreatedVia,
 		Bundles:    make(map[string]KeyCurrentBundle, len(resp.Bundles)),
+		HasData:    resp.HasData,
 	}
 	if !resp.CreatedAt.IsZero() {
 		out.CreatedAt = resp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
