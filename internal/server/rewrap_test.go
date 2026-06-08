@@ -87,6 +87,7 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 
 	chatJSON := []byte(`{"id":"c1","messages":[]}`)
 	f.cp.mu.Lock()
+	f.cp.currentKID = f.userKeyID
 	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlob(t, f.userKey, chatJSON)}
 	f.cp.mu.Unlock()
 
@@ -118,6 +119,54 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	f.cp.mu.Unlock()
 	if envelope.Detect(after) != envelope.VersionV2 {
 		t.Fatalf("blob still legacy after auto-rewrap: %s", after)
+	}
+}
+
+// TestPullSkipsRewrapWhenNoCurrentKey guards the 409-storm fix: when
+// the pull target is not the user's registered current key (here none
+// is registered), the enclave must serve the decrypted legacy plaintext
+// with needs_rewrap=true and must NOT attempt the inline rewrap. Every
+// such rewrap 409s STALE_KEY on the controlplane CAS, so a normal pull
+// of a legacy account would otherwise storm the rewrap endpoint.
+func TestPullSkipsRewrapWhenNoCurrentKey(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	chatJSON := []byte(`{"id":"c1","messages":[]}`)
+	f.cp.mu.Lock()
+	// currentKID stays "" — a legacy account whose user_keys row was
+	// never written.
+	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlob(t, f.userKey, chatJSON)}
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat",
+		IDs:   []string{"c1"},
+		Keys:  []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull: %d %s", resp.StatusCode, body)
+	}
+	var pr PullResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if len(pr.Items) != 1 || !pr.Items[0].OK {
+		t.Fatalf("items: %+v", pr.Items)
+	}
+	if !pr.Items[0].NeedsRewrap {
+		t.Fatalf("expected needs_rewrap=true when target is not the current key")
+	}
+	got, err := base64.StdEncoding.DecodeString(pr.Items[0].Plaintext)
+	if err != nil || string(got) != string(chatJSON) {
+		t.Fatalf("plaintext mismatch: %s err=%v", got, err)
+	}
+
+	f.cp.mu.Lock()
+	after := f.cp.blobs["chat/c1"].Body
+	f.cp.mu.Unlock()
+	if envelope.Detect(after) == envelope.VersionV2 {
+		t.Fatalf("blob was rewrapped despite no current key; rewrap must be skipped")
 	}
 }
 
@@ -169,6 +218,7 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 	chatBytes, _ := json.Marshal(chat)
 	f.cp.mu.Lock()
+	f.cp.currentKID = f.userKeyID
 	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlobV1(t, f.userKey, chatBytes)}
 	f.cp.mu.Unlock()
 

@@ -252,10 +252,20 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	deps.logInfo("pull begin: user=%s scope=%s candidate_keys=%d target_kid=%s ids=%d all=%t",
 		sess.Claims.Subject, scope, len(keys), targetKIDHex, len(ids), req.All)
 
+	// Inline rewrap promotes legacy rows to v2 on first read, but the
+	// controlplane gates every rewrap CAS on the user's registered
+	// current key. When the pull target is not that key (none
+	// registered yet, or a mismatch the user must reconcile via
+	// recovery) every rewrap returns STALE_KEY. Probe once per pull and
+	// skip the inline rewrap in that case: the rows still decrypt and
+	// render via the candidate keys, and we avoid a doomed per-blob 409
+	// storm on every sync.
+	canRewrap := currentPrimaryKeyIs(ctx, deps, sess, targetKIDHex)
+
 	out := &PullResponse{NextCursor: nextCursor}
 	var okCount, failCount, legacyCount int
 	for _, id := range ids {
-		item := pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex)
+		item := pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex, canRewrap)
 		out.Items = append(out.Items, item)
 		switch {
 		case !item.OK:
@@ -281,6 +291,7 @@ func pullOne(
 	keys []envelope.Key,
 	targetKey []byte,
 	targetKIDHex string,
+	canRewrap bool,
 ) PullItem {
 	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
@@ -325,17 +336,19 @@ func pullOne(
 			return PullItem{ID: id, OK: false, Code: CodeUnknownKey, Reason: "no_key_decrypted_legacy"}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
-		if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
-			return PullItem{
-				ID: id, OK: true,
-				Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
-				KeyID:       targetKIDHex,
-				ETag:        newETag,
-				NeedsRewrap: false,
+		if canRewrap {
+			if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
+				return PullItem{
+					ID: id, OK: true,
+					Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
+					KeyID:       targetKIDHex,
+					ETag:        newETag,
+					NeedsRewrap: false,
+				}
+			} else {
+				deps.logError("pull lazy rewrap failed: user=%s scope=%s id=%s err=%v",
+					sess.Claims.Subject, scope, id, rewrapErr)
 			}
-		} else {
-			deps.logError("pull lazy rewrap failed: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, id, rewrapErr)
 		}
 		// rewrap is best-effort: if the controlplane PUT loses a CAS
 		// race or the buckets-cascade trips, surface the legacy
@@ -1065,10 +1078,12 @@ func cloneScopeReport(in MigrateAllScopeReport) MigrateAllScopeReport {
 // on current_key_id, and a freshly-arrived v2 user whose `user_keys`
 // row was never written would burn the whole migration on 409s.
 //
-// Idempotent. If a current key already exists the call is a no-op,
-// even when the existing key differs from the target — the caller's
-// subsequent rewraps will surface STALE_KEY and the client can drive
-// a key-rotation flow from there.
+// Idempotent when the registered current key already matches the
+// target. When a current key exists but differs from the target, the
+// call fails fast with STALE_KEY instead of letting the migration loop
+// fire a doomed rewrap against every blob — those all return STALE_KEY
+// from the controlplane CAS and only produce a 409 storm. The client
+// must reconcile the key (recovery / rotation) before retrying.
 func ensureCurrentKeyRegistered(
 	ctx context.Context,
 	deps Deps,
@@ -1093,6 +1108,16 @@ func ensureCurrentKeyRegistered(
 	targetKIDHex := cryptopkg.KeyIDHex(targetKIDBytes)
 
 	if current != nil && current.KeyID != "" {
+		if current.KeyID != targetKIDHex {
+			deps.logError("migrate-all bootstrap: user=%s target kid=%s != current kid=%s; refusing to migrate",
+				sess.Claims.Subject, targetKIDHex, current.KeyID)
+			return &AppError{
+				Status:  http.StatusConflict,
+				Code:    CodeStaleKey,
+				Reason:  "stale_key",
+				Message: "migration target is not the registered current key",
+			}
+		}
 		deps.logInfo("migrate-all bootstrap: user=%s current_kid=%s target_kid=%s",
 			sess.Claims.Subject, current.KeyID, targetKIDHex)
 		return nil
@@ -1114,6 +1139,23 @@ func ensureCurrentKeyRegistered(
 		Reason:  "no_current_key",
 		Message: "no current key registered; register the primary key before migrating",
 	}
+}
+
+// currentPrimaryKeyIs reports whether the user's registered current key
+// is exactly targetKIDHex. Every rewrap CAS on the controlplane is
+// gated on the current key id, so a rewrap toward any other key (none
+// registered yet, or a key the user must still reconcile) is guaranteed
+// to return STALE_KEY. Read paths probe this once per batch to skip a
+// doomed per-blob rewrap. A probe failure returns false so we err
+// toward not rewrapping rather than storming.
+func currentPrimaryKeyIs(ctx context.Context, deps Deps, sess Session, targetKIDHex string) bool {
+	current, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		deps.logError("current-key probe failed: user=%s target_kid=%s err=%v",
+			sess.Claims.Subject, targetKIDHex, err)
+		return false
+	}
+	return current != nil && current.KeyID == targetKIDHex
 }
 
 // isAuthError reports whether err originates from a 401/403 from
