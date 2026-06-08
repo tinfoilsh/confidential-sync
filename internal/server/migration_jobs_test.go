@@ -632,6 +632,51 @@ func TestMigrateAllRefusesWhenNoCurrentKeyRegistered(t *testing.T) {
 	}
 }
 
+func TestMigrateAllRefusesWhenCurrentKeyDiffersFromTarget(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	// Register a current key that is NOT the migration target. Every
+	// rewrap would 409 STALE_KEY on the controlplane CAS, so migrate-all
+	// must fail fast instead of looping doomed rewraps against every
+	// blob.
+	const otherKID = "00000000000000000000000000000000"
+	f.cp.mu.Lock()
+	f.cp.currentKID = otherKID
+	f.cp.keys[otherKID] = struct{}{}
+	f.cp.mu.Unlock()
+
+	sess := Session{RawJWT: f.jwt(), Claims: auth.Claims{Subject: f.userSub}}
+	_, err := MigrateAll(context.Background(), f.handler.deps, sess, MigrateAllRequest{
+		Keys:   []PullKey{{Key: f.userKeyB64}},
+		Target: MigrateTarget{Key: f.userKeyB64},
+	})
+	if err == nil {
+		t.Fatal("expected migrate-all to fail when current key differs from target")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected *AppError, got %T: %v", err, err)
+	}
+	if appErr.Status != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d", appErr.Status)
+	}
+	if appErr.Code != CodeStaleKey {
+		t.Fatalf("expected code %s, got %s", CodeStaleKey, appErr.Code)
+	}
+	if appErr.Reason != "stale_key" {
+		t.Fatalf("expected reason stale_key, got %q", appErr.Reason)
+	}
+
+	// The registered current key must be untouched by the refusal.
+	f.cp.mu.Lock()
+	gotKID := f.cp.currentKID
+	f.cp.mu.Unlock()
+	if gotKID != otherKID {
+		t.Fatalf("current key changed during refusal: %q", gotKID)
+	}
+}
+
 func TestMigrateStatusReturnsIdleWhenNoJob(t *testing.T) {
 	t.Parallel()
 
