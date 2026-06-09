@@ -258,6 +258,14 @@ func promoteOneAttachment(
 				sess.Claims.Subject, chatID, attID)
 			return nil
 		}
+		if errors.Is(err, controlplane.ErrLegacyAttachmentGone) {
+			// Already promoted to v2 in an earlier pass; the chat's
+			// embedded key still addresses the v2 slot, so this is a
+			// no-op rather than a chat-level rewrap failure.
+			deps.logInfo("attachment promote skip already-v2: user=%s chat=%s att=%s",
+				sess.Claims.Subject, chatID, attID)
+			return nil
+		}
 		return fmt.Errorf("rewrap: fetch legacy attachment %s: %w", attID, err)
 	}
 	if err := verifyLegacyAttachmentClaim(

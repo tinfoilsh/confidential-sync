@@ -842,6 +842,13 @@ func IsCode(err error, code string) bool {
 // (user, attachment) pair before promoting it to v2.
 var ErrLegacyAttachmentNotFound = errors.New("controlplane: legacy attachment not found")
 
+// ErrLegacyAttachmentGone is returned when the controlplane answers
+// 410: the attachment has already been promoted to v2 buckets storage,
+// so there is no legacy ciphertext left to re-seal. The rewrap caller
+// treats this exactly like not-found — a no-op skip — because the
+// chat's embedded per-attachment key already addresses the v2 slot.
+var ErrLegacyAttachmentGone = errors.New("controlplane: legacy attachment already migrated to v2")
+
 // HeaderLegacyClaim names the response header carrying the CP-signed
 // claim that authorizes a legacy attachment re-seal for a specific
 // user. Lives in controlplane/client.go so both enclave and CP can
@@ -874,6 +881,9 @@ func (c *Client) GetLegacyAttachment(ctx context.Context, jwt, clerkUserID, atta
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		return LegacyAttachmentResponse{}, ErrLegacyAttachmentNotFound
+	}
+	if resp.StatusCode == http.StatusGone {
+		return LegacyAttachmentResponse{}, ErrLegacyAttachmentGone
 	}
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

@@ -64,6 +64,7 @@ type cpStub struct {
 	migrationFailures map[string]int
 	needsMigration    []cpNeedsMigration
 	legacyAttachments map[string][]byte // attachmentID → ciphertext (set by tests)
+	goneAttachments   map[string]bool   // attachmentID → already promoted to v2 (410)
 	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
 	attachmentOwner   map[string]string // attachmentID → clerkUserID (set by tests)
 	// wipedAttachments seeds the start_fresh response so tests can
@@ -423,6 +424,10 @@ func (s *cpStub) handleRemoveBundle(w http.ResponseWriter, r *http.Request) {
 // a rewrap to simulate the v1 BYTEA storage the rewrap path drains.
 func (s *cpStub) handleLegacyAttachment(w http.ResponseWriter, r *http.Request) {
 	aid := r.PathValue("aid")
+	if s.goneAttachments[aid] {
+		w.WriteHeader(http.StatusGone)
+		return
+	}
 	if s.legacyAttachments == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
