@@ -312,6 +312,82 @@ func TestPullRewrapsAttachmentCascade(t *testing.T) {
 	}
 }
 
+// TestPullRewrapSkipsAlreadyV2Attachment guards the case daniel hit in
+// production: an older chat references an attachment that a prior pass
+// already promoted to v2, so controlplane answers the legacy fetch
+// with 410. The chat must still re-seal to v2 (the attachment is
+// already in the desired end state) instead of failing the whole chat.
+func TestPullRewrapSkipsAlreadyV2Attachment(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	attID := "223e4567-e89b-12d3-a456-426614174999"
+	attKey := make([]byte, 32)
+	if _, err := rand.Read(attKey); err != nil {
+		t.Fatal(err)
+	}
+	thumbnailB64 := base64.StdEncoding.EncodeToString([]byte("thumbnail bytes"))
+
+	// Mark the attachment as already promoted: legacy fetch returns 410,
+	// and no legacy ciphertext is planted.
+	f.cp.mu.Lock()
+	f.cp.goneAttachments = map[string]bool{attID: true}
+	f.cp.currentKID = f.userKeyID
+	f.cp.mu.Unlock()
+
+	chat := map[string]any{
+		"id": "c1",
+		"messages": []any{
+			map[string]any{
+				"id":   "m1",
+				"role": "user",
+				"attachments": []any{
+					map[string]any{
+						"id":            attID,
+						"type":          "image",
+						"base64":        thumbnailB64,
+						"encryptionKey": base64.StdEncoding.EncodeToString(attKey),
+					},
+				},
+			},
+		},
+	}
+	chatBytes, _ := json.Marshal(chat)
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlobV1(t, f.userKey, chatBytes)}
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat", IDs: []string{"c1"},
+		Keys: []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull: %d %s", resp.StatusCode, body)
+	}
+	var pr PullResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if len(pr.Items) != 1 || !pr.Items[0].OK {
+		t.Fatalf("items: %+v", pr.Items)
+	}
+	if pr.Items[0].NeedsRewrap {
+		t.Fatalf("expected needs_rewrap=false despite already-v2 attachment")
+	}
+
+	// The chat must have migrated to v2, and the skipped attachment must
+	// not have been (re-)uploaded to buckets.
+	f.cp.mu.Lock()
+	afterBlob := append([]byte(nil), f.cp.blobs["chat/c1"].Body...)
+	f.cp.mu.Unlock()
+	if envelope.Detect(afterBlob) != envelope.VersionV2 {
+		t.Fatalf("chat did not migrate to v2 with an already-v2 attachment")
+	}
+	if f.bk.has(attID) {
+		t.Fatalf("already-v2 attachment should not be re-uploaded to buckets")
+	}
+}
+
 // TestDeleteChatCascadesAttachmentsToBuckets confirms that deleting a
 // v2 chat through the enclave wipes attachment objects from buckets
 // using the ids returned by the controlplane delete response. The

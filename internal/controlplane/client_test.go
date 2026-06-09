@@ -406,6 +406,21 @@ func TestGetLegacyAttachmentMapsNotFound(t *testing.T) {
 	}
 }
 
+// A 410 means the attachment is already promoted to v2; the rewrap
+// path treats it as a no-op skip rather than a failure, so it must
+// surface as the dedicated sentinel and not a generic error.
+func TestGetLegacyAttachmentMapsGone(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/storage/attachment/already_v2", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGone)
+	})
+	c := NewClient(st.server.URL, nil)
+	_, err := c.GetLegacyAttachment(context.Background(), "j", "user_x", "already_v2")
+	if !errors.Is(err, ErrLegacyAttachmentGone) {
+		t.Fatalf("expected ErrLegacyAttachmentGone, got %v", err)
+	}
+}
+
 func TestDeleteAttachmentIndex(t *testing.T) {
 	st := newStub(t)
 	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {
