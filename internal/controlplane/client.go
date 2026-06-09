@@ -581,15 +581,20 @@ type CurrentKeyResponse struct {
 	ETag       string                      `json:"etag"`
 	Bundles    map[string]CurrentKeyBundle `json:"bundles"`
 	CreatedVia string                      `json:"created_via"`
-	CreatedAt  time.Time                   `json:"created_at"`
-	HasData    bool                        `json:"has_data"`
+	// CreatedAt and RegisteredAt are decoded as the controlplane's
+	// already-formatted RFC3339 strings, not time.Time. The no-key
+	// response carries an empty `created_at`, which fails time.Time
+	// decoding; keeping them as strings tolerates that and avoids a
+	// lossy parse-then-reformat round-trip on the way to the client.
+	CreatedAt string `json:"created_at"`
+	HasData   bool   `json:"has_data"`
 }
 
 type CurrentKeyBundle struct {
-	CredentialID  string    `json:"credential_id"`
-	KEKIV         string    `json:"kek_iv"`
-	EncryptedKeys string    `json:"encrypted_keys"`
-	RegisteredAt  time.Time `json:"registered_at"`
+	CredentialID  string `json:"credential_id"`
+	KEKIV         string `json:"kek_iv"`
+	EncryptedKeys string `json:"encrypted_keys"`
+	RegisteredAt  string `json:"registered_at"`
 }
 
 func (c *Client) GetCurrentKey(ctx context.Context, jwt, clerkUserID string) (*CurrentKeyResponse, error) {
