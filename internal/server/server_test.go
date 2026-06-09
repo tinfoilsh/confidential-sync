@@ -390,10 +390,14 @@ func (s *cpStub) handleAddBundle(w http.ResponseWriter, r *http.Request) {
 func (s *cpStub) handleCurrentKey(w http.ResponseWriter, r *http.Request) {
 	if s.currentKID == "" {
 		if s.noKeyHasData {
-			json.NewEncoder(w).Encode(controlplane.CurrentKeyResponse{
-				Bundles: map[string]controlplane.CurrentKeyBundle{},
-				HasData: true,
-			})
+			// Mirror the real controlplane's no-key 200 shape verbatim,
+			// including the empty `created_at` string. Encoding the
+			// CurrentKeyResponse struct would mask a regression if the
+			// decode type ever drifts back to time.Time (which cannot
+			// parse ""), so pin the exact wire bytes the enclave must
+			// tolerate.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"key_id":"","etag":"","bundles":{},"created_via":"","created_at":"","has_data":true}`))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)

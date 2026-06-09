@@ -783,8 +783,8 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 		Bundles:    make(map[string]KeyCurrentBundle, len(resp.Bundles)),
 		HasData:    resp.HasData,
 	}
-	if !resp.CreatedAt.IsZero() {
-		out.CreatedAt = resp.CreatedAt.Format("2006-01-02T15:04:05.000Z")
+	if resp.CreatedAt != "" {
+		out.CreatedAt = resp.CreatedAt
 	}
 	for cid, b := range resp.Bundles {
 		out.Bundles[cid] = KeyCurrentBundle{
@@ -792,11 +792,10 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 			KEKIV:         b.KEKIV,
 			EncryptedKeys: b.EncryptedKeys,
 		}
-		if !b.RegisteredAt.IsZero() {
+		if b.RegisteredAt != "" {
 			ent := out.Bundles[cid]
-			registeredAt := b.RegisteredAt.Format("2006-01-02T15:04:05.000Z")
-			ent.CreatedAt = registeredAt
-			ent.UpdatedAt = registeredAt
+			ent.CreatedAt = b.RegisteredAt
+			ent.UpdatedAt = b.RegisteredAt
 			out.Bundles[cid] = ent
 		}
 	}

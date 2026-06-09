@@ -301,6 +301,60 @@ func TestGetCurrentKeyNotFound(t *testing.T) {
 	}
 }
 
+// The controlplane's no-key 200 shape carries an empty created_at
+// string. Decoding it must not fail (it once decoded into time.Time,
+// which rejects "" and turned every no-key user's key/current into a
+// 500, blocking legacy migration).
+func TestGetCurrentKeyDecodesEmptyCreatedAt(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/sync/keys/current", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"key_id":"","etag":"","bundles":{},"created_via":"","created_at":"","has_data":true}`))
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.GetCurrentKey(context.Background(), "j", "user_x")
+	if err != nil {
+		t.Fatalf("decode no-key response: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if resp.KeyID != "" {
+		t.Fatalf("expected empty key_id, got %q", resp.KeyID)
+	}
+	if !resp.HasData {
+		t.Fatal("expected has_data=true")
+	}
+	if resp.CreatedAt != "" {
+		t.Fatalf("expected empty created_at, got %q", resp.CreatedAt)
+	}
+}
+
+// A keyed response forwards created_at and each bundle's registered_at
+// as the controlplane's already-formatted strings.
+func TestGetCurrentKeyDecodesKeyedResponse(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/sync/keys/current", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"key_id":"abc","etag":"3","created_via":"recovery","created_at":"2026-06-05T02:17:16.755Z","has_data":true,"bundles":{"cred-1":{"credential_id":"cred-1","kek_iv":"iv","encrypted_keys":"ct","registered_at":"2026-06-05T02:17:16.755Z"}}}`))
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.GetCurrentKey(context.Background(), "j", "user_x")
+	if err != nil {
+		t.Fatalf("decode keyed response: %v", err)
+	}
+	if resp.KeyID != "abc" || resp.CreatedAt != "2026-06-05T02:17:16.755Z" {
+		t.Fatalf("unexpected key fields: %+v", resp)
+	}
+	b, ok := resp.Bundles["cred-1"]
+	if !ok {
+		t.Fatal("expected bundle cred-1")
+	}
+	if b.RegisteredAt != "2026-06-05T02:17:16.755Z" {
+		t.Fatalf("unexpected registered_at: %q", b.RegisteredAt)
+	}
+}
+
 func TestAddBundleForwardsCredentials(t *testing.T) {
 	st := newStub(t)
 	st.handle1("POST", "/api/sync/keys/"+strings.Repeat("a", 32)+"/bundles", func(w http.ResponseWriter, r *http.Request) {
