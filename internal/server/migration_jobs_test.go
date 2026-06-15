@@ -14,6 +14,7 @@ import (
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 )
 
 // buildLegacyChatBlob seals a JSON chat row under the fixture's
@@ -393,6 +394,73 @@ func TestMigrateAllHandlerAsyncKickoff(t *testing.T) {
 // top-of-iteration ctx.Err() guard directly. The loop must observe
 // the canceled context on the very first iteration and break
 // without touching ANY id.
+// TestMigrateOneTreatsConcurrentV2AsMigrated guards the phantom-failure
+// fix: when a concurrent migration pass (or a user push) re-keys a row
+// to v2 between our fetch and our rewrap, the rewrap CAS answers
+// STALE_BLOB. migrateOne must re-read, observe the row is already v2,
+// and count it migrated instead of recording a migration failure that
+// burns the 24h cooldown.
+func TestMigrateOneTreatsConcurrentV2AsMigrated(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	chatJSON := []byte(`{"id":"c1","title":"legacy","messages":[]}`)
+	f.cp.mu.Lock()
+	f.cp.currentKID = f.userKeyID
+	f.cp.blobs["chat/c1"] = buildLegacyChatBlob(t, f, "c1")
+	f.cp.mu.Unlock()
+
+	v2blob, err := envelope.Encrypt(f.userKey, chatJSON, envelope.AAD{
+		KeyIDHex:    f.userKeyID,
+		Scope:       envelope.ScopeChat,
+		ID:          "c1",
+		ClerkUserID: f.userSub,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Right before our rewrap CAS runs, swap the row to a v2 envelope
+	// and bump the etag so our if_match (etag 1) mismatches and the
+	// stub answers STALE_BLOB, exactly as a concurrent pass that
+	// already migrated the row would.
+	var swapped int32
+	f.cp.captureHeaders = func(r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/api/sync/rewrap") {
+			return
+		}
+		if !atomic.CompareAndSwapInt32(&swapped, 0, 1) {
+			return
+		}
+		f.cp.mu.Lock()
+		f.cp.blobs["chat/c1"] = &cpBlob{ETag: 2, KeyID: f.userKeyID, Body: v2blob}
+		f.cp.mu.Unlock()
+	}
+
+	sess := Session{RawJWT: tok, Claims: auth.Claims{Subject: f.userSub}}
+	resp, err := Migrate(context.Background(), f.handler.deps, sess, MigrateRequest{
+		Scope:  "chat",
+		IDs:    []string{"c1"},
+		Keys:   []PullKey{{Key: f.userKeyB64}},
+		Target: MigrateTarget{Key: f.userKeyB64},
+	})
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if resp.Migrated != 1 {
+		t.Fatalf("expected migrated=1, got %d (blocked=%v)", resp.Migrated, resp.Blocked)
+	}
+	if len(resp.Blocked) != 0 {
+		t.Fatalf("expected no blocked rows, got %v", resp.Blocked)
+	}
+
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	if n := f.cp.migrationFailures["chat/c1"]; n != 0 {
+		t.Fatalf("phantom migration failure recorded: %d", n)
+	}
+}
+
 func TestMigrateLoopSkipsRemainingIDsWhenContextCancelledUpfront(t *testing.T) {
 	f := newFixture(t)
 
