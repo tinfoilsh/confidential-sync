@@ -1179,31 +1179,59 @@ func migrateOne(
 	targetKey []byte,
 	targetKIDHex string,
 ) bool {
-	blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
-	if err != nil {
-		deps.logError("migrate item fetch failed: user=%s scope=%s id=%s err=%v",
-			sess.Claims.Subject, scope, id, err)
-		return false
-	}
-	version := envelope.Detect(blob.Ciphertext)
-	plaintext, ok := decryptAnyVersion(blob.Ciphertext, keys, scope, id, sess.Claims.Subject)
-	if !ok {
-		deps.logError("migrate item decrypt failed: user=%s scope=%s id=%s version=%v",
-			sess.Claims.Subject, scope, id, version)
-		return false
-	}
-	defer cryptopkg.Zero(plaintext)
-
-	newETag, err := rewrapBlob(ctx, deps, sess, scope, id, plaintext, blob.ETag, targetKey, targetKIDHex)
-	if err != nil {
+	// Loop: fetch the current row, decrypt the bytes we actually see,
+	// and rewrap them to v2. On STALE_BLOB the row moved under us
+	// (typically a concurrent migration pass, or a user push that
+	// already sealed it under the current key); re-fetch and
+	// re-evaluate instead of stamping a phantom failure that burns the
+	// 24h cooldown. Re-reading each attempt also means we never rewrap
+	// stale plaintext over newer bytes.
+	for attempt := 0; attempt < migrateRewrapMaxRetries; attempt++ {
+		blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
+		if err != nil {
+			deps.logError("migrate item fetch failed: user=%s scope=%s id=%s err=%v",
+				sess.Claims.Subject, scope, id, err)
+			return false
+		}
+		version := envelope.Detect(blob.Ciphertext)
+		if version == envelope.VersionV2 && blob.KeyID == targetKIDHex {
+			// Already sealed under the target key by a concurrent
+			// migration pass or a user push. The row is in the desired
+			// end state, so count it migrated rather than re-sealing it
+			// or recording a failure. A v2 row under a different key
+			// (a key rotation) still falls through to the rewrap below.
+			deps.logInfo("migrate item already at target: user=%s scope=%s id=%s attempt=%d",
+				sess.Claims.Subject, scope, id, attempt)
+			return true
+		}
+		plaintext, ok := decryptAnyVersion(blob.Ciphertext, keys, scope, id, sess.Claims.Subject)
+		if !ok {
+			deps.logError("migrate item decrypt failed: user=%s scope=%s id=%s version=%v",
+				sess.Claims.Subject, scope, id, version)
+			return false
+		}
+		newETag, rerr := rewrapBlob(ctx, deps, sess, scope, id, plaintext, blob.ETag, targetKey, targetKIDHex)
+		cryptopkg.Zero(plaintext)
+		if rerr == nil {
+			deps.logInfo("migrate item ok: user=%s scope=%s id=%s version=%v target_kid=%s new_etag=%s",
+				sess.Claims.Subject, scope, id, version, targetKIDHex, newETag)
+			return true
+		}
+		if controlplane.IsCode(rerr, controlplane.StatusStaleBlob) {
+			deps.logInfo("migrate item stale, retrying: user=%s scope=%s id=%s attempt=%d",
+				sess.Claims.Subject, scope, id, attempt)
+			continue
+		}
 		deps.logError("migrate item rewrap failed: user=%s scope=%s id=%s version=%v err=%v",
-			sess.Claims.Subject, scope, id, version, err)
+			sess.Claims.Subject, scope, id, version, rerr)
 		return false
 	}
-	deps.logInfo("migrate item ok: user=%s scope=%s id=%s version=%v target_kid=%s new_etag=%s",
-		sess.Claims.Subject, scope, id, version, targetKIDHex, newETag)
-	return true
+	deps.logError("migrate item exhausted retries: user=%s scope=%s id=%s",
+		sess.Claims.Subject, scope, id)
+	return false
 }
+
+const migrateRewrapMaxRetries = 3
 
 // projectIDFromMetadata pulls the optional `projectId` field out of
 // a chat push's metadata. Returns (false, nil) for non-chat scopes,
