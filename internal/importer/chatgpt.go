@@ -63,6 +63,8 @@ type chatgptAssetPointer struct {
 	AssetPointer string `json:"asset_pointer"`
 }
 
+const chatgptSyntheticRoot = "client-created-root"
+
 func parseChatGPT(data []byte, opts Options, emit EmitFunc) (Result, error) {
 	var conversations []chatgptConversation
 	if err := json.Unmarshal(data, &conversations); err != nil {
@@ -114,8 +116,13 @@ func buildChatGPTChat(conv *chatgptConversation, opts Options) *Chat {
 			processNode(nodeID)
 		}
 	} else {
+		branchVisited := make(map[string]struct{}, len(nodeMap))
 		var processBranch func(nodeID string)
 		processBranch = func(nodeID string) {
+			if _, ok := branchVisited[nodeID]; ok {
+				return
+			}
+			branchVisited[nodeID] = struct{}{}
 			processNode(nodeID)
 			node, ok := nodeMap[nodeID]
 			if !ok || len(node.Children) == 0 {
@@ -175,7 +182,7 @@ func chatgptActivePath(conv *chatgptConversation) []string {
 	var reversed []string
 	visited := make(map[string]struct{}, len(nodeMap))
 	cur := conv.CurrentNode
-	for cur != "" {
+	for cur != "" && cur != chatgptSyntheticRoot {
 		if _, ok := visited[cur]; ok {
 			return nil
 		}
@@ -196,7 +203,7 @@ func chatgptActivePath(conv *chatgptConversation) []string {
 func chatgptRootNodes(nodeMap map[string]chatgptNode) []string {
 	var roots []string
 	for nodeID, node := range nodeMap {
-		if node.Parent == "" || node.Parent == "client-created-root" {
+		if node.Parent == "" || node.Parent == chatgptSyntheticRoot {
 			roots = append(roots, nodeID)
 		}
 	}

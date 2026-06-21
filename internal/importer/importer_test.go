@@ -78,8 +78,7 @@ func TestParseChatGPTUsesCurrentNodePath(t *testing.T) {
         "create_time": 1700000000,
         "current_node": "a2",
         "mapping": {
-          "root": {"id":"root","parent":"","children":["u1"]},
-          "u1": {"id":"u1","parent":"root","children":["a1","a2"],"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["Hi"]},"create_time":1700000001}},
+          "u1": {"id":"u1","parent":"client-created-root","children":["a1","a2"],"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["Hi"]},"create_time":1700000001}},
           "a1": {"id":"a1","parent":"u1","children":[],"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["old reply"]},"create_time":1700000002}},
           "a2": {"id":"a2","parent":"u1","children":[],"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["current reply"]},"create_time":1700000003}}
         }
@@ -95,6 +94,28 @@ func TestParseChatGPTUsesCurrentNodePath(t *testing.T) {
 	}
 	if got := chats[0].Messages[1].Content; got != "current reply" {
 		t.Fatalf("expected current reply, got %q", got)
+	}
+}
+
+func TestParseChatGPTFallbackStopsOnCycles(t *testing.T) {
+	data := []byte(`[
+      {
+        "id": "conv-cycle",
+        "title": "Cycle",
+        "create_time": 1700000000,
+        "mapping": {
+          "u1": {"id":"u1","parent":"","children":["a1"],"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["Hi"]},"create_time":1700000001}},
+          "a1": {"id":"a1","parent":"u1","children":["u1"],"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["Hello"]},"create_time":1700000002}}
+        }
+      }
+    ]`)
+
+	chats, _ := collect(t, SourceChatGPT, data, nil)
+	if len(chats) != 1 {
+		t.Fatalf("expected 1 chat, got %d", len(chats))
+	}
+	if len(chats[0].Messages) != 2 {
+		t.Fatalf("expected cycle-safe branch to render 2 messages, got %d", len(chats[0].Messages))
 	}
 }
 
