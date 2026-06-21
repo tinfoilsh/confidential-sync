@@ -58,5 +58,9 @@ shim:
     - /v1/attachment/get
     - /v1/attachment/delete
     - /v1/attachment/get-public
+    - /v1/import/create
+    - /v1/import/upload
+    - /v1/import/start
+    - /v1/import/status
     - /v1/share/seal
     - /v1/share/open

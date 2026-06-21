@@ -24,10 +24,11 @@ const MaxRequestBytes = 64 << 20
 const AttachmentRequestTimeout = 5 * time.Minute
 
 type Handler struct {
-	deps        Deps
-	verifier    auth.Verifier
-	logger      Logger
-	coordinator *MigrationCoordinator
+	deps              Deps
+	verifier          auth.Verifier
+	logger            Logger
+	coordinator       *MigrationCoordinator
+	importCoordinator *ImportCoordinator
 }
 
 type Logger interface {
@@ -37,10 +38,11 @@ type Logger interface {
 
 func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 	return &Handler{
-		deps:        deps,
-		verifier:    verifier,
-		logger:      logger,
-		coordinator: NewMigrationCoordinator(),
+		deps:              deps,
+		verifier:          verifier,
+		logger:            logger,
+		coordinator:       NewMigrationCoordinator(),
+		importCoordinator: NewImportCoordinator(),
 	}
 }
 
@@ -94,6 +96,17 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/attachment/get-public", func(h *Handler) http.Handler {
 			return withRequestTimeout(http.HandlerFunc(h.attachmentGetPublic), AttachmentRequestTimeout)
 		}},
+
+		// Off-device chat import. create/start/status only touch
+		// in-memory coordinator state and return quickly; upload
+		// streams an 8 MiB chunk to the buckets staging area, so it
+		// gets the longer attachment-style timeout.
+		{"POST", "/v1/import/create", func(h *Handler) http.Handler { return h.authMiddleware(h.importCreate) }},
+		{"POST", "/v1/import/upload", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.importUpload, AttachmentRequestTimeout)
+		}},
+		{"POST", "/v1/import/start", func(h *Handler) http.Handler { return h.authMiddleware(h.importStart) }},
+		{"POST", "/v1/import/status", func(h *Handler) http.Handler { return h.authMiddleware(h.importStatus) }},
 
 		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
 		// /v1/share/open is intentionally unauthenticated. Knowing the
@@ -428,6 +441,88 @@ func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess 
 		return
 	}
 	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) importCreate(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ImportCreateRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	job, err := h.importCoordinator.Create(sess.Claims.Subject, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, ImportCreateResponse{JobID: job.ID, UploadID: job.UploadID})
+}
+
+func (h *Handler) importUpload(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ImportUploadRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	job := h.importCoordinator.Get(sess.Claims.Subject)
+	if job == nil || job.UploadID != req.UploadID {
+		writeError(w, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "import upload not found"})
+		return
+	}
+	if err := stageImportChunk(r.Context(), h.deps, sess.Claims.Subject, job, req); err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) importStart(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ImportStartRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	job := h.importCoordinator.Get(sess.Claims.Subject)
+	if job == nil || job.ID != req.JobID {
+		writeError(w, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "import job not found"})
+		return
+	}
+	if !job.allChunksReceived() {
+		writeError(w, badRequest("not all chunks uploaded"))
+		return
+	}
+	cek, err := cekFromImportStart(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	h.importCoordinator.Start(r.Context(), h.deps, sess, job, cek)
+	snap := job.Snapshot()
+	encode(w, http.StatusAccepted, importStatusResponse(snap))
+}
+
+func (h *Handler) importStatus(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ImportStatusRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	job := h.importCoordinator.Get(sess.Claims.Subject)
+	if job == nil {
+		encode(w, http.StatusOK, ImportStatusResponse{Status: string(ImportJobIdle)})
+		return
+	}
+	encode(w, http.StatusOK, importStatusResponse(job.Snapshot()))
+}
+
+func importStatusResponse(snap ImportJobSnapshot) ImportStatusResponse {
+	return ImportStatusResponse{
+		Status:   string(snap.Status),
+		Imported: snap.Imported,
+		Failed:   snap.Failed,
+		Total:    snap.Total,
+		Errors:   snap.Errors,
+		JobID:    snap.ID,
+	}
 }
 
 func (h *Handler) shareSeal(w http.ResponseWriter, r *http.Request, sess Session) {
