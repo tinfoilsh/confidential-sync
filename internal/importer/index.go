@@ -74,8 +74,9 @@ func (i *Index) Basename(ref string) (string, bool) {
 }
 
 // ByIDPrefix resolves an attachment file id (e.g. ChatGPT "file-abc123")
-// to the first entry whose basename starts with that id. ChatGPT and
-// Claude name media files using the source file id as a prefix.
+// to a unique entry whose basename contains that id as an exact stem or
+// prefix. ChatGPT and Claude name media files using the source file id
+// as a prefix.
 func (i *Index) ByIDPrefix(id string) (string, bool) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -84,12 +85,45 @@ func (i *Index) ByIDPrefix(id string) (string, bool) {
 	if name, ok := i.byBase[id]; ok {
 		return name, true
 	}
-	for _, n := range i.names {
-		if strings.HasPrefix(path.Base(n), id) {
-			return n, true
-		}
+	if name, ok := i.uniqueIDStem(id); ok {
+		return name, true
 	}
-	return "", false
+	return i.uniqueIDPrefix(id)
+}
+
+func (i *Index) uniqueIDStem(id string) (string, bool) {
+	var match string
+	for _, n := range i.names {
+		base := path.Base(n)
+		if strings.TrimSuffix(base, path.Ext(base)) != id {
+			continue
+		}
+		if match != "" {
+			return "", false
+		}
+		match = n
+	}
+	return match, match != ""
+}
+
+func (i *Index) uniqueIDPrefix(id string) (string, bool) {
+	var match string
+	for _, n := range i.names {
+		base := path.Base(n)
+		if !strings.HasPrefix(base, id) || len(base) == len(id) {
+			continue
+		}
+		switch base[len(id)] {
+		case '.', '-', '_':
+		default:
+			continue
+		}
+		if match != "" {
+			return "", false
+		}
+		match = n
+	}
+	return match, match != ""
 }
 
 // Len reports how many safe entries the index holds.

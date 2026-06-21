@@ -478,6 +478,23 @@ func TestAddAuthStampsClerkUserIDFromCaller(t *testing.T) {
 	}
 }
 
+func TestNotifyImportCompleteOmitsEmptyBearer(t *testing.T) {
+	st := newStub(t)
+	st.handle1("POST", "/api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderAuth); got != "" {
+			t.Errorf("authorization header: %q, want empty", got)
+		}
+		if got := r.Header.Get(HeaderClerkUserID); got != "user_real" {
+			t.Errorf("clerk-user-id header: %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	if err := c.NotifyImportComplete(context.Background(), "user_real", "job_1", "chatgpt", 3, 0); err != nil {
+		t.Fatalf("notify import complete: %v", err)
+	}
+}
+
 func TestAddAuthOmitsClerkUserIDWhenCallerOmitsIt(t *testing.T) {
 	st := newStub(t)
 	st.handle1("DELETE", "/api/sync/attachment-index/att_1", func(w http.ResponseWriter, r *http.Request) {

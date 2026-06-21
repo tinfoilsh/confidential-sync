@@ -86,6 +86,36 @@ func TestImportJobPlainJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestImportJobRetriesCompletionNotification(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+
+	oldDelay := importNotifyRetryDelay
+	importNotifyRetryDelay = 0
+	t.Cleanup(func() { importNotifyRetryDelay = oldDelay })
+
+	var attempts int32
+	f.cp.mux.HandleFunc("POST /api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) < importNotifyAttempts {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
+
+	job := stageArchive(t, f, "tinfoil", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+	if atomic.LoadInt32(&attempts) != importNotifyAttempts {
+		t.Fatalf("expected %d notification attempts, got %d", importNotifyAttempts, attempts)
+	}
+}
+
 func TestImportJobZipWithImage(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID

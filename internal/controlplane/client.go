@@ -211,7 +211,9 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 // JWT payload here, so a malformed or attacker-supplied token cannot
 // influence the asserted identity.
 func (c *Client) addAuth(req *http.Request, rawJWT, clerkUserID string) {
-	req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	if rawJWT != "" {
+		req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	}
 	if clerkUserID != "" {
 		req.Header.Set(HeaderClerkUserID, clerkUserID)
 	}

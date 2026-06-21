@@ -228,6 +228,10 @@ func attachmentIdemKey(chatID, ref string, index int) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+const importNotifyAttempts = 3
+
+var importNotifyRetryDelay = 2 * time.Second
+
 // notifyImportComplete tells the controlplane to email the user. It is
 // best-effort: a failure is logged but never fails the job.
 func notifyImportComplete(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int) {
@@ -236,8 +240,23 @@ func notifyImportComplete(ctx context.Context, deps Deps, clerkUserID, jobID, so
 	}
 	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if err := deps.Controlplane.NotifyImportComplete(notifyCtx, clerkUserID, jobID, source, imported, failed); err != nil {
-		deps.logError("import notify failed: user=%s job=%s err=%v", clerkUserID, jobID, err)
+	for attempt := 1; attempt <= importNotifyAttempts; attempt++ {
+		if err := deps.Controlplane.NotifyImportComplete(notifyCtx, clerkUserID, jobID, source, imported, failed); err != nil {
+			if attempt == importNotifyAttempts {
+				deps.logError("import notify failed: user=%s job=%s err=%v", clerkUserID, jobID, err)
+				return
+			}
+			timer := time.NewTimer(importNotifyRetryDelay)
+			select {
+			case <-notifyCtx.Done():
+				timer.Stop()
+				deps.logError("import notify failed: user=%s job=%s err=%v", clerkUserID, jobID, notifyCtx.Err())
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		return
 	}
 }
 

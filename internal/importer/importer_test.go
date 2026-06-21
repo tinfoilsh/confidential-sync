@@ -188,6 +188,32 @@ func TestParseChatGPTAttachmentOnlyMessage(t *testing.T) {
 	}
 }
 
+func TestParseChatGPTUnresolvedImageStaysImage(t *testing.T) {
+	data := []byte(`[
+      {
+        "id": "conv-unresolved-image",
+        "title": "Missing image",
+        "create_time": 1700000000,
+        "mapping": {
+          "u1": {"id":"u1","parent":"","children":[],"message":{
+            "author":{"role":"user"},
+            "content":{"content_type":"multimodal_text"},
+            "metadata":{"attachments":[{"id":"file-MISSING","name":"pic.png","mime_type":"image/png"}]}
+          }}
+        }
+      }
+    ]`)
+
+	chats, _ := collect(t, SourceChatGPT, data, NewIndex(nil))
+	if len(chats) != 1 {
+		t.Fatalf("expected 1 chat, got %d", len(chats))
+	}
+	atts := chats[0].Messages[0].Attachments
+	if len(atts) != 1 || atts[0].Type != AttachmentImage || atts[0].BinaryRef != "" {
+		t.Fatalf("unexpected unresolved image attachment: %+v", atts)
+	}
+}
+
 func TestIndexExactDoesNotFallBackToBasename(t *testing.T) {
 	idx := NewIndex([]string{"safe/pic.png"})
 	if got, ok := idx.Exact("other/pic.png"); ok {
@@ -195,6 +221,18 @@ func TestIndexExactDoesNotFallBackToBasename(t *testing.T) {
 	}
 	if got, ok := idx.Basename("other/pic.png"); !ok || got != "safe/pic.png" {
 		t.Fatalf("Basename = (%q,%v), want safe/pic.png,true", got, ok)
+	}
+}
+
+func TestIndexByIDPrefixRejectsAmbiguousPrefix(t *testing.T) {
+	idx := NewIndex([]string{"file-1.png", "file-10.png"})
+	if got, ok := idx.ByIDPrefix("file-1"); !ok || got != "file-1.png" {
+		t.Fatalf("ByIDPrefix exact stem = (%q,%v), want file-1.png,true", got, ok)
+	}
+
+	ambiguous := NewIndex([]string{"file-1-a.png", "file-1-b.png"})
+	if got, ok := ambiguous.ByIDPrefix("file-1"); ok {
+		t.Fatalf("ByIDPrefix ambiguous prefix returned %q", got)
 	}
 }
 

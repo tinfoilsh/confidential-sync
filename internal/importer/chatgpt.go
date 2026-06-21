@@ -283,6 +283,9 @@ func chatgptAttachments(msg *chatgptMessage, pointers []chatgptAssetPointer, idx
 			FileName: a.Name,
 			MimeType: a.MimeType,
 		}
+		if isImageRef(a.MimeType, a.Name) {
+			att.Type = AttachmentImage
+		}
 		if idx != nil {
 			if name, ok := idx.ByIDPrefix(id); ok {
 				if isImageRef(a.MimeType, name) {
