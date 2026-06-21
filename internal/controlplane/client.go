@@ -211,7 +211,9 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 // JWT payload here, so a malformed or attacker-supplied token cannot
 // influence the asserted identity.
 func (c *Client) addAuth(req *http.Request, rawJWT, clerkUserID string) {
-	req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	if rawJWT != "" {
+		req.Header.Set(HeaderAuth, "Bearer "+rawJWT)
+	}
 	if clerkUserID != "" {
 		req.Header.Set(HeaderClerkUserID, clerkUserID)
 	}
@@ -919,6 +921,43 @@ func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, clerkUserID, 
 		"/api/sync/attachment-index/",
 		"attachment index",
 	)
+}
+
+// NotifyImportComplete asks the controlplane to email the user that an
+// off-device chat import finished. The enclave has no JWT to forward
+// for a detached job (it may have expired mid-import), so this is a
+// service-secret call that asserts the user only via X-Clerk-User-Id.
+func (c *Client) NotifyImportComplete(ctx context.Context, clerkUserID, jobID, source string, imported, failed int) error {
+	if clerkUserID == "" {
+		return fmt.Errorf("controlplane: clerk user id is required")
+	}
+	body, err := json.Marshal(map[string]any{
+		"jobId":         jobID,
+		"source":        source,
+		"importedCount": imported,
+		"failedCount":   failed,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := c.baseURL + "/api/sync/notify-import-complete"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	c.addAuth(httpReq, "", clerkUserID)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return parseError(resp.StatusCode, raw)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, clerkUserID, attachmentID string) error {
