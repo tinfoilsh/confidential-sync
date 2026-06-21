@@ -80,9 +80,13 @@ func buildClaudeChat(conv *claudeConversation, opts Options) *Chat {
 		if text == "" && len(attachments) == 0 {
 			continue
 		}
+		role, ok := claudeRole(msg.Sender)
+		if !ok {
+			continue
+		}
 
 		out := Message{
-			Role:        claudeRole(msg.Sender),
+			Role:        role,
 			Content:     text,
 			Attachments: attachments,
 			Timestamp:   jsTime{parseISOTime(msg.CreatedAt)},
@@ -116,11 +120,15 @@ func buildClaudeChat(conv *claudeConversation, opts Options) *Chat {
 	}
 }
 
-func claudeRole(sender string) string {
-	if sender == "human" {
-		return "user"
+func claudeRole(sender string) (string, bool) {
+	switch sender {
+	case "human":
+		return "user", true
+	case "assistant":
+		return "assistant", true
+	default:
+		return "", false
 	}
-	return "assistant"
 }
 
 func claudeAttachments(msg *claudeMessage, idx *Index) []Attachment {

@@ -235,6 +235,31 @@ func TestParseClaudeThinkingAndDocuments(t *testing.T) {
 	}
 }
 
+func TestParseClaudeSkipsUnknownSenders(t *testing.T) {
+	data := []byte(`[
+      {
+        "uuid": "claude-unknown",
+        "name": "Unknown sender",
+        "created_at": "2023-11-14T22:13:20Z",
+        "chat_messages": [
+          {"uuid":"m1","sender":"human","text":"hello","created_at":"2023-11-14T22:13:21Z"},
+          {"uuid":"m2","sender":"system","text":"internal note","created_at":"2023-11-14T22:13:22Z"}
+        ]
+      }
+    ]`)
+
+	chats, _ := collect(t, SourceClaude, data, nil)
+	if len(chats) != 1 {
+		t.Fatalf("expected 1 chat, got %d", len(chats))
+	}
+	if len(chats[0].Messages) != 1 {
+		t.Fatalf("expected unknown sender to be skipped, got %d messages", len(chats[0].Messages))
+	}
+	if got := chats[0].Messages[0].Role; got != "user" {
+		t.Fatalf("expected human message role user, got %q", got)
+	}
+}
+
 func TestParseTinfoilRoundTripShape(t *testing.T) {
 	data := []byte(`[
       {

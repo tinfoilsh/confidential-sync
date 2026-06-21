@@ -173,6 +173,23 @@ func (j *ImportJobState) finish(status ImportJobStatus) {
 	close(j.done)
 }
 
+func (j *ImportJobState) failIfStaleStaging(retention time.Duration, now time.Time) (time.Duration, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.status != ImportJobStaging {
+		return 0, false
+	}
+	if remaining := retention - now.Sub(j.updatedAt); remaining > 0 {
+		return remaining, false
+	}
+	j.status = ImportJobFailed
+	j.updatedAt = now.UTC()
+	cryptopkg.Zero(j.cek)
+	cryptopkg.Zero(j.stagingKey)
+	close(j.done)
+	return 0, true
+}
+
 func (j *ImportJobState) Done() <-chan struct{} { return j.done }
 
 // ImportCoordinator owns the in-memory set of import jobs, one per user.
@@ -280,29 +297,26 @@ func (c *ImportCoordinator) reapStaleStaging(parentCtx context.Context, deps Dep
 	if retention < 0 {
 		retention = 0
 	}
-	job.mu.Lock()
-	status := job.status
-	updatedAt := job.updatedAt
-	job.mu.Unlock()
-	if status != ImportJobStaging {
+	c.mu.Lock()
+	if c.jobs[job.UserID] != job {
+		c.mu.Unlock()
 		return
 	}
-	if remaining := retention - time.Since(updatedAt); remaining > 0 {
+	remaining, failed := job.failIfStaleStaging(retention, time.Now())
+	if remaining > 0 {
+		c.mu.Unlock()
 		time.AfterFunc(remaining, func() {
 			c.reapStaleStaging(parentCtx, deps, job)
 		})
 		return
 	}
-
-	c.mu.Lock()
-	if c.jobs[job.UserID] != job {
+	if !failed {
 		c.mu.Unlock()
 		return
 	}
 	delete(c.jobs, job.UserID)
 	c.mu.Unlock()
 
-	job.finish(ImportJobFailed)
 	c.cleanupStaging(context.WithoutCancel(parentCtx), deps, job)
 }
 

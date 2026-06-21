@@ -299,6 +299,33 @@ func TestImportStagingCleanupExpiresStaleJobs(t *testing.T) {
 	}
 }
 
+func TestImportStagingCleanupLeavesRunningJobs(t *testing.T) {
+	c := NewImportCoordinator()
+	job := &ImportJobState{
+		ID:        "job",
+		UserID:    "user",
+		UploadID:  "upload",
+		status:    ImportJobRunning,
+		updatedAt: time.Now().Add(-time.Hour),
+		done:      make(chan struct{}),
+	}
+	c.jobs[job.UserID] = job
+
+	c.reapStaleStaging(context.Background(), Deps{}, job)
+
+	if c.Get(job.UserID) != job {
+		t.Fatal("running job should remain addressable")
+	}
+	if got := job.Snapshot().Status; got != ImportJobRunning {
+		t.Fatalf("expected running job to stay running, got %s", got)
+	}
+	select {
+	case <-job.Done():
+		t.Fatal("running job should not be marked done")
+	default:
+	}
+}
+
 func TestImportStatusRequiresMatchingJobID(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()

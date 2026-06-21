@@ -83,9 +83,6 @@ func (r *stagedArchiveReader) getChunk(idx int) ([]byte, error) {
 	}
 	r.mu.Unlock()
 
-	if idx < 0 || idx >= r.totalChunks {
-		return nil, fmt.Errorf("import: chunk index %d out of range", idx)
-	}
 	chunk, err := r.deps.Buckets.Get(r.ctx, r.owner, importChunkToken(r.uploadID, idx), r.stagingKey)
 	if err != nil {
 		return nil, fmt.Errorf("import: fetch staged chunk: %w", err)

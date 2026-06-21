@@ -72,8 +72,12 @@ func buildTinfoilChat(conv *tinfoilConversation, opts Options) *Chat {
 		if text == "" && len(attachments) == 0 {
 			continue
 		}
+		role, ok := claudeRole(msg.Sender)
+		if !ok {
+			continue
+		}
 		out := Message{
-			Role:        claudeRole(msg.Sender),
+			Role:        role,
 			Content:     text,
 			Attachments: attachments,
 			Timestamp:   jsTime{parseISOTime(msg.CreatedAt)},
