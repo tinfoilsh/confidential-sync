@@ -70,6 +70,34 @@ func TestParseChatGPTTraversalAndThoughts(t *testing.T) {
 	}
 }
 
+func TestParseChatGPTUsesCurrentNodePath(t *testing.T) {
+	data := []byte(`[
+      {
+        "id": "conv-branch",
+        "title": "Branch",
+        "create_time": 1700000000,
+        "current_node": "a2",
+        "mapping": {
+          "root": {"id":"root","parent":"","children":["u1"]},
+          "u1": {"id":"u1","parent":"root","children":["a1","a2"],"message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["Hi"]},"create_time":1700000001}},
+          "a1": {"id":"a1","parent":"u1","children":[],"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["old reply"]},"create_time":1700000002}},
+          "a2": {"id":"a2","parent":"u1","children":[],"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["current reply"]},"create_time":1700000003}}
+        }
+      }
+    ]`)
+
+	chats, _ := collect(t, SourceChatGPT, data, nil)
+	if len(chats) != 1 {
+		t.Fatalf("expected 1 chat, got %d", len(chats))
+	}
+	if len(chats[0].Messages) != 2 {
+		t.Fatalf("expected active path to render 2 messages, got %d", len(chats[0].Messages))
+	}
+	if got := chats[0].Messages[1].Content; got != "current reply" {
+		t.Fatalf("expected current reply, got %q", got)
+	}
+}
+
 func TestParseChatGPTAttachments(t *testing.T) {
 	data := []byte(`[
       {
@@ -109,6 +137,43 @@ func TestParseChatGPTAttachments(t *testing.T) {
 	}
 	if img == nil || img.BinaryRef != "file-ABC-1234.png" || img.MimeType != "image/png" {
 		t.Fatalf("unexpected image attachment: %+v", img)
+	}
+}
+
+func TestParseChatGPTAttachmentOnlyMessage(t *testing.T) {
+	data := []byte(`[
+      {
+        "id": "conv-attachment-only",
+        "title": "Attachment only",
+        "create_time": 1700000000,
+        "mapping": {
+          "u1": {"id":"u1","parent":"","children":[],"message":{
+            "author":{"role":"user"},
+            "content":{"content_type":"multimodal_text"},
+            "metadata":{"attachments":[{"id":"file-ABC","name":"pic.png","mime_type":"image/png"}]}
+          }}
+        }
+      }
+    ]`)
+
+	idx := NewIndex([]string{"file-ABC-1234.png"})
+	chats, _ := collect(t, SourceChatGPT, data, idx)
+	if len(chats) != 1 {
+		t.Fatalf("expected 1 chat, got %d", len(chats))
+	}
+	atts := chats[0].Messages[0].Attachments
+	if len(atts) != 1 || atts[0].BinaryRef != "file-ABC-1234.png" {
+		t.Fatalf("unexpected attachments: %+v", atts)
+	}
+}
+
+func TestIndexExactDoesNotFallBackToBasename(t *testing.T) {
+	idx := NewIndex([]string{"safe/pic.png"})
+	if got, ok := idx.Exact("other/pic.png"); ok {
+		t.Fatalf("Exact returned basename fallback %q", got)
+	}
+	if got, ok := idx.Basename("other/pic.png"); !ok || got != "safe/pic.png" {
+		t.Fatalf("Basename = (%q,%v), want safe/pic.png,true", got, ok)
 	}
 }
 
@@ -239,5 +304,12 @@ func TestParseEachUnsupportedSource(t *testing.T) {
 	_, err := ParseEach(Source("bogus"), []byte("[]"), Options{}, func(*Chat) error { return nil })
 	if err == nil {
 		t.Fatal("expected error for unsupported source")
+	}
+}
+
+func TestParseEachRejectsNilEmit(t *testing.T) {
+	_, err := ParseEach(SourceChatGPT, []byte("[]"), Options{}, nil)
+	if err == nil {
+		t.Fatal("expected error for nil emit")
 	}
 }

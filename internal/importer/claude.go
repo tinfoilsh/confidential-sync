@@ -157,6 +157,9 @@ func claudeAttachments(msg *claudeMessage, idx *Index) []Attachment {
 			continue
 		}
 		name, ok := idx.Exact(f.FileName)
+		if !ok {
+			name, ok = idx.Basename(f.FileName)
+		}
 		if !ok && f.FileUUID != "" {
 			name, ok = idx.ByIDPrefix(f.FileUUID)
 		}
@@ -209,7 +212,7 @@ func parseISOTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000000Z07:00"} {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC()
 		}

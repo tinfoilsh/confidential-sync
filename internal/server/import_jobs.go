@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -377,7 +378,8 @@ func validateImportCreate(req ImportCreateRequest) error {
 	if req.TotalChunks != expected {
 		return badRequest("total_chunks does not match total_bytes")
 	}
-	if len(req.ArchiveSHA256) != 64 {
+	archiveHash, err := hex.DecodeString(req.ArchiveSHA256)
+	if err != nil || len(archiveHash) != sha256.Size {
 		return badRequest("invalid archive_sha256")
 	}
 	return nil

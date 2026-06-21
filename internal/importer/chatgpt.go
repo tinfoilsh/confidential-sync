@@ -3,6 +3,7 @@ package importer
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -13,6 +14,7 @@ type chatgptConversation struct {
 	Title          string                 `json:"title"`
 	CreateTime     float64                `json:"create_time"`
 	UpdateTime     float64                `json:"update_time"`
+	CurrentNode    string                 `json:"current_node"`
 	Mapping        map[string]chatgptNode `json:"mapping"`
 }
 
@@ -91,8 +93,7 @@ func buildChatGPTChat(conv *chatgptConversation, opts Options) *Chat {
 	visited := make(map[string]struct{}, len(nodeMap))
 	var messages []Message
 
-	var process func(nodeID string)
-	process = func(nodeID string) {
+	processNode := func(nodeID string) {
 		if _, ok := visited[nodeID]; ok {
 			return
 		}
@@ -106,14 +107,25 @@ func buildChatGPTChat(conv *chatgptConversation, opts Options) *Chat {
 				messages = append(messages, m)
 			}
 		}
-		for _, childID := range node.Children {
-			process(childID)
-		}
 	}
 
-	for nodeID, node := range nodeMap {
-		if node.Parent == "" || node.Parent == "client-created-root" {
-			process(nodeID)
+	if path := chatgptActivePath(conv); len(path) > 0 {
+		for _, nodeID := range path {
+			processNode(nodeID)
+		}
+	} else {
+		var processBranch func(nodeID string)
+		processBranch = func(nodeID string) {
+			processNode(nodeID)
+			node, ok := nodeMap[nodeID]
+			if !ok || len(node.Children) == 0 {
+				return
+			}
+			processBranch(node.Children[0])
+		}
+
+		for _, nodeID := range chatgptRootNodes(nodeMap) {
+			processBranch(nodeID)
 		}
 	}
 
@@ -152,7 +164,44 @@ func chatgptIsRenderable(msg *chatgptMessage) bool {
 	if ct != "text" && ct != "multimodal_text" {
 		return false
 	}
-	return len(msg.Content.Parts) > 0
+	return len(msg.Content.Parts) > 0 || len(msg.Metadata.Attachments) > 0
+}
+
+func chatgptActivePath(conv *chatgptConversation) []string {
+	if conv.CurrentNode == "" {
+		return nil
+	}
+	nodeMap := conv.Mapping
+	var reversed []string
+	visited := make(map[string]struct{}, len(nodeMap))
+	cur := conv.CurrentNode
+	for cur != "" {
+		if _, ok := visited[cur]; ok {
+			return nil
+		}
+		visited[cur] = struct{}{}
+		node, ok := nodeMap[cur]
+		if !ok {
+			return nil
+		}
+		reversed = append(reversed, cur)
+		cur = node.Parent
+	}
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	return reversed
+}
+
+func chatgptRootNodes(nodeMap map[string]chatgptNode) []string {
+	var roots []string
+	for nodeID, node := range nodeMap {
+		if node.Parent == "" || node.Parent == "client-created-root" {
+			roots = append(roots, nodeID)
+		}
+	}
+	sort.Strings(roots)
+	return roots
 }
 
 func buildChatGPTMessage(nodeID string, nodeMap map[string]chatgptNode, conv *chatgptConversation, opts Options) (Message, bool) {

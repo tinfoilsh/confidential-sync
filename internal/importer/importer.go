@@ -46,6 +46,9 @@ type EmitFunc func(*Chat) error
 // slice of every chat, so large archives do not have to be held in
 // memory all at once.
 func ParseEach(source Source, conversationsJSON []byte, opts Options, emit EmitFunc) (Result, error) {
+	if emit == nil {
+		return Result{}, fmt.Errorf("importer: emit callback is required")
+	}
 	switch source {
 	case SourceChatGPT:
 		return parseChatGPT(conversationsJSON, opts, emit)

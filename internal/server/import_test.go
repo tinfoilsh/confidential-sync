@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,9 @@ func TestValidateImportCreate(t *testing.T) {
 	}
 	if err := validateImportCreate(ImportCreateRequest{Source: "tinfoil", TotalBytes: MaxImportChunkBytes + 1, TotalChunks: 1, ArchiveSHA256: hashOf([]byte("x"))}); err == nil {
 		t.Fatal("expected chunk-count mismatch error")
+	}
+	if err := validateImportCreate(ImportCreateRequest{Source: "tinfoil", TotalBytes: 10, TotalChunks: 1, ArchiveSHA256: strings.Repeat("z", 64)}); err == nil {
+		t.Fatal("expected invalid archive hash error")
 	}
 	if err := validateImportCreate(ImportCreateRequest{Source: "tinfoil", TotalBytes: 10, TotalChunks: 1, ArchiveSHA256: hashOf([]byte("x"))}); err != nil {
 		t.Fatalf("unexpected error: %v", err)

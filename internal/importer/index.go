@@ -58,10 +58,19 @@ func (i *Index) Exact(ref string) (string, bool) {
 	if _, ok := i.byName[clean]; ok {
 		return clean, true
 	}
-	if name, ok := i.byBase[path.Base(clean)]; ok {
-		return name, true
-	}
 	return "", false
+}
+
+// Basename resolves a reference by basename only. Formats whose exports
+// provide bare filenames instead of archive-relative paths opt into this
+// weaker match explicitly.
+func (i *Index) Basename(ref string) (string, bool) {
+	clean := normalizeEntry(ref)
+	if clean == "" {
+		return "", false
+	}
+	name, ok := i.byBase[path.Base(clean)]
+	return name, ok
 }
 
 // ByIDPrefix resolves an attachment file id (e.g. ChatGPT "file-abc123")

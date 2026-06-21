@@ -77,6 +77,7 @@ func (r *stagedArchiveReader) expectedChunkLen(idx int) int64 {
 func (r *stagedArchiveReader) getChunk(idx int) ([]byte, error) {
 	r.mu.Lock()
 	if chunk, ok := r.cache[idx]; ok {
+		r.touchLocked(idx)
 		r.mu.Unlock()
 		return chunk, nil
 	}
@@ -103,6 +104,16 @@ func (r *stagedArchiveReader) getChunk(idx int) ([]byte, error) {
 	}
 	r.mu.Unlock()
 	return chunk, nil
+}
+
+func (r *stagedArchiveReader) touchLocked(idx int) {
+	for i, seen := range r.order {
+		if seen == idx {
+			copy(r.order[i:], r.order[i+1:])
+			r.order[len(r.order)-1] = idx
+			return
+		}
+	}
 }
 
 // importChunkToken is the buckets object key for one staged chunk. The
@@ -258,7 +269,7 @@ func safeZipName(name string) (string, bool) {
 		return "", false
 	}
 	norm := path.Clean(cleaned)
-	if norm == "." || norm == ".." || strings.HasPrefix(norm, "../") || strings.Contains(norm, "/../") {
+	if norm == "." || norm == ".." || strings.HasPrefix(norm, "../") {
 		return "", false
 	}
 	return norm, true
