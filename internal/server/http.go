@@ -454,6 +454,7 @@ func (h *Handler) importCreate(w http.ResponseWriter, r *http.Request, sess Sess
 		writeError(w, err)
 		return
 	}
+	h.importCoordinator.ScheduleStagingCleanup(r.Context(), h.deps, job)
 	encode(w, http.StatusOK, ImportCreateResponse{JobID: job.ID, UploadID: job.UploadID})
 }
 
@@ -495,7 +496,15 @@ func (h *Handler) importStart(w http.ResponseWriter, r *http.Request, sess Sessi
 		writeError(w, err)
 		return
 	}
-	h.importCoordinator.Start(r.Context(), h.deps, sess, job, cek)
+	if !h.importCoordinator.Start(r.Context(), h.deps, sess, job, cek) {
+		snap := job.Snapshot()
+		if snap.Status == ImportJobRunning || snap.Status == ImportJobCompleted || snap.Status == ImportJobFailed {
+			encode(w, http.StatusAccepted, importStatusResponse(snap))
+			return
+		}
+		writeError(w, &AppError{Status: http.StatusConflict, Code: CodeIdempotencyConflict, Message: "import job is not startable"})
+		return
+	}
 	snap := job.Snapshot()
 	encode(w, http.StatusAccepted, importStatusResponse(snap))
 }
@@ -506,9 +515,13 @@ func (h *Handler) importStatus(w http.ResponseWriter, r *http.Request, sess Sess
 		writeError(w, err)
 		return
 	}
+	if req.JobID == "" {
+		writeError(w, badRequest("job_id is required"))
+		return
+	}
 	job := h.importCoordinator.Get(sess.Claims.Subject)
-	if job == nil {
-		encode(w, http.StatusOK, ImportStatusResponse{Status: string(ImportJobIdle)})
+	if job == nil || job.ID != req.JobID {
+		writeError(w, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "import job not found"})
 		return
 	}
 	encode(w, http.StatusOK, importStatusResponse(job.Snapshot()))

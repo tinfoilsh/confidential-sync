@@ -50,13 +50,23 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 		},
 	}
 
-	var imported, failed, conversations, attachments int
+	var imported, failed, conversations, messages, parsedAttachments, uploadedAttachments int
 	emit := func(chat *importer.Chat) error {
 		conversations++
 		if conversations > MaxImportConversations {
 			return errors.New("import: conversation limit exceeded")
 		}
-		if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, &attachments); err != nil {
+		messages += len(chat.Messages)
+		if messages > maxImportMessages {
+			return errors.New("import: message limit exceeded")
+		}
+		for _, msg := range chat.Messages {
+			parsedAttachments += len(msg.Attachments)
+		}
+		if parsedAttachments > MaxImportAttachments {
+			return errors.New("import: attachment limit exceeded")
+		}
+		if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, &uploadedAttachments); err != nil {
 			if isAlreadyImported(err) {
 				imported++
 			} else {
@@ -98,7 +108,15 @@ func sealImportedChat(
 		kept := make([]importer.Attachment, 0, len(msg.Attachments))
 		for _, att := range msg.Attachments {
 			if att.BinaryRef == "" {
+				if att.Type == importer.AttachmentImage && (att.ID == "" || att.EncryptionKey == "") {
+					job.addError("image attachment skipped")
+					continue
+				}
 				kept = append(kept, att)
+				continue
+			}
+			if att.Type != importer.AttachmentImage {
+				job.addError("binary document skipped")
 				continue
 			}
 			idx := attIndex
@@ -249,7 +267,16 @@ func stageImportChunk(ctx context.Context, deps Deps, owner string, job *ImportJ
 		return badRequest("chunk hash mismatch")
 	}
 
-	alreadyHave, err := job.recordChunk(req.ChunkIndex, strings.ToLower(req.ChunkSHA256))
+	expectedChunkBytes := MaxImportChunkBytes
+	if req.ChunkIndex == job.TotalChunks-1 {
+		expectedChunkBytes = int(job.TotalBytes - int64(req.ChunkIndex)*int64(MaxImportChunkBytes))
+	}
+	if len(data) != expectedChunkBytes {
+		return badRequest("chunk size does not match expected range")
+	}
+
+	chunkSHA := strings.ToLower(req.ChunkSHA256)
+	alreadyHave, err := job.beginChunk(req.ChunkIndex, chunkSHA)
 	if err != nil {
 		return badRequest(err.Error())
 	}
@@ -263,10 +290,13 @@ func stageImportChunk(ctx context.Context, deps Deps, owner string, job *ImportJ
 	defer cryptopkg.Zero(stagingKey)
 
 	if deps.Buckets == nil || !deps.Buckets.Configured() {
+		job.clearPendingChunk(req.ChunkIndex, chunkSHA)
 		return &AppError{Status: 503, Code: CodeInternal, Message: "buckets backend not configured"}
 	}
 	if err := deps.Buckets.Put(ctx, owner, importChunkToken(job.UploadID, req.ChunkIndex), data, stagingKey); err != nil {
+		job.clearPendingChunk(req.ChunkIndex, chunkSHA)
 		return &AppError{Status: 502, Code: CodeUpstream, Message: "stage chunk failed: " + err.Error()}
 	}
+	job.finishChunk(req.ChunkIndex, chunkSHA)
 	return nil
 }

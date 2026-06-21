@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,12 @@ const ImportJobBudget = MigrateAllBudget + 1*time.Minute
 // ImportJobRetention keeps a finished job addressable for late status
 // polls before it is reaped.
 const ImportJobRetention = 5 * time.Minute
+
+// ImportStagingRetention is how long an incomplete upload may sit in
+// staging without progress before its staged chunks are deleted.
+const ImportStagingRetention = 30 * time.Minute
+
+const importChunkPendingPrefix = "pending:"
 
 type ImportJobStatus string
 
@@ -82,26 +89,55 @@ func (j *ImportJobState) Snapshot() ImportJobSnapshot {
 // recordChunk makes chunk staging idempotent: replaying the same index
 // with the same hash succeeds; a different hash for an already-seen
 // index is rejected so a flipped chunk cannot corrupt the archive.
-func (j *ImportJobState) recordChunk(index int, chunkSHA string) (alreadyHave bool, err error) {
+func (j *ImportJobState) beginChunk(index int, chunkSHA string) (alreadyHave bool, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.startedRun {
 		return false, fmt.Errorf("import: job already started")
 	}
 	if prev, ok := j.received[index]; ok {
-		if prev != chunkSHA {
+		if strings.TrimPrefix(prev, importChunkPendingPrefix) != chunkSHA {
 			return false, fmt.Errorf("import: chunk %d hash conflict", index)
+		}
+		if strings.HasPrefix(prev, importChunkPendingPrefix) {
+			return false, fmt.Errorf("import: chunk %d upload already in progress", index)
 		}
 		return true, nil
 	}
-	j.received[index] = chunkSHA
+	j.received[index] = importChunkPendingPrefix + chunkSHA
 	j.updatedAt = time.Now().UTC()
 	return false, nil
+}
+
+func (j *ImportJobState) finishChunk(index int, chunkSHA string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.received[index] == importChunkPendingPrefix+chunkSHA {
+		j.received[index] = chunkSHA
+		j.updatedAt = time.Now().UTC()
+	}
+}
+
+func (j *ImportJobState) clearPendingChunk(index int, chunkSHA string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.received[index] == importChunkPendingPrefix+chunkSHA {
+		delete(j.received, index)
+		j.updatedAt = time.Now().UTC()
+	}
 }
 
 func (j *ImportJobState) allChunksReceived() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if len(j.received) != j.TotalChunks {
+		return false
+	}
+	for _, status := range j.received {
+		if strings.HasPrefix(status, importChunkPendingPrefix) {
+			return false
+		}
+	}
 	return len(j.received) == j.TotalChunks
 }
 
@@ -126,6 +162,9 @@ func (j *ImportJobState) setProgress(imported, failed, total int) {
 func (j *ImportJobState) finish(status ImportJobStatus) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.status == ImportJobCompleted || j.status == ImportJobFailed {
+		return
+	}
 	j.status = status
 	j.updatedAt = time.Now().UTC()
 	cryptopkg.Zero(j.cek)
@@ -137,19 +176,21 @@ func (j *ImportJobState) Done() <-chan struct{} { return j.done }
 
 // ImportCoordinator owns the in-memory set of import jobs, one per user.
 type ImportCoordinator struct {
-	mu        sync.Mutex
-	jobs      map[string]*ImportJobState
-	retention time.Duration
-	budget    time.Duration
-	runner    func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error
+	mu               sync.Mutex
+	jobs             map[string]*ImportJobState
+	retention        time.Duration
+	stagingRetention time.Duration
+	budget           time.Duration
+	runner           func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error
 }
 
 func NewImportCoordinator() *ImportCoordinator {
 	return &ImportCoordinator{
-		jobs:      map[string]*ImportJobState{},
-		retention: ImportJobRetention,
-		budget:    ImportJobBudget,
-		runner:    runImportJob,
+		jobs:             map[string]*ImportJobState{},
+		retention:        ImportJobRetention,
+		stagingRetention: ImportStagingRetention,
+		budget:           ImportJobBudget,
+		runner:           runImportJob,
 	}
 }
 
@@ -208,6 +249,11 @@ func (c *ImportCoordinator) Start(parentCtx context.Context, deps Deps, sess Ses
 		cryptopkg.Zero(cek)
 		return false
 	}
+	if job.status != ImportJobStaging {
+		job.mu.Unlock()
+		cryptopkg.Zero(cek)
+		return false
+	}
 	job.startedRun = true
 	job.cek = cek
 	job.status = ImportJobRunning
@@ -216,6 +262,47 @@ func (c *ImportCoordinator) Start(parentCtx context.Context, deps Deps, sess Ses
 
 	go c.run(parentCtx, deps, sess, job)
 	return true
+}
+
+func (c *ImportCoordinator) ScheduleStagingCleanup(parentCtx context.Context, deps Deps, job *ImportJobState) {
+	delay := c.stagingRetention
+	if delay < 0 {
+		delay = 0
+	}
+	time.AfterFunc(delay, func() {
+		c.reapStaleStaging(parentCtx, deps, job)
+	})
+}
+
+func (c *ImportCoordinator) reapStaleStaging(parentCtx context.Context, deps Deps, job *ImportJobState) {
+	retention := c.stagingRetention
+	if retention < 0 {
+		retention = 0
+	}
+	job.mu.Lock()
+	status := job.status
+	updatedAt := job.updatedAt
+	job.mu.Unlock()
+	if status != ImportJobStaging {
+		return
+	}
+	if remaining := retention - time.Since(updatedAt); remaining > 0 {
+		time.AfterFunc(remaining, func() {
+			c.reapStaleStaging(parentCtx, deps, job)
+		})
+		return
+	}
+
+	c.mu.Lock()
+	if c.jobs[job.UserID] != job {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.jobs, job.UserID)
+	c.mu.Unlock()
+
+	job.finish(ImportJobFailed)
+	c.cleanupStaging(context.WithoutCancel(parentCtx), deps, job)
 }
 
 func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Session, job *ImportJobState) {

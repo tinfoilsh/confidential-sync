@@ -67,3 +67,5 @@ const (
 	// MaxImportJobErrors caps how many per-item warnings a job retains.
 	MaxImportJobErrors = 100
 )
+
+var maxImportMessages = MaxImportMessages
