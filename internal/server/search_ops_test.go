@@ -9,7 +9,9 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
@@ -20,9 +22,28 @@ import (
 // a tiny synonym table, so "animal" lands near "duck" and "dog" the
 // way a real embedding model would, without any network dependency.
 type stubEmbedder struct {
+	mu        sync.Mutex
 	model     string
 	failEmbed error
 	calls     int
+}
+
+func (s *stubEmbedder) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func (s *stubEmbedder) setModel(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.model = model
+}
+
+func (s *stubEmbedder) setFailEmbed(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failEmbed = err
 }
 
 var stubSynonyms = map[string]string{
@@ -31,12 +52,20 @@ var stubSynonyms = map[string]string{
 }
 
 func (s *stubEmbedder) Configured() bool { return true }
-func (s *stubEmbedder) Model() string    { return s.model }
+
+func (s *stubEmbedder) Model() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
+}
 
 func (s *stubEmbedder) Embed(_ context.Context, inputs []string) ([][]float32, error) {
+	s.mu.Lock()
 	s.calls++
-	if s.failEmbed != nil {
-		return nil, s.failEmbed
+	failEmbed := s.failEmbed
+	s.mu.Unlock()
+	if failEmbed != nil {
+		return nil, failEmbed
 	}
 	out := make([][]float32, len(inputs))
 	for i, in := range inputs {
@@ -235,7 +264,7 @@ func TestSearchQueryReportsNeedsReindexWithoutIndex(t *testing.T) {
 	if !got.NeedsReindex || got.TotalIndexed != 0 || len(got.Results) != 0 {
 		t.Fatalf("expected empty needs_reindex response, got %+v", got)
 	}
-	if f.embedder.calls != 0 {
+	if f.embedder.callCount() != 0 {
 		t.Fatal("query on empty index should not call the embedder")
 	}
 }
@@ -276,32 +305,69 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 		t.Fatal("expected needs_reindex after index loss")
 	}
 
-	cursor := ""
-	total := 0
-	for pages := 0; ; pages++ {
-		if pages > 10 {
-			t.Fatal("reindex did not terminate")
-		}
-		resp, body := f.post("/v1/search/reindex", SearchReindexRequest{
-			Keys:   []PullKey{{Key: f.userKeyB64}},
-			Cursor: cursor,
-			Limit:  2,
-		}, tok)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("reindex: status %d body %s", resp.StatusCode, body)
-		}
-		var out SearchReindexResponse
-		if err := json.Unmarshal(body, &out); err != nil {
-			t.Fatal(err)
-		}
-		total += out.Indexed
-		if out.Done {
-			break
-		}
-		cursor = out.NextCursor
+	// No job yet: status reports idle.
+	resp, body := f.post("/v1/search/reindex-status", struct{}{}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d %s", resp.StatusCode, body)
 	}
-	if total != 3 {
-		t.Fatalf("reindexed %d chats, want 3", total)
+	var idle SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &idle); err != nil {
+		t.Fatal(err)
+	}
+	if idle.Status != string(MigrationJobIdle) {
+		t.Fatalf("expected idle status, got %+v", idle)
+	}
+
+	req := SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}
+	resp, body = f.post("/v1/search/reindex", req, tok)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("kickoff: status %d body %s", resp.StatusCode, body)
+	}
+	var kicked SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &kicked); err != nil {
+		t.Fatal(err)
+	}
+	if kicked.JobID == "" {
+		t.Fatal("kickoff did not return a job id")
+	}
+
+	// A duplicate kickoff must join the existing job, not stack a
+	// second full re-embed.
+	resp, body = f.post("/v1/search/reindex", req, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second kickoff: status %d body %s", resp.StatusCode, body)
+	}
+	var joined SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &joined); err != nil {
+		t.Fatal(err)
+	}
+	if joined.JobID != kicked.JobID {
+		t.Fatalf("duplicate kickoff started a new job: %s != %s", joined.JobID, kicked.JobID)
+	}
+
+	job := f.handler.reindexCoordinator.Status(f.userSub)
+	if job == nil {
+		t.Fatal("no job tracked after kickoff")
+	}
+	select {
+	case <-job.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("reindex job did not finish")
+	}
+
+	resp, body = f.post("/v1/search/reindex-status", struct{}{}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status after run: %d %s", resp.StatusCode, body)
+	}
+	var final SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != string(MigrationJobCompleted) || final.Partial {
+		t.Fatalf("unexpected terminal status: %+v", final)
+	}
+	if final.Indexed != 3 || final.TotalIndexed != 3 {
+		t.Fatalf("reindexed %d chats (total %d), want 3", final.Indexed, final.TotalIndexed)
 	}
 
 	got := f.query(t, tok, "animal")
@@ -315,7 +381,7 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 
 func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
 	f := newSearchFixture(t)
-	f.embedder.failEmbed = errors.New("embedding backend down")
+	f.embedder.setFailEmbed(errors.New("embedding backend down"))
 	tok := f.jwt()
 
 	out := f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
@@ -327,7 +393,7 @@ func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
 	}
 
 	// The lexical-only entry still makes the chat findable by keyword.
-	f.embedder.failEmbed = nil
+	f.embedder.setFailEmbed(nil)
 	got := f.query(t, tok, "duck")
 	if len(got.Results) != 1 || got.Results[0].ID != "chat_duck" {
 		t.Fatalf("expected lexical hit for 'duck', got %+v", got.Results)

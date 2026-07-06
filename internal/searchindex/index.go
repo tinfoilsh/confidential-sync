@@ -111,12 +111,19 @@ func Quantize(v []float32) Vector {
 		}
 	}
 	out := make(Vector, len(v))
-	if maxAbs == 0 {
+	// NaN/Inf cannot arrive via well-formed JSON embeddings, but a
+	// non-finite value here would make the int8 conversion below
+	// implementation-defined; a zero vector is the safe degradation.
+	if maxAbs == 0 || math.IsInf(maxAbs, 0) || math.IsNaN(maxAbs) {
 		return out
 	}
 	scale := 127 / maxAbs
 	for i, f := range v {
-		out[i] = int8(math.Round(float64(f) * scale))
+		q := math.Round(float64(f) * scale)
+		if math.IsNaN(q) {
+			continue
+		}
+		out[i] = int8(q)
 	}
 	return out
 }
@@ -216,12 +223,19 @@ func Decode(data []byte) (*Index, error) {
 		}
 		live++
 		e, ok := ix.Chats[id]
-		if !ok || id != ix.Slots[e.Slot] {
+		if !ok || e.Slot < 0 || e.Slot >= len(ix.Slots) || id != ix.Slots[e.Slot] {
 			return nil, errors.New("searchindex: slot table does not match entries")
 		}
 	}
 	if live != len(ix.Chats) {
 		return nil, errors.New("searchindex: slot table does not match entries")
+	}
+	for _, e := range ix.Chats {
+		for _, v := range e.Vectors {
+			if len(v) == 0 || len(v) != ix.Dims {
+				return nil, errors.New("searchindex: entry vector does not match index dims")
+			}
+		}
 	}
 	for _, slots := range ix.Postings {
 		for _, s := range slots {
@@ -268,7 +282,18 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	e.Slot = len(ix.Slots)
 	ix.Slots = append(ix.Slots, id)
 	ix.Chats[id] = e
+	// Tokenize already dedupes, but Upsert must not trust its caller:
+	// a duplicated token would double-count the chat in that token's
+	// IDF and score.
+	seen := make(map[string]struct{}, len(tokens))
 	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
 		ix.Postings[tok] = append(ix.Postings[tok], e.Slot)
 	}
 	ix.maybeCompact()

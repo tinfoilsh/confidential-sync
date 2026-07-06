@@ -24,11 +24,12 @@ const MaxRequestBytes = 64 << 20
 const AttachmentRequestTimeout = 5 * time.Minute
 
 type Handler struct {
-	deps              Deps
-	verifier          auth.Verifier
-	logger            Logger
-	coordinator       *MigrationCoordinator
-	importCoordinator *ImportCoordinator
+	deps               Deps
+	verifier           auth.Verifier
+	logger             Logger
+	coordinator        *MigrationCoordinator
+	importCoordinator  *ImportCoordinator
+	reindexCoordinator *SearchReindexCoordinator
 }
 
 type Logger interface {
@@ -38,11 +39,12 @@ type Logger interface {
 
 func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 	return &Handler{
-		deps:              deps,
-		verifier:          verifier,
-		logger:            logger,
-		coordinator:       NewMigrationCoordinator(),
-		importCoordinator: NewImportCoordinator(),
+		deps:               deps,
+		verifier:           verifier,
+		logger:             logger,
+		coordinator:        NewMigrationCoordinator(),
+		importCoordinator:  NewImportCoordinator(),
+		reindexCoordinator: NewSearchReindexCoordinator(),
 	}
 }
 
@@ -109,12 +111,12 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/import/status", func(h *Handler) http.Handler { return h.authMiddleware(h.importStatus) }},
 
 		// Chat search. Query runs under the regular auth timeout (one
-		// embedding round trip plus one index read); reindex pulls and
-		// embeds a whole page of chats, so it gets a longer deadline.
+		// embedding round trip plus one index read). Reindex kicks off
+		// a detached background job and returns immediately, like
+		// migrate-all; status is a pure in-memory poll.
 		{"POST", "/v1/search/query", func(h *Handler) http.Handler { return h.authMiddleware(h.searchQuery) }},
-		{"POST", "/v1/search/reindex", func(h *Handler) http.Handler {
-			return h.authMiddlewareWithTimeout(h.searchReindex, SearchReindexRequestTimeout)
-		}},
+		{"POST", "/v1/search/reindex", func(h *Handler) http.Handler { return h.authMiddleware(h.searchReindex) }},
+		{"POST", "/v1/search/reindex-status", func(h *Handler) http.Handler { return h.authMiddleware(h.searchReindexStatus) }},
 
 		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
 		// /v1/share/open is intentionally unauthenticated. Knowing the
@@ -566,12 +568,29 @@ func (h *Handler) searchReindex(w http.ResponseWriter, r *http.Request, sess Ses
 		writeError(w, err)
 		return
 	}
-	resp, err := SearchReindex(r.Context(), h.deps, sess, req)
-	if err != nil {
+	if !searchConfigured(h.deps) {
+		writeError(w, searchUnavailable())
+		return
+	}
+	if err := validateSearchReindexRequest(req); err != nil {
 		writeError(w, err)
 		return
 	}
-	encode(w, http.StatusOK, resp)
+	job, started := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, req)
+	status := http.StatusOK
+	if started {
+		status = http.StatusAccepted
+	}
+	encode(w, status, job.statusResponse())
+}
+
+func (h *Handler) searchReindexStatus(w http.ResponseWriter, r *http.Request, sess Session) {
+	job := h.reindexCoordinator.Status(sess.Claims.Subject)
+	if job == nil {
+		encode(w, http.StatusOK, SearchReindexStatusResponse{Status: string(MigrationJobIdle)})
+		return
+	}
+	encode(w, http.StatusOK, job.statusResponse())
 }
 
 func (h *Handler) shareSeal(w http.ResponseWriter, r *http.Request, sess Session) {

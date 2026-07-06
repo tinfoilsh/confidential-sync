@@ -73,5 +73,6 @@ shim:
     - /v1/import/status
     - /v1/search/query
     - /v1/search/reindex
+    - /v1/search/reindex-status
     - /v1/share/seal
     - /v1/share/open

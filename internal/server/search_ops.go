@@ -63,14 +63,9 @@ const (
 	defaultSearchLimit = 20
 	maxSearchLimit     = 100
 
-	// defaultReindexPageSize is how many chats one reindex call pulls
-	// and embeds. Bounded by the embedder's batch limit.
-	defaultReindexPageSize = 16
-	maxReindexPageSize     = 64
-
-	// SearchReindexRequestTimeout gives one reindex page room for the
-	// controlplane pulls plus a batch embedding round trip.
-	SearchReindexRequestTimeout = 2 * time.Minute
+	// reindexPageSize is how many chats one reindex page pulls and
+	// embeds. Bounded by the embedder's batch limit.
+	reindexPageSize = 16
 )
 
 // Embedder is the embedding backend the search feature uses. In
@@ -432,22 +427,22 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	return resp, nil
 }
 
-// SearchReindex rebuilds one page of the caller's index from the
-// stored chat blobs. The client drives pagination: an empty cursor
-// starts a rebuild (dropping the previous index generation, which
-// also flushes entries for since-deleted chats), and each response's
-// next_cursor feeds the following call until done=true.
-func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest) (*SearchReindexResponse, error) {
-	if !searchConfigured(deps) {
-		return nil, searchUnavailable()
-	}
-	if len(req.Keys) == 0 {
-		return nil, badRequest("keys is required and must not be empty")
-	}
-	if req.Limit <= 0 || req.Limit > maxReindexPageSize {
-		req.Limit = defaultReindexPageSize
-	}
-	cek, err := decodeKey(req.Keys[0].Key)
+// searchReindexPageResult reports one page of a rebuild. NextCursor
+// feeds the next page; Done means the chat listing is drained.
+type searchReindexPageResult struct {
+	Indexed      int
+	Failed       int
+	NextCursor   string
+	Done         bool
+	TotalIndexed int
+}
+
+// searchReindexPage rebuilds one page of the caller's index from the
+// stored chat blobs. An empty cursor starts a rebuild, dropping the
+// previous index generation (which also flushes entries for
+// since-deleted chats). Driven by the reindex job runner.
+func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string) (*searchReindexPageResult, error) {
+	cek, err := decodeKey(keys[0].Key)
 	if err != nil {
 		return nil, badRequest("invalid key: " + err.Error())
 	}
@@ -461,9 +456,9 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 	pull, err := Pull(ctx, deps, sess, PullRequest{
 		Scope:  string(envelope.ScopeChat),
 		All:    true,
-		Cursor: req.Cursor,
-		Limit:  req.Limit,
-		Keys:   req.Keys,
+		Cursor: cursor,
+		Limit:  reindexPageSize,
+		Keys:   keys,
 	})
 	if err != nil {
 		return nil, err
@@ -505,7 +500,7 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 	unlock := lockSearchIndex(sess.Claims.Subject)
 	defer unlock()
 	var ix *searchindex.Index
-	if req.Cursor == "" {
+	if cursor == "" {
 		ix = searchindex.New(deps.Embedder.Model())
 	} else {
 		ix, _, err = loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
@@ -531,7 +526,7 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 	if err := saveSearchIndex(ctx, deps, sess.Claims.Subject, indexKey, ix); err != nil {
 		return nil, err
 	}
-	resp := &SearchReindexResponse{
+	resp := &searchReindexPageResult{
 		Indexed:      indexed,
 		Failed:       failed,
 		NextCursor:   pull.NextCursor,

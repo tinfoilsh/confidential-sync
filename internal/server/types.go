@@ -258,21 +258,30 @@ type SearchQueryResponse struct {
 	NeedsReindex bool `json:"needs_reindex,omitempty"`
 }
 
-// SearchReindexRequest rebuilds one page of the search index from the
-// stored chat blobs. An empty cursor starts a fresh rebuild; callers
-// feed each response's next_cursor back until done=true.
+// SearchReindexRequest kicks off a background job that rebuilds the
+// caller's search index from the stored chat blobs. The enclave pages
+// through the chats internally; callers poll /v1/search/reindex-status
+// (or re-POST reindex, which returns the in-flight job) until the
+// status is terminal.
 type SearchReindexRequest struct {
-	Keys   []PullKey `json:"keys"`
-	Cursor string    `json:"cursor,omitempty"`
-	Limit  int       `json:"limit,omitempty"`
+	Keys []PullKey `json:"keys"`
 }
 
-type SearchReindexResponse struct {
+// SearchReindexStatusResponse is the wire shape returned by both the
+// reindex kickoff and the status poll. Status values match the
+// migration job lifecycle: idle, running, completed, failed.
+type SearchReindexStatusResponse struct {
+	JobID        string `json:"job_id,omitempty"`
+	Status       string `json:"status"`
 	Indexed      int    `json:"indexed"`
 	Failed       int    `json:"failed"`
-	NextCursor   string `json:"next_cursor,omitempty"`
-	Done         bool   `json:"done"`
 	TotalIndexed int    `json:"total_indexed"`
+	// Partial is true when the run stopped at its wall-clock budget
+	// before draining every chat; a fresh kickoff restarts the build.
+	Partial   bool   `json:"partial"`
+	StartedAt string `json:"started_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type HealthResponse struct {
