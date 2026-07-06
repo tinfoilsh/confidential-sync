@@ -18,6 +18,10 @@ type PushResponse struct {
 	OK    bool   `json:"ok"`
 	ETag  string `json:"etag"`
 	KeyID string `json:"key_id"`
+	// SearchIndexed reports whether the inline search-index update
+	// succeeded for a chat push. False means the blob stored fine but
+	// the chat won't surface in search until a reindex.
+	SearchIndexed bool `json:"search_indexed,omitempty"`
 }
 
 type PullKey struct {
@@ -232,6 +236,43 @@ type MigrateAllStatusResponse struct {
 	Partial            bool                    `json:"partial"`
 	Scopes             []MigrateAllScopeReport `json:"scopes"`
 	Error              string                  `json:"error,omitempty"`
+}
+
+type SearchQueryRequest struct {
+	Key   string `json:"key"` // base64 32-byte CEK
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type SearchQueryResult struct {
+	ID    string  `json:"id"`
+	Score float64 `json:"score"`
+}
+
+type SearchQueryResponse struct {
+	Results      []SearchQueryResult `json:"results"`
+	TotalIndexed int                 `json:"total_indexed"`
+	// NeedsReindex is true when no readable index exists for the
+	// caller's current CEK (never built, CEK rotated, or embedding
+	// model changed); the client should drive /v1/search/reindex.
+	NeedsReindex bool `json:"needs_reindex,omitempty"`
+}
+
+// SearchReindexRequest rebuilds one page of the search index from the
+// stored chat blobs. An empty cursor starts a fresh rebuild; callers
+// feed each response's next_cursor back until done=true.
+type SearchReindexRequest struct {
+	Keys   []PullKey `json:"keys"`
+	Cursor string    `json:"cursor,omitempty"`
+	Limit  int       `json:"limit,omitempty"`
+}
+
+type SearchReindexResponse struct {
+	Indexed      int    `json:"indexed"`
+	Failed       int    `json:"failed"`
+	NextCursor   string `json:"next_cursor,omitempty"`
+	Done         bool   `json:"done"`
+	TotalIndexed int    `json:"total_indexed"`
 }
 
 type HealthResponse struct {

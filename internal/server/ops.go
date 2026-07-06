@@ -19,7 +19,14 @@ import (
 type Deps struct {
 	Controlplane *controlplane.Client
 	Buckets      *buckets.Client
-	GitSHA       string
+	// SearchBuckets talks to the dedicated search-index sidecar,
+	// backed by its own S3 bucket. Optional: when unconfigured the
+	// search routes return 503 and push/delete skip index upkeep.
+	SearchBuckets *buckets.Client
+	// Embedder generates embedding vectors via the Tinfoil inference
+	// service. Optional, gated together with SearchBuckets.
+	Embedder Embedder
+	GitSHA   string
 	// SyncEnclaveSecret is the shared secret used to verify the
 	// X-Legacy-Claim header CP stamps on legacy attachment reads.
 	// Empty in test fixtures, where the legacy-claim guard is
@@ -148,7 +155,20 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if err == nil {
 		deps.logInfo("push ok: user=%s scope=%s id=%s kid=%s new_etag=%s",
 			sess.Claims.Subject, scope, req.ID, kidHex, resp.ETag)
-		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
+		// Search indexing is inline (the plaintext and CEK only exist
+		// for this request) but best-effort: the blob write already
+		// succeeded, so an indexing failure degrades search instead
+		// of failing the push. The reindex path repairs any gap.
+		searchIndexed := false
+		if scope == envelope.ScopeChat && searchConfigured(deps) {
+			if idxErr := indexChatForSearch(ctx, deps, sess.Claims.Subject, key, req.ID, plaintext, resp.ETag); idxErr != nil {
+				deps.logError("push search index failed: user=%s id=%s err=%v",
+					sess.Claims.Subject, req.ID, idxErr)
+			} else {
+				searchIndexed = true
+			}
+		}
+		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID, SearchIndexed: searchIndexed}, nil
 	}
 
 	if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
@@ -456,6 +476,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		if scope == envelope.ScopeChat && cpResp != nil {
 			deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 		}
+		dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
 		deps.logInfo("delete ok: user=%s scope=%s id=%s", sess.Claims.Subject, scope, req.ID)
 		return resp, nil
 	}
@@ -498,6 +519,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// trusts controlplane authority over ownership.
 				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 			}
+			dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
 			deps.logInfo("delete ok: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, req.ID, attempt)
 			return resp, nil

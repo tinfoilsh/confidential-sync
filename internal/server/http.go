@@ -108,6 +108,14 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/import/start", func(h *Handler) http.Handler { return h.authMiddleware(h.importStart) }},
 		{"POST", "/v1/import/status", func(h *Handler) http.Handler { return h.authMiddleware(h.importStatus) }},
 
+		// Chat search. Query runs under the regular auth timeout (one
+		// embedding round trip plus one index read); reindex pulls and
+		// embeds a whole page of chats, so it gets a longer deadline.
+		{"POST", "/v1/search/query", func(h *Handler) http.Handler { return h.authMiddleware(h.searchQuery) }},
+		{"POST", "/v1/search/reindex", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.searchReindex, SearchReindexRequestTimeout)
+		}},
+
 		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
 		// /v1/share/open is intentionally unauthenticated. Knowing the
 		// share key in the URL fragment is the access proof — the same
@@ -536,6 +544,34 @@ func importStatusResponse(snap ImportJobSnapshot) ImportStatusResponse {
 		Errors:   snap.Errors,
 		JobID:    snap.ID,
 	}
+}
+
+func (h *Handler) searchQuery(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req SearchQueryRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := SearchQuery(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) searchReindex(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req SearchReindexRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := SearchReindex(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
 }
 
 func (h *Handler) shareSeal(w http.ResponseWriter, r *http.Request, sess Session) {
