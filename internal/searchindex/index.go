@@ -1,16 +1,22 @@
 // Package searchindex implements the per-user chat search index the
-// sync enclave maintains. The index maps each chat id to a lexical
-// token set plus a semantic embedding vector; queries are answered by
-// brute-force cosine similarity over every entry, combined with a
-// lexical-overlap boost. Brute force is deliberate: per-user chat
-// counts are small (hundreds to a few thousand), and scanning the
-// whole index inside the enclave leaks no per-query access pattern
-// the way a disk-resident ANN structure would.
+// sync enclave maintains, modeled on what E2EE messengers build
+// client-side (SQLite FTS5 style): an inverted index from token to
+// posting list for exact keyword search, plus a handful of quantized
+// chunk-embedding vectors per chat for semantic ranking as a bonus
+// signal.
 //
-// The index is serialized to JSON and stored as a single object
-// through the buckets sidecar, sealed under a key derived from the
-// user's CEK (crypto.DeriveSearchIndexKey). Plaintext index contents
-// exist only inside the enclave for the lifetime of a request.
+// The whole index is one object fetched into memory from the buckets
+// sidecar, so the format is optimized to stay small: each token
+// string is stored once (as a postings key) no matter how many chats
+// contain it, posting lists hold small integer slots instead of chat
+// ids, and vectors are int8-quantized. Queries resolve keywords by
+// O(query tokens) posting-list lookups; only the semantic pass scans
+// per-chat vectors, which stays cheap at per-user corpus sizes.
+//
+// The index is serialized to JSON, gzipped, and stored sealed under a
+// key derived from the user's CEK (crypto.DeriveSearchIndexKey).
+// Plaintext index contents exist only inside the enclave for the
+// lifetime of a request.
 package searchindex
 
 import (
@@ -19,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -32,23 +39,49 @@ const (
 	FormatVersion = 1
 
 	// MaxChats bounds how many entries one index holds, which in turn
-	// bounds the object size and per-query scan cost.
+	// bounds the object size and per-query cost.
 	MaxChats = 50000
 
-	// MaxTokensPerChat caps the stored lexical token set per chat.
+	// MaxTokensPerChat caps how many tokens one chat contributes to
+	// the postings.
 	MaxTokensPerChat = 512
+
+	// MaxChunksPerChat caps how many embedding vectors one chat may
+	// store. Chunked embeddings keep long chats searchable (one
+	// vector over a whole conversation dilutes everything), while the
+	// cap bounds the dominant per-chat size cost; typical short chats
+	// carry a single chunk.
+	MaxChunksPerChat = 8
 
 	// minTokenLen drops single-character noise tokens.
 	minTokenLen = 2
 
-	// maxTokenLen drops pathological tokens (base64 blobs, hashes)
-	// that bloat the index without helping lexical match.
+	// maxTokenLen drops pathological fragment tokens (base64 blobs,
+	// hashes) that bloat the index without helping keyword search.
 	maxTokenLen = 40
 
-	// lexicalBoostWeight is how much a full lexical overlap adds on
-	// top of the cosine score. Cosine dominates ranking; the boost
-	// promotes exact keyword hits among semantically similar chats.
-	lexicalBoostWeight = 0.3
+	// maxIdentifierLen is the longer cap for whole identifiers
+	// (emails, URLs) kept intact for exact matching.
+	maxIdentifierLen = 64
+
+	// compactionMinDead avoids rewriting postings for trivial amounts
+	// of garbage; compaction only fires once at least this many dead
+	// slots exist and they outnumber the live entries.
+	compactionMinDead = 64
+
+	// rrfK is the standard reciprocal-rank-fusion smoothing constant.
+	rrfK = 60
+
+	// rrfCandidateDepth truncates each ranked list before fusion so a
+	// huge corpus doesn't drag thousands of near-zero-signal entries
+	// into the fused scoring.
+	rrfCandidateDepth = 128
+
+	// lexicalRRFWeight / semanticRRFWeight bias fusion toward keyword
+	// hits: exact keyword search is the reliable tier, semantic
+	// similarity the bonus tier.
+	lexicalRRFWeight  = 1.0
+	semanticRRFWeight = 0.5
 )
 
 var (
@@ -112,34 +145,19 @@ func (v *Vector) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// TokenSet is a chat's lexical token set. It serializes as a single
-// space-delimited string instead of a JSON string array: tokens can
-// never contain whitespace (Tokenize splits on it), and the packed
-// form drops the per-token quoting/comma overhead and compresses
-// better under the gzip layer the index is stored through.
-type TokenSet []string
-
-func (ts TokenSet) MarshalJSON() ([]byte, error) {
-	return json.Marshal(strings.Join(ts, " "))
-}
-
-func (ts *TokenSet) UnmarshalJSON(data []byte) error {
-	var packed string
-	if err := json.Unmarshal(data, &packed); err != nil {
-		return fmt.Errorf("searchindex: decode tokens: %w", err)
-	}
-	*ts = strings.Fields(packed)
-	return nil
-}
-
-// Entry is one chat's index record.
+// Entry is one chat's index record. Its tokens live in the shared
+// postings, referenced by Slot, not on the entry itself.
 type Entry struct {
+	// Slot is the chat's position in the Slots table; posting lists
+	// reference chats by slot. Assigned by Upsert.
+	Slot int `json:"slot"`
 	// ETag is the sync blob etag the entry was built from, so callers
 	// can skip re-embedding chats that have not changed.
-	ETag      string   `json:"etag,omitempty"`
-	UpdatedAt string   `json:"updated_at,omitempty"`
-	Tokens    TokenSet `json:"tokens,omitempty"`
-	Vector    Vector   `json:"vector,omitempty"`
+	ETag      string `json:"etag,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+	// Vectors holds one quantized embedding per text chunk; the
+	// semantic score for the chat is the max similarity over them.
+	Vectors []Vector `json:"vectors,omitempty"`
 }
 
 // Index is the serialized per-user search index.
@@ -147,20 +165,35 @@ type Index struct {
 	Version int `json:"version"`
 	// Model and Dims pin the embedding space. Vectors from different
 	// models are not comparable, so a model change forces a rebuild.
-	Model string           `json:"model,omitempty"`
-	Dims  int              `json:"dims,omitempty"`
+	Model string `json:"model,omitempty"`
+	Dims  int    `json:"dims,omitempty"`
+	// Slots maps slot -> chat id. An updated or removed chat leaves a
+	// tombstone ("" at its old slot) instead of eagerly rewriting
+	// every posting list; queries skip dead slots and compaction
+	// reclaims them once they outnumber live entries.
+	Slots []string `json:"slots,omitempty"`
+	// Chats maps chat id -> entry.
 	Chats map[string]Entry `json:"chats"`
+	// Postings is the inverted index: token -> ascending slot list.
+	Postings map[string][]int `json:"postings,omitempty"`
+
+	// dead counts tombstoned slots; recomputed on decode, maintained
+	// on mutation, never serialized.
+	dead int
 }
 
 func New(model string) *Index {
 	return &Index{
-		Version: FormatVersion,
-		Model:   model,
-		Chats:   map[string]Entry{},
+		Version:  FormatVersion,
+		Model:    model,
+		Chats:    map[string]Entry{},
+		Postings: map[string][]int{},
 	}
 }
 
-// Decode parses a serialized index and validates its version.
+// Decode parses a serialized index and validates its shape. Slot
+// references are checked so a corrupted object surfaces as a decode
+// error (which callers treat as "rebuild") instead of a panic later.
 func Decode(data []byte) (*Index, error) {
 	var ix Index
 	if err := json.Unmarshal(data, &ix); err != nil {
@@ -172,6 +205,31 @@ func Decode(data []byte) (*Index, error) {
 	if ix.Chats == nil {
 		ix.Chats = map[string]Entry{}
 	}
+	if ix.Postings == nil {
+		ix.Postings = map[string][]int{}
+	}
+	live := 0
+	for _, id := range ix.Slots {
+		if id == "" {
+			ix.dead++
+			continue
+		}
+		live++
+		e, ok := ix.Chats[id]
+		if !ok || id != ix.Slots[e.Slot] {
+			return nil, errors.New("searchindex: slot table does not match entries")
+		}
+	}
+	if live != len(ix.Chats) {
+		return nil, errors.New("searchindex: slot table does not match entries")
+	}
+	for _, slots := range ix.Postings {
+		for _, s := range slots {
+			if s < 0 || s >= len(ix.Slots) {
+				return nil, errors.New("searchindex: posting references unknown slot")
+			}
+		}
+	}
 	return &ix, nil
 }
 
@@ -179,28 +237,92 @@ func (ix *Index) Encode() ([]byte, error) {
 	return json.Marshal(ix)
 }
 
-// Upsert records or replaces one chat's entry. The first vector to
-// land in an empty index pins Dims; later vectors must match.
-func (ix *Index) Upsert(id string, e Entry) error {
+// Upsert records or replaces one chat's entry and its postings. The
+// previous generation of an updated chat is tombstoned rather than
+// scrubbed from every posting list; compaction reclaims tombstones in
+// bulk. The first vector to land in an empty index pins Dims; later
+// vectors must match.
+func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	if id == "" {
 		return errors.New("searchindex: id is required")
 	}
-	if _, exists := ix.Chats[id]; !exists && len(ix.Chats) >= MaxChats {
-		return ErrTooLarge
+	if len(e.Vectors) > MaxChunksPerChat {
+		return fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
 	}
-	if len(e.Vector) > 0 {
+	for _, v := range e.Vectors {
+		if len(v) == 0 {
+			return errors.New("searchindex: empty chunk vector")
+		}
 		if ix.Dims == 0 {
-			ix.Dims = len(e.Vector)
-		} else if len(e.Vector) != ix.Dims {
-			return fmt.Errorf("searchindex: vector has %d dims, index has %d", len(e.Vector), ix.Dims)
+			ix.Dims = len(v)
+		} else if len(v) != ix.Dims {
+			return fmt.Errorf("searchindex: vector has %d dims, index has %d", len(v), ix.Dims)
 		}
 	}
+	if old, exists := ix.Chats[id]; exists {
+		ix.Slots[old.Slot] = ""
+		ix.dead++
+	} else if len(ix.Chats) >= MaxChats {
+		return ErrTooLarge
+	}
+	e.Slot = len(ix.Slots)
+	ix.Slots = append(ix.Slots, id)
 	ix.Chats[id] = e
+	for _, tok := range tokens {
+		ix.Postings[tok] = append(ix.Postings[tok], e.Slot)
+	}
+	ix.maybeCompact()
 	return nil
 }
 
+// Remove drops one chat, leaving a tombstone slot behind.
 func (ix *Index) Remove(id string) {
+	e, ok := ix.Chats[id]
+	if !ok {
+		return
+	}
+	ix.Slots[e.Slot] = ""
+	ix.dead++
 	delete(ix.Chats, id)
+	ix.maybeCompact()
+}
+
+// maybeCompact rewrites the slot table and postings once tombstones
+// outnumber live entries. Amortized this keeps mutations O(tokens per
+// chat) while bounding the garbage a churn-heavy user accumulates.
+func (ix *Index) maybeCompact() {
+	if ix.dead < compactionMinDead || ix.dead <= len(ix.Chats) {
+		return
+	}
+	remap := make(map[int]int, len(ix.Chats))
+	newSlots := make([]string, 0, len(ix.Chats))
+	for oldSlot, id := range ix.Slots {
+		if id == "" {
+			continue
+		}
+		remap[oldSlot] = len(newSlots)
+		newSlots = append(newSlots, id)
+	}
+	for id, e := range ix.Chats {
+		e.Slot = remap[e.Slot]
+		ix.Chats[id] = e
+	}
+	for tok, slots := range ix.Postings {
+		kept := slots[:0]
+		for _, s := range slots {
+			if n, ok := remap[s]; ok {
+				kept = append(kept, n)
+			}
+		}
+		if len(kept) == 0 {
+			delete(ix.Postings, tok)
+			continue
+		}
+		sort.Ints(kept)
+		ix.Postings[tok] = kept
+	}
+	ix.Slots = newSlots
+	ix.dead = 0
 }
 
 // Compatible reports whether the index can serve queries embedded
@@ -209,29 +331,44 @@ func (ix *Index) Compatible(model string) bool {
 	return ix.Model == model
 }
 
-// Tokenize lowercases text, splits on non-letter/non-digit runes, and
-// returns the deduplicated token set (capped at MaxTokensPerChat).
-// Order is sorted so serialized indexes are deterministic.
+// identifierPattern matches whole emails and URLs in lowercased text.
+// These are kept intact as single tokens (alongside their fragments)
+// so a query for an exact identifier like "sacha@gmail.com" matches
+// the whole token decisively instead of relying on fragment
+// coincidence.
+var identifierPattern = regexp.MustCompile(`https?://[^\s<>"']+|www\.[^\s<>"']+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}`)
+
+// Tokenize lowercases text and returns its deduplicated token set:
+// whole email/URL identifiers first (so the cap can never evict
+// them), then fragments split on non-letter/non-digit runes.
 func Tokenize(text string) []string {
-	fields := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
-	})
-	seen := make(map[string]struct{}, len(fields))
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		if len(f) < minTokenLen || len(f) > maxTokenLen {
-			continue
+	lower := strings.ToLower(text)
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(tok string, maxLen int) bool {
+		if len(tok) < minTokenLen || len(tok) > maxLen {
+			return true
 		}
-		if _, dup := seen[f]; dup {
-			continue
+		if _, dup := seen[tok]; dup {
+			return true
 		}
-		seen[f] = struct{}{}
-		out = append(out, f)
-		if len(out) >= MaxTokensPerChat {
-			break
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+		return len(out) < MaxTokensPerChat
+	}
+	for _, ident := range identifierPattern.FindAllString(lower, -1) {
+		if !add(strings.Trim(ident, ".,;:!?"), maxIdentifierLen) {
+			return out
 		}
 	}
-	sort.Strings(out)
+	fields := strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	for _, f := range fields {
+		if !add(f, maxTokenLen) {
+			return out
+		}
+	}
 	return out
 }
 
@@ -241,35 +378,32 @@ type Result struct {
 	Score float64
 }
 
-// Search ranks every entry against the query embedding and token set
-// and returns the top `limit` results, best first. Entries without a
-// vector (or with mismatched dims) are ranked by lexical overlap
-// alone, so a partially indexed corpus still returns keyword hits.
+// Search answers a query with weighted reciprocal-rank fusion of two
+// ranked lists:
+//
+//   - Lexical: posting-list lookups scored by summed IDF, so rare
+//     query tokens ("sacha") dominate ubiquitous ones ("com"). This
+//     is the reliable tier; fusion weights it highest.
+//   - Semantic: cosine over per-chat quantized vectors, the bonus
+//     tier that surfaces "animal" -> duck/dog chats.
+//
+// Rank fusion sidesteps the incompatible scales of cosine and IDF
+// scores. Returned scores are the fused values: meaningful for
+// ordering, not calibrated for anything else.
 func (ix *Index) Search(queryVec []float32, queryTokens []string, limit int) []Result {
-	if limit <= 0 {
+	if limit <= 0 || len(ix.Chats) == 0 {
 		return nil
 	}
-	querySet := make(map[string]struct{}, len(queryTokens))
-	for _, t := range queryTokens {
-		querySet[t] = struct{}{}
+	fused := map[int]float64{}
+	for rank, slot := range ix.lexicalRanked(queryTokens) {
+		fused[slot] += lexicalRRFWeight / float64(rrfK+rank+1)
 	}
-	results := make([]Result, 0, len(ix.Chats))
-	for id, e := range ix.Chats {
-		score := 0.0
-		scored := false
-		if len(queryVec) > 0 && len(e.Vector) == len(queryVec) {
-			score = cosine(queryVec, e.Vector)
-			scored = true
-		}
-		if len(querySet) > 0 {
-			overlap := lexicalOverlap(querySet, e.Tokens)
-			score += lexicalBoostWeight * overlap
-			scored = scored || overlap > 0
-		}
-		if !scored {
-			continue
-		}
-		results = append(results, Result{ID: id, Score: score})
+	for rank, slot := range ix.semanticRanked(queryVec) {
+		fused[slot] += semanticRRFWeight / float64(rrfK+rank+1)
+	}
+	results := make([]Result, 0, len(fused))
+	for slot, score := range fused {
+		results = append(results, Result{ID: ix.Slots[slot], Score: score})
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Score != results[j].Score {
@@ -283,19 +417,88 @@ func (ix *Index) Search(queryVec []float32, queryTokens []string, limit int) []R
 	return results
 }
 
-// lexicalOverlap is the fraction of query tokens present in the
-// entry's token set.
-func lexicalOverlap(querySet map[string]struct{}, tokens []string) float64 {
-	if len(querySet) == 0 || len(tokens) == 0 {
-		return 0
-	}
-	hits := 0
-	for _, t := range tokens {
-		if _, ok := querySet[t]; ok {
-			hits++
+// lexicalRanked returns live slots ordered by summed IDF over the
+// matched query tokens, truncated to rrfCandidateDepth.
+func (ix *Index) lexicalRanked(queryTokens []string) []int {
+	n := len(ix.Chats)
+	scores := map[int]float64{}
+	seen := map[string]struct{}{}
+	for _, tok := range queryTokens {
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		live := ix.livePostings(tok)
+		if len(live) == 0 {
+			continue
+		}
+		// BM25-style IDF: a token in every chat scores ~0, a token in
+		// one chat scores ~log(N).
+		idf := math.Log(1 + (float64(n)-float64(len(live))+0.5)/(float64(len(live))+0.5))
+		for _, slot := range live {
+			scores[slot] += idf
 		}
 	}
-	return float64(hits) / float64(len(querySet))
+	return rankSlots(scores, func(a, b int) bool { return ix.Slots[a] < ix.Slots[b] })
+}
+
+// semanticRanked returns live slots ordered by the best cosine
+// similarity between the query vector and any of the chat's chunk
+// vectors, truncated to rrfCandidateDepth. Max-sim over chunks means
+// a long chat matches on its most relevant passage instead of an
+// average washed out by the rest of the conversation.
+func (ix *Index) semanticRanked(queryVec []float32) []int {
+	if len(queryVec) == 0 {
+		return nil
+	}
+	scores := map[int]float64{}
+	for _, e := range ix.Chats {
+		best := math.Inf(-1)
+		for _, v := range e.Vectors {
+			if len(v) != len(queryVec) {
+				continue
+			}
+			if c := cosine(queryVec, v); c > best {
+				best = c
+			}
+		}
+		if !math.IsInf(best, -1) {
+			scores[e.Slot] = best
+		}
+	}
+	return rankSlots(scores, func(a, b int) bool { return ix.Slots[a] < ix.Slots[b] })
+}
+
+// livePostings returns the token's posting list with tombstoned and
+// superseded slots filtered out.
+func (ix *Index) livePostings(tok string) []int {
+	slots := ix.Postings[tok]
+	live := make([]int, 0, len(slots))
+	for _, s := range slots {
+		if ix.Slots[s] == "" {
+			continue
+		}
+		live = append(live, s)
+	}
+	return live
+}
+
+func rankSlots(scores map[int]float64, tieBreak func(a, b int) bool) []int {
+	ranked := make([]int, 0, len(scores))
+	for slot := range scores {
+		ranked = append(ranked, slot)
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		si, sj := scores[ranked[i]], scores[ranked[j]]
+		if si != sj {
+			return si > sj
+		}
+		return tieBreak(ranked[i], ranked[j])
+	})
+	if len(ranked) > rrfCandidateDepth {
+		ranked = ranked[:rrfCandidateDepth]
+	}
+	return ranked
 }
 
 func cosine(a []float32, b Vector) float64 {

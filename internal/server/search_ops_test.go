@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
+	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/searchindex"
 )
 
 // stubEmbedder produces deterministic bag-of-words hash vectors with
@@ -161,6 +163,69 @@ func TestPushIndexesChatAndSemanticSearchFinds(t *testing.T) {
 	kw := f.query(t, tok, "tax deadline")
 	if len(kw.Results) == 0 || kw.Results[0].ID != "chat_tax" {
 		t.Fatalf("expected chat_tax first for 'tax deadline', got %+v", kw.Results)
+	}
+}
+
+func (f *searchFixture) loadIndex(t *testing.T) *searchindex.Index {
+	t.Helper()
+	indexKey, err := cryptopkg.DeriveSearchIndexKey(f.userKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := f.handler.deps.SearchBuckets.Get(context.Background(), f.userSub, searchIndexObjectKey, indexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := gunzipIndex(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix, err := searchindex.Decode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ix
+}
+
+func TestLongChatIsChunkedAndFindableByLatePassage(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+
+	// The duck passage sits past the first chunk boundary; a single
+	// truncated embedding would dilute or drop it entirely.
+	filler := strings.Repeat("meeting notes budget report quarterly planning ", 70)
+	if len(filler) <= searchChunkChars {
+		t.Fatalf("filler too short to force chunking: %d", len(filler))
+	}
+	chat := map[string]any{
+		"id":    "chat_long",
+		"title": "Weekly sync",
+		"messages": []map[string]any{
+			{"role": "user", "content": filler},
+			{"role": "user", "content": "afterwards we watched a duck at the pond"},
+		},
+	}
+	plaintext, _ := json.Marshal(chat)
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "chat_long",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString(plaintext),
+		IdempotencyKey: "idem-chat_long",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("push: status %d body %s", resp.StatusCode, body)
+	}
+	f.pushChat(t, tok, "chat_tax", "Paperwork", "tax return time")
+
+	entry := f.loadIndex(t).Chats["chat_long"]
+	if len(entry.Vectors) < 2 {
+		t.Fatalf("expected multiple chunk vectors, got %d", len(entry.Vectors))
+	}
+
+	got := f.query(t, tok, "animal")
+	if len(got.Results) == 0 || got.Results[0].ID != "chat_long" {
+		t.Fatalf("late passage not found via semantic chunk: %+v", got.Results)
 	}
 }
 

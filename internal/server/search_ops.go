@@ -43,10 +43,20 @@ const (
 	searchDocPrefix   = "search_document: "
 	searchQueryPrefix = "search_query: "
 
-	// maxSearchTextChars caps how much chat text is embedded and
-	// tokenized. Sized to stay inside the embedding model's 8192-token
-	// context with margin.
-	maxSearchTextChars = 24000
+	// searchChunkChars is the target size of one embedding chunk.
+	// Chunks are cut on message boundaries where possible; ~2000
+	// chars is ~500 tokens, small enough that one topic dominates
+	// the chunk's vector.
+	searchChunkChars = 2000
+
+	// maxSearchTextChars caps how much chat text is tokenized and
+	// chunked overall (searchindex.MaxChunksPerChat chunks of
+	// searchChunkChars each).
+	maxSearchTextChars = searchChunkChars * searchindex.MaxChunksPerChat
+
+	// searchEmbedBatch is how many chunk texts one Embed call
+	// carries. Stays under the inference client's batch cap.
+	searchEmbedBatch = 32
 
 	maxSearchQueryChars = 1000
 
@@ -179,43 +189,94 @@ type chatSearchDoc struct {
 	} `json:"messages"`
 }
 
-// chatSearchText extracts the indexable text from a chat blob: the
-// title plus every message body, truncated to maxSearchTextChars.
-// Returns "" when the blob is not chat-shaped JSON or has no text.
-func chatSearchText(plaintext []byte) string {
+// chatSearchChunks extracts the indexable text from a chat blob as
+// embedding-sized chunks: the title plus message bodies, packed into
+// chunks of ~searchChunkChars cut on message boundaries where
+// possible (an oversized single message is split mid-message). Total
+// coverage is capped at MaxChunksPerChat chunks. Returns nil when the
+// blob is not chat-shaped JSON or has no text.
+func chatSearchChunks(plaintext []byte) []string {
 	var doc chatSearchDoc
 	if err := json.Unmarshal(plaintext, &doc); err != nil {
-		return ""
+		return nil
 	}
-	var b strings.Builder
-	appendPart := func(s string) bool {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return true
-		}
-		remaining := maxSearchTextChars - b.Len()
-		if remaining <= 0 {
-			return false
-		}
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-			remaining--
-		}
-		if len(s) > remaining {
-			s = truncateUTF8(s, remaining)
-		}
-		b.WriteString(s)
-		return b.Len() < maxSearchTextChars
-	}
-	if !appendPart(doc.Title) {
-		return b.String()
+	parts := make([]string, 0, len(doc.Messages)+1)
+	if title := strings.TrimSpace(doc.Title); title != "" {
+		parts = append(parts, title)
 	}
 	for _, m := range doc.Messages {
-		if !appendPart(m.Content) {
-			break
+		if content := strings.TrimSpace(m.Content); content != "" {
+			parts = append(parts, content)
 		}
 	}
-	return b.String()
+	var chunks []string
+	var cur strings.Builder
+	flush := func() bool {
+		if cur.Len() == 0 {
+			return true
+		}
+		chunks = append(chunks, cur.String())
+		cur.Reset()
+		return len(chunks) < searchindex.MaxChunksPerChat
+	}
+	for _, part := range parts {
+		for len(part) > 0 {
+			if cur.Len() >= searchChunkChars {
+				if !flush() {
+					return chunks
+				}
+			}
+			piece := truncateUTF8(part, searchChunkChars-cur.Len())
+			if piece == "" {
+				// Less room left than the next rune needs; close the
+				// chunk and retry with a fresh one.
+				if !flush() {
+					return chunks
+				}
+				continue
+			}
+			if cur.Len() > 0 {
+				cur.WriteByte('\n')
+			}
+			cur.WriteString(piece)
+			part = part[len(piece):]
+		}
+	}
+	flush()
+	return chunks
+}
+
+// embedChunks prefixes every chunk with the model's task instruction
+// and embeds them in batches sized for the inference client.
+func embedChunks(ctx context.Context, embedder Embedder, prefix string, chunks []string) ([][]float32, error) {
+	out := make([][]float32, 0, len(chunks))
+	for start := 0; start < len(chunks); start += searchEmbedBatch {
+		end := start + searchEmbedBatch
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := make([]string, 0, end-start)
+		for _, c := range chunks[start:end] {
+			batch = append(batch, prefix+c)
+		}
+		vecs, err := embedder.Embed(ctx, batch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vecs...)
+	}
+	return out, nil
+}
+
+func quantizeAll(vecs [][]float32) []searchindex.Vector {
+	if len(vecs) == 0 {
+		return nil
+	}
+	out := make([]searchindex.Vector, len(vecs))
+	for i, v := range vecs {
+		out[i] = searchindex.Quantize(v)
+	}
+	return out
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a rune.
@@ -241,22 +302,22 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 	}
 	defer cryptopkg.Zero(indexKey)
 
-	text := chatSearchText(plaintext)
+	chunks := chatSearchChunks(plaintext)
 	entry := searchindex.Entry{
 		ETag:      etag,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		Tokens:    searchindex.Tokenize(text),
 	}
+	tokens := searchindex.Tokenize(strings.Join(chunks, "\n"))
 	var embedErr error
-	if text != "" {
-		vecs, err := deps.Embedder.Embed(ctx, []string{searchDocPrefix + text})
+	if len(chunks) > 0 {
+		vecs, err := embedChunks(ctx, deps.Embedder, searchDocPrefix, chunks)
 		if err != nil {
 			// Keep the lexical entry so the chat is still findable by
 			// keyword; surface the error so the caller logs the
 			// degraded state.
 			embedErr = err
 		} else {
-			entry.Vector = searchindex.Quantize(vecs[0])
+			entry.Vectors = quantizeAll(vecs)
 		}
 	}
 
@@ -266,7 +327,7 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 	if err != nil {
 		return err
 	}
-	if err := ix.Upsert(chatID, entry); err != nil {
+	if err := ix.Upsert(chatID, entry, tokens); err != nil {
 		return err
 	}
 	if err := saveSearchIndex(ctx, deps, owner, indexKey, ix); err != nil {
@@ -409,10 +470,9 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 	}
 
 	type pending struct {
-		id    string
-		etag  string
-		text  string
-		embed bool
+		id     string
+		etag   string
+		chunks []string
 	}
 	var page []pending
 	failed := 0
@@ -427,18 +487,15 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 			failed++
 			continue
 		}
-		text := chatSearchText(plaintext)
+		chunks := chatSearchChunks(plaintext)
 		cryptopkg.Zero(plaintext)
-		p := pending{id: item.ID, etag: item.ETag, text: text, embed: text != ""}
-		if p.embed {
-			texts = append(texts, searchDocPrefix+text)
-		}
-		page = append(page, p)
+		page = append(page, pending{id: item.ID, etag: item.ETag, chunks: chunks})
+		texts = append(texts, chunks...)
 	}
 
 	var vectors [][]float32
 	if len(texts) > 0 {
-		vectors, err = deps.Embedder.Embed(ctx, texts)
+		vectors, err = embedChunks(ctx, deps.Embedder, searchDocPrefix, texts)
 		if err != nil {
 			deps.logError("search reindex embed failed: user=%s err=%v", sess.Claims.Subject, err)
 			return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
@@ -462,13 +519,10 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 		entry := searchindex.Entry{
 			ETag:      p.etag,
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			Tokens:    searchindex.Tokenize(p.text),
+			Vectors:   quantizeAll(vectors[vecIdx : vecIdx+len(p.chunks)]),
 		}
-		if p.embed {
-			entry.Vector = searchindex.Quantize(vectors[vecIdx])
-			vecIdx++
-		}
-		if err := ix.Upsert(p.id, entry); err != nil {
+		vecIdx += len(p.chunks)
+		if err := ix.Upsert(p.id, entry, searchindex.Tokenize(strings.Join(p.chunks, "\n"))); err != nil {
 			failed++
 			continue
 		}
