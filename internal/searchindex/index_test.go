@@ -15,25 +15,59 @@ func TestTokenizeNormalizesAndDedupes(t *testing.T) {
 	}
 }
 
-func TestVectorJSONRoundtrip(t *testing.T) {
+func TestVectorAndTokensJSONRoundtrip(t *testing.T) {
 	ix := New("test-model")
-	if err := ix.Upsert("chat_1", Entry{Vector: Vector{0.25, -1.5, 3.75}, Tokens: []string{"duck"}}); err != nil {
+	if err := ix.Upsert("chat_1", Entry{Vector: Vector{25, -100, 127}, Tokens: TokenSet{"duck", "pond"}}); err != nil {
 		t.Fatal(err)
 	}
 	encoded, err := ix.Encode()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(string(encoded), `"duck pond"`) {
+		t.Fatalf("tokens not packed as one string: %s", encoded)
+	}
 	decoded, err := Decode(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := decoded.Chats["chat_1"]
-	if !reflect.DeepEqual(e.Vector, Vector{0.25, -1.5, 3.75}) {
+	if !reflect.DeepEqual(e.Vector, Vector{25, -100, 127}) {
 		t.Fatalf("vector roundtrip mismatch: %v", e.Vector)
+	}
+	if !reflect.DeepEqual(e.Tokens, TokenSet{"duck", "pond"}) {
+		t.Fatalf("tokens roundtrip mismatch: %v", e.Tokens)
 	}
 	if decoded.Dims != 3 || !decoded.Compatible("test-model") {
 		t.Fatalf("dims/model mismatch: dims=%d model=%q", decoded.Dims, decoded.Model)
+	}
+}
+
+func TestQuantizePreservesDirection(t *testing.T) {
+	q := Quantize([]float32{0.5, -0.25, 0, 1.0})
+	want := Vector{64, -32, 0, 127}
+	if !reflect.DeepEqual(q, want) {
+		t.Fatalf("Quantize = %v, want %v", q, want)
+	}
+	if got := Quantize(nil); got != nil {
+		t.Fatalf("Quantize(nil) = %v, want nil", got)
+	}
+	if got := Quantize([]float32{0, 0}); !reflect.DeepEqual(got, Vector{0, 0}) {
+		t.Fatalf("Quantize(zero) = %v", got)
+	}
+
+	// Cosine ranking survives quantization: a near-duplicate of the
+	// query must stay ahead of an orthogonal vector.
+	ix := New("m")
+	if err := ix.Upsert("close", Entry{Vector: Quantize([]float32{0.99, 0.14})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Upsert("far", Entry{Vector: Quantize([]float32{0.01, 0.99})}); err != nil {
+		t.Fatal(err)
+	}
+	results := ix.Search([]float32{1, 0}, nil, 2)
+	if len(results) != 2 || results[0].ID != "close" {
+		t.Fatalf("quantized ranking broken: %+v", results)
 	}
 }
 
@@ -64,9 +98,9 @@ func TestSearchRanksBySimilarityWithLexicalBoost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mustUpsert("ducks", Entry{Vector: Vector{1, 0}, Tokens: []string{"duck", "pond"}})
-	mustUpsert("dogs", Entry{Vector: Vector{0.9, float32(math.Sqrt(1 - 0.81))}, Tokens: []string{"dog", "walk"}})
-	mustUpsert("taxes", Entry{Vector: Vector{0, 1}, Tokens: []string{"tax", "return"}})
+	mustUpsert("ducks", Entry{Vector: Quantize([]float32{1, 0}), Tokens: TokenSet{"duck", "pond"}})
+	mustUpsert("dogs", Entry{Vector: Quantize([]float32{0.9, float32(math.Sqrt(1 - 0.81))}), Tokens: TokenSet{"dog", "walk"}})
+	mustUpsert("taxes", Entry{Vector: Quantize([]float32{0, 1}), Tokens: TokenSet{"tax", "return"}})
 
 	results := ix.Search([]float32{1, 0}, []string{"animal"}, 2)
 	if len(results) != 2 {
@@ -103,7 +137,7 @@ func TestSearchRanksBySimilarityWithLexicalBoost(t *testing.T) {
 
 func TestSearchLexicalOnlyWhenNoVector(t *testing.T) {
 	ix := New("m")
-	if err := ix.Upsert("keyword-only", Entry{Tokens: []string{"invoice", "duck"}}); err != nil {
+	if err := ix.Upsert("keyword-only", Entry{Tokens: TokenSet{"invoice", "duck"}}); err != nil {
 		t.Fatal(err)
 	}
 	results := ix.Search(nil, []string{"invoice"}, 5)

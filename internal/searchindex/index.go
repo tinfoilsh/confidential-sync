@@ -15,7 +15,6 @@ package searchindex
 
 import (
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,8 +26,9 @@ import (
 
 const (
 	// FormatVersion tags the serialized index shape. Decode rejects
-	// anything newer so an older enclave never silently corrupts an
-	// index written by a newer one.
+	// anything else so an older enclave never silently corrupts an
+	// index written by a newer one; a version bump simply forces a
+	// client-driven reindex.
 	FormatVersion = 1
 
 	// MaxChats bounds how many entries one index holds, which in turn
@@ -56,15 +56,42 @@ var (
 	ErrTooLarge = errors.New("searchindex: index is full")
 )
 
-// Vector is an embedding vector that serializes as base64 of
-// little-endian float32 bytes instead of a JSON number array, which
-// keeps a 768-dim vector at ~4 KiB on the wire instead of ~15 KiB.
-type Vector []float32
+// Vector is an int8-quantized embedding vector that serializes as
+// base64, keeping a 768-dim vector at ~1 KiB on the wire instead of
+// the ~15 KiB a float JSON array would take. Cosine similarity is
+// invariant under per-vector positive scaling, and cosine is the only
+// operation performed on stored vectors, so symmetric max-abs
+// quantization needs no stored scale factor and costs ranking quality
+// only through the (small) rounding error.
+type Vector []int8
+
+// Quantize maps a float vector onto the int8 range via symmetric
+// max-abs scaling.
+func Quantize(v []float32) Vector {
+	if len(v) == 0 {
+		return nil
+	}
+	var maxAbs float64
+	for _, f := range v {
+		if a := math.Abs(float64(f)); a > maxAbs {
+			maxAbs = a
+		}
+	}
+	out := make(Vector, len(v))
+	if maxAbs == 0 {
+		return out
+	}
+	scale := 127 / maxAbs
+	for i, f := range v {
+		out[i] = int8(math.Round(float64(f) * scale))
+	}
+	return out
+}
 
 func (v Vector) MarshalJSON() ([]byte, error) {
-	buf := make([]byte, 4*len(v))
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	buf := make([]byte, len(v))
+	for i, q := range v {
+		buf[i] = byte(q)
 	}
 	return []byte(`"` + base64.StdEncoding.EncodeToString(buf) + `"`), nil
 }
@@ -77,14 +104,31 @@ func (v *Vector) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("searchindex: decode vector: %w", err)
 	}
-	if len(raw)%4 != 0 {
-		return errors.New("searchindex: vector byte length not a multiple of 4")
-	}
-	out := make(Vector, len(raw)/4)
-	for i := range out {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
+	out := make(Vector, len(raw))
+	for i, b := range raw {
+		out[i] = int8(b)
 	}
 	*v = out
+	return nil
+}
+
+// TokenSet is a chat's lexical token set. It serializes as a single
+// space-delimited string instead of a JSON string array: tokens can
+// never contain whitespace (Tokenize splits on it), and the packed
+// form drops the per-token quoting/comma overhead and compresses
+// better under the gzip layer the index is stored through.
+type TokenSet []string
+
+func (ts TokenSet) MarshalJSON() ([]byte, error) {
+	return json.Marshal(strings.Join(ts, " "))
+}
+
+func (ts *TokenSet) UnmarshalJSON(data []byte) error {
+	var packed string
+	if err := json.Unmarshal(data, &packed); err != nil {
+		return fmt.Errorf("searchindex: decode tokens: %w", err)
+	}
+	*ts = strings.Fields(packed)
 	return nil
 }
 
@@ -94,7 +138,7 @@ type Entry struct {
 	// can skip re-embedding chats that have not changed.
 	ETag      string   `json:"etag,omitempty"`
 	UpdatedAt string   `json:"updated_at,omitempty"`
-	Tokens    []string `json:"tokens,omitempty"`
+	Tokens    TokenSet `json:"tokens,omitempty"`
 	Vector    Vector   `json:"vector,omitempty"`
 }
 

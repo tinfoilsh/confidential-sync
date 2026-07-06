@@ -142,6 +142,9 @@ func TestPushIndexesChatAndSemanticSearchFinds(t *testing.T) {
 	if f.bk.has(searchIndexObjectKey) {
 		t.Fatal("search index leaked into the attachments bucket")
 	}
+	if item, ok := f.searchBk.item(searchIndexObjectKey); !ok || len(item.Value) < 2 || item.Value[0] != 0x1f || item.Value[1] != 0x8b {
+		t.Fatal("stored index is not gzip-compressed")
+	}
 
 	got := f.query(t, tok, "animal")
 	if got.TotalIndexed != 2 {

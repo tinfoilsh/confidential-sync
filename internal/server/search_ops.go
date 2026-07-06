@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -94,6 +97,12 @@ func lockSearchIndex(user string) func() {
 	return mu.Unlock
 }
 
+// maxIndexDecompressedBytes caps the inflated index JSON so a
+// corrupted or hostile stored object cannot balloon enclave memory.
+// Sized for searchindex.MaxChats entries at the worst-case per-entry
+// footprint with ample margin.
+const maxIndexDecompressedBytes = 512 << 20
+
 // loadSearchIndex fetches and decodes the user's index. A missing
 // object, an index sealed under a different (rotated) CEK, an unknown
 // format, or a model change all yield a fresh empty index with
@@ -110,7 +119,11 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []by
 	case err != nil:
 		return nil, false, err
 	}
-	ix, err := searchindex.Decode(raw)
+	encoded, err := gunzipIndex(raw)
+	if err != nil {
+		return searchindex.New(model), true, nil
+	}
+	ix, err := searchindex.Decode(encoded)
 	if err != nil {
 		return searchindex.New(model), true, nil
 	}
@@ -120,12 +133,40 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []by
 	return ix, false, nil
 }
 
+// saveSearchIndex gzips the index JSON before handing it to the
+// sidecar: token text compresses well, and compression must happen
+// before the sidecar encrypts since ciphertext does not compress.
 func saveSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []byte, ix *searchindex.Index) error {
 	encoded, err := ix.Encode()
 	if err != nil {
 		return err
 	}
-	return deps.SearchBuckets.Put(ctx, owner, searchIndexObjectKey, encoded, indexKey)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(encoded); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return deps.SearchBuckets.Put(ctx, owner, searchIndexObjectKey, buf.Bytes(), indexKey)
+}
+
+func gunzipIndex(compressed []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	out, err := io.ReadAll(io.LimitReader(zr, maxIndexDecompressedBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxIndexDecompressedBytes {
+		return nil, errors.New("search index exceeds decompressed size limit")
+	}
+	return out, nil
 }
 
 // chatSearchDoc is the subset of the StoredChat JSON shape the
@@ -215,7 +256,7 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 			// degraded state.
 			embedErr = err
 		} else {
-			entry.Vector = vecs[0]
+			entry.Vector = searchindex.Quantize(vecs[0])
 		}
 	}
 
@@ -424,7 +465,7 @@ func SearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReind
 			Tokens:    searchindex.Tokenize(p.text),
 		}
 		if p.embed {
-			entry.Vector = vectors[vecIdx]
+			entry.Vector = searchindex.Quantize(vectors[vecIdx])
 			vecIdx++
 		}
 		if err := ix.Upsert(p.id, entry); err != nil {
