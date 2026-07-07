@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -93,13 +94,25 @@ func searchUnavailable() *AppError {
 // index object within this process. The buckets sidecar has no CAS,
 // so without this two concurrent pushes could each read the same
 // index generation and the second write would drop the first entry.
+// Readers (queries) take the shared side: cached indices are mutated
+// in place by writers, so an unlocked concurrent Search would race.
 var searchIndexLocks sync.Map
 
 func lockSearchIndex(user string) func() {
-	v, _ := searchIndexLocks.LoadOrStore(user, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+	mu := searchIndexLock(user)
 	mu.Lock()
 	return mu.Unlock
+}
+
+func rlockSearchIndex(user string) func() {
+	mu := searchIndexLock(user)
+	mu.RLock()
+	return mu.RUnlock
+}
+
+func searchIndexLock(user string) *sync.RWMutex {
+	v, _ := searchIndexLocks.LoadOrStore(user, &sync.RWMutex{})
+	return v.(*sync.RWMutex)
 }
 
 // maxIndexDecompressedBytes caps the inflated index JSON so a
@@ -108,13 +121,24 @@ func lockSearchIndex(user string) func() {
 // footprint with ample margin.
 const maxIndexDecompressedBytes = 512 << 20
 
-// loadSearchIndex fetches and decodes the user's index. A missing
-// object, an index sealed under a different (rotated) CEK, an unknown
-// format, or a model change all yield a fresh empty index with
-// needsReindex=true so callers can surface "rebuild me" to the client
-// instead of failing.
+// loadSearchIndex returns the user's decoded index, from the
+// in-memory cache when possible and from the sidecar otherwise. A
+// missing object, an index sealed under a different (rotated) CEK,
+// an unknown format, or a model change all yield a fresh empty index
+// with needsReindex=true so callers can surface "rebuild me" to the
+// client instead of failing; those degraded results are never
+// cached. Callers must hold the per-user lock (shared for reads,
+// exclusive for mutation) since cached indices are shared across
+// requests.
 func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []byte) (*searchindex.Index, bool, error) {
 	model := deps.Embedder.Model()
+	keyHash := sha256.Sum256(indexKey)
+	if ix, ok := deps.SearchCache.get(owner, keyHash); ok {
+		if ix.Compatible(model) {
+			return ix, false, nil
+		}
+		deps.SearchCache.drop(owner)
+	}
 	raw, err := deps.SearchBuckets.Get(ctx, owner, searchIndexObjectKey, indexKey)
 	switch {
 	case errors.Is(err, buckets.ErrNotFound):
@@ -135,12 +159,16 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []by
 	if !ix.Compatible(model) {
 		return searchindex.New(model), true, nil
 	}
+	deps.SearchCache.put(owner, keyHash, ix, len(encoded))
 	return ix, false, nil
 }
 
 // saveSearchIndex gzips the index JSON before handing it to the
 // sidecar: token text compresses well, and compression must happen
 // before the sidecar encrypts since ciphertext does not compress.
+// Writes through to the cache on success; a failed write drops the
+// cache entry so the next operation reloads the last durable state
+// instead of serving mutations that were never persisted.
 func saveSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []byte, ix *searchindex.Index) error {
 	encoded, err := ix.Encode()
 	if err != nil {
@@ -155,7 +183,12 @@ func saveSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []by
 	if err := zw.Close(); err != nil {
 		return err
 	}
-	return deps.SearchBuckets.Put(ctx, owner, searchIndexObjectKey, buf.Bytes(), indexKey)
+	if err := deps.SearchBuckets.Put(ctx, owner, searchIndexObjectKey, buf.Bytes(), indexKey); err != nil {
+		deps.SearchCache.drop(owner)
+		return err
+	}
+	deps.SearchCache.put(owner, sha256.Sum256(indexKey), ix, len(encoded))
+	return nil
 }
 
 func gunzipIndex(compressed []byte) ([]byte, error) {
@@ -401,8 +434,10 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	}
 	defer cryptopkg.Zero(indexKey)
 
+	runlock := rlockSearchIndex(sess.Claims.Subject)
 	ix, needsReindex, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
 	if err != nil {
+		runlock()
 		deps.logError("search query index load failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
 	}
@@ -411,15 +446,25 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 		TotalIndexed: len(ix.Chats),
 		NeedsReindex: needsReindex,
 	}
-	if len(ix.Chats) == 0 {
+	runlock()
+	if resp.TotalIndexed == 0 {
 		return resp, nil
 	}
+	// Embed outside the lock: it is a network round trip and must not
+	// serialize against this user's pushes.
 	vecs, err := deps.Embedder.Embed(ctx, []string{searchQueryPrefix + query})
 	if err != nil {
 		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
 	}
-	for _, r := range ix.Search(vecs[0], searchindex.Tokenize(query), req.Limit) {
+	// Re-acquire for the search itself: writers mutate the cached
+	// index in place, only ever under the exclusive lock, so holding
+	// the shared lock makes reading ix safe even if the cache has
+	// since replaced it with a newer generation.
+	runlock = rlockSearchIndex(sess.Claims.Subject)
+	results := ix.Search(vecs[0], searchindex.Tokenize(query), req.Limit)
+	runlock()
+	for _, r := range results {
 		resp.Results = append(resp.Results, SearchQueryResult{ID: r.ID, Score: r.Score})
 	}
 	deps.logInfo("search query ok: user=%s indexed=%d results=%d",

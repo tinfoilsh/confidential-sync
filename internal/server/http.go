@@ -38,6 +38,9 @@ type Logger interface {
 }
 
 func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
+	if deps.SearchCache == nil {
+		deps.SearchCache = newSearchIndexCache(searchCacheBudgetBytes)
+	}
 	return &Handler{
 		deps:               deps,
 		verifier:           verifier,

@@ -256,6 +256,9 @@ func TestCorruptedIndexObjectsTriggerReindex(t *testing.T) {
 		if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, searchIndexObjectKey, blob, indexKey); err != nil {
 			t.Fatalf("%s: seed corruption: %v", name, err)
 		}
+		// Out-of-band corruption is invisible while the cache is warm;
+		// drop it to model hitting the poisoned object cold.
+		f.handler.deps.SearchCache.drop(f.userSub)
 		got := f.query(t, tok, "duck")
 		if !got.NeedsReindex {
 			t.Fatalf("%s: expected needs_reindex", name)

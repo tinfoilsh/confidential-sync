@@ -26,7 +26,10 @@ type Deps struct {
 	// Embedder generates embedding vectors via the Tinfoil inference
 	// service. Optional, gated together with SearchBuckets.
 	Embedder Embedder
-	GitSHA   string
+	// SearchCache holds decoded search indices between requests.
+	// Populated by NewHandler; nil disables caching.
+	SearchCache *searchIndexCache
+	GitSHA      string
 	// SyncEnclaveSecret is the shared secret used to verify the
 	// X-Legacy-Claim header CP stamps on legacy attachment reads.
 	// Empty in test fixtures, where the legacy-claim guard is

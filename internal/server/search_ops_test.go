@@ -297,10 +297,13 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 	f.pushChat(t, tok, "chat_dog", "Walk", "walked the dog in the park")
 	f.pushChat(t, tok, "chat_tax", "Paperwork", "tax return time")
 
-	// Simulate a lost index (e.g. CEK rotation or bucket wipe).
+	// Simulate a lost index (e.g. CEK rotation or bucket wipe). Out-
+	// of-band storage changes are invisible to the in-memory cache,
+	// so drop it too, as a restart would.
 	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
 		t.Fatal(err)
 	}
+	f.handler.deps.SearchCache.drop(f.userSub)
 	if got := f.query(t, tok, "animal"); !got.NeedsReindex {
 		t.Fatal("expected needs_reindex after index loss")
 	}
