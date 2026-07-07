@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/searchindex"
@@ -121,47 +123,153 @@ func searchIndexLock(user string) *sync.RWMutex {
 // footprint with ample margin.
 const maxIndexDecompressedBytes = 512 << 20
 
+// maxIndexStoredBytes caps the gzipped object read from the sidecar
+// before decompression. It is slightly above the decoded cap to allow
+// gzip framing overhead while rejecting arbitrarily large bucket
+// bodies before they can exhaust memory.
+var maxIndexStoredBytes int64 = maxIndexDecompressedBytes + (1 << 20)
+
+// searchLoadState reports how loadSearchIndex obtained its result.
+// Missing and unreadable both mean "no usable previous index" (the
+// caller gets a fresh empty one), but they differ in what they imply
+// about coverage: missing may simply be a user who never had an
+// index, while unreadable means an index existed and its contents
+// were lost (wrong key, corruption, model change), so anything
+// built on top of it is known-incomplete.
+type searchLoadState int
+
+const (
+	searchLoadOK searchLoadState = iota
+	searchLoadMissing
+	searchLoadUnreadable
+)
+
 // loadSearchIndex returns the user's decoded index, from the
 // in-memory cache when possible and from the sidecar otherwise. A
-// missing object, an index sealed under a different (rotated) CEK,
-// an unknown format, or a model change all yield a fresh empty index
-// with needsReindex=true so callers can surface "rebuild me" to the
-// client instead of failing; those degraded results are never
-// cached. Callers must hold the per-user lock (shared for reads,
-// exclusive for mutation) since cached indices are shared across
-// requests.
-func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []byte) (*searchindex.Index, bool, error) {
+// missing object, an index sealed under a different key, an unknown
+// format, or a model change all yield a fresh empty index with a
+// degraded load state so callers can surface "rebuild me" to the
+// client instead of failing; those degraded results are never cached.
+// Callers must hold the per-user lock (shared for reads, exclusive
+// for mutation) since cached indices are shared across requests.
+func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []byte) (*searchindex.Index, searchLoadState, error) {
 	model := deps.Embedder.Model()
 	keyHash := sha256.Sum256(indexKey)
 	if ix, ok := deps.SearchCache.get(owner, keyHash); ok {
 		if ix.Compatible(model) {
-			return ix, false, nil
+			return ix, searchLoadOK, nil
 		}
 		deps.SearchCache.drop(owner)
 	}
-	raw, err := deps.SearchBuckets.Get(ctx, owner, searchIndexObjectKey, indexKey)
+	raw, err := deps.SearchBuckets.GetLimited(ctx, owner, searchIndexObjectKey, indexKey, maxIndexStoredBytes)
 	switch {
 	case errors.Is(err, buckets.ErrNotFound):
-		return searchindex.New(model), true, nil
-	case errors.Is(err, buckets.ErrForbidden):
-		return searchindex.New(model), true, nil
+		return searchindex.New(model), searchLoadMissing, nil
+	case errors.Is(err, buckets.ErrForbidden), errors.Is(err, buckets.ErrTooLarge):
+		return searchindex.New(model), searchLoadUnreadable, nil
 	case err != nil:
-		return nil, false, err
+		return nil, searchLoadUnreadable, err
 	}
 	encoded, err := gunzipIndex(raw)
 	if err != nil {
-		return searchindex.New(model), true, nil
+		return searchindex.New(model), searchLoadUnreadable, nil
 	}
 	ix, err := searchindex.Decode(encoded)
 	if err != nil {
-		return searchindex.New(model), true, nil
+		return searchindex.New(model), searchLoadUnreadable, nil
 	}
 	if !ix.Compatible(model) {
-		return searchindex.New(model), true, nil
+		return searchindex.New(model), searchLoadUnreadable, nil
 	}
 	deps.SearchCache.put(owner, keyHash, ix, len(encoded))
-	return ix, false, nil
+	return ix, searchLoadOK, nil
 }
+
+// searchEntryTime parses an entry's UpdatedAt for ordering decisions.
+// Unparseable or absent timestamps sort as oldest, so legacy entries
+// lose to anything freshly written.
+func searchEntryTime(e searchindex.Entry) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, e.UpdatedAt)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// searchEtagGeneration parses a controlplane CAS token as the blob's
+// version counter. The controlplane issues per-blob incrementing
+// numeric etags; ok is false for any other shape so callers can fall
+// back to timestamp ordering rather than misorder opaque tokens.
+func searchEtagGeneration(etag string) (int64, bool) {
+	g, err := strconv.ParseInt(etag, 10, 64)
+	return g, err == nil
+}
+
+// searchEntrySupersedes reports whether the existing index entry is a
+// strictly newer blob generation than a candidate write carrying
+// etag/committedAt. Generation numbers are the durable order (they
+// come from the CAS chain, immune to response reordering); local
+// commit-boundary timestamps are the fallback when either token is
+// not numeric.
+func searchEntrySupersedes(existing searchindex.Entry, etag string, committedAt time.Time) bool {
+	if eg, ok := searchEtagGeneration(existing.ETag); ok {
+		if cg, ok := searchEtagGeneration(etag); ok {
+			return eg > cg
+		}
+	}
+	return searchEntryTime(existing).After(committedAt)
+}
+
+type searchSnapshotState int
+
+const (
+	searchSnapshotCurrent searchSnapshotState = iota
+	searchSnapshotStale
+	searchSnapshotDeleted
+)
+
+func searchChatSnapshotState(ctx context.Context, deps Deps, sess Session, chatID, etag string) (searchSnapshotState, error) {
+	scope := string(envelope.ScopeChat)
+	meta, err := deps.Controlplane.HeadBlob(ctx, scope, chatID, sess.RawJWT, sess.Claims.Subject)
+	if err == nil {
+		if meta.ETag != etag {
+			return searchSnapshotStale, nil
+		}
+		return searchSnapshotCurrent, nil
+	}
+	// This check runs under the search-index lock, so HEAD keeps the
+	// critical section from downloading whole ciphertexts. A failed
+	// HEAD is ambiguous, though: a controlplane that does not route
+	// HEAD answers 404/405 for live blobs, and treating that as
+	// deleted would silently drop the chat from the index. Confirm
+	// with a full GET before acting on the miss.
+	blob, gerr := deps.Controlplane.GetBlob(ctx, scope, chatID, sess.RawJWT, sess.Claims.Subject)
+	if gerr != nil {
+		var cpe *controlplane.Error
+		if errors.As(gerr, &cpe) && cpe.StatusCode == http.StatusNotFound {
+			return searchSnapshotDeleted, nil
+		}
+		return searchSnapshotStale, gerr
+	}
+	if blob.ETag != etag {
+		return searchSnapshotStale, nil
+	}
+	return searchSnapshotCurrent, nil
+}
+
+func missingSearchIndexNeedsReindex(ctx context.Context, deps Deps, sess Session, chatID string) bool {
+	list, err := deps.Controlplane.ListStatus(ctx, string(envelope.ScopeChat), "", 2, sess.RawJWT, sess.Claims.Subject, "", "")
+	if err != nil {
+		deps.logError("search coverage check failed: user=%s id=%s err=%v", sess.Claims.Subject, chatID, err)
+		return true
+	}
+	if list.NextCursor != "" || len(list.Updates) != 1 {
+		return true
+	}
+	return list.Updates[0].ID != chatID
+}
+
+type searchWriteHook func(ctx context.Context, ix *searchindex.Index, state searchLoadState) (cont bool, mutated bool, err error)
 
 // saveSearchIndex gzips the index JSON before handing it to the
 // sidecar: token text compresses well, and compression must happen
@@ -320,10 +428,43 @@ func truncateUTF8(s string, n int) string {
 }
 
 // indexChatForSearch embeds one chat and merges it into the user's
-// index. Called inline from Push after the blob write succeeds; the
-// caller treats failures as best-effort (the blob is already stored)
-// and logs them.
-func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte, chatID string, plaintext []byte, etag string) error {
+// index. committedAt is captured at the blob commit boundary
+// (immediately after the CAS write returned) and orders this entry
+// against concurrent writes for the same chat, well before the
+// embedding round trip can reshuffle completion order.
+func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time) error {
+	return indexChatForSearchWithHook(ctx, deps, owner, cek, chatID, plaintext, etag, committedAt, nil)
+}
+
+func indexCurrentChatForSearch(ctx context.Context, deps Deps, sess Session, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time) error {
+	hook := func(ctx context.Context, ix *searchindex.Index, state searchLoadState) (bool, bool, error) {
+		snapshotState, err := searchChatSnapshotState(ctx, deps, sess, chatID, etag)
+		if err != nil {
+			return false, false, err
+		}
+		switch snapshotState {
+		case searchSnapshotCurrent:
+			mutated := false
+			if state == searchLoadMissing && missingSearchIndexNeedsReindex(ctx, deps, sess, chatID) {
+				ix.Incomplete = true
+				mutated = true
+			}
+			return true, mutated, nil
+		case searchSnapshotDeleted:
+			mutated := false
+			if _, ok := ix.Chats[chatID]; ok {
+				ix.Remove(chatID)
+				mutated = true
+			}
+			return false, mutated, nil
+		default:
+			return false, false, nil
+		}
+	}
+	return indexChatForSearchWithHook(ctx, deps, sess.Claims.Subject, cek, chatID, plaintext, etag, committedAt, hook)
+}
+
+func indexChatForSearchWithHook(ctx context.Context, deps Deps, owner string, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time, hook searchWriteHook) error {
 	indexKey, err := cryptopkg.DeriveSearchIndexKey(cek)
 	if err != nil {
 		return err
@@ -333,7 +474,7 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 	chunks := chatSearchChunks(plaintext)
 	entry := searchindex.Entry{
 		ETag:      etag,
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: committedAt.UTC().Format(time.RFC3339Nano),
 	}
 	tokens := searchindex.Tokenize(strings.Join(chunks, "\n"))
 	var embedErr error
@@ -351,9 +492,39 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 
 	unlock := lockSearchIndex(owner)
 	defer unlock()
-	ix, _, err := loadSearchIndex(ctx, deps, owner, indexKey)
+	ix, state, err := loadSearchIndex(ctx, deps, owner, indexKey)
 	if err != nil {
 		return err
+	}
+	if hook != nil {
+		cont, mutated, err := hook(ctx, ix, state)
+		if err != nil {
+			return err
+		}
+		if !cont {
+			if mutated {
+				return saveSearchIndex(ctx, deps, owner, indexKey, ix)
+			}
+			return nil
+		}
+	}
+	// A slower push must not clobber the entry a newer push (or a
+	// rebuild) already wrote for this chat. Ordering comes from the
+	// blob's CAS generation whenever the etags are numeric; the
+	// commit-boundary timestamp is only the fallback for opaque
+	// tokens, valid because this process is the sole index writer and
+	// two generations of the same chat commit at least a client round
+	// trip apart.
+	if existing, ok := ix.Chats[chatID]; ok && searchEntrySupersedes(existing, etag, committedAt) {
+		deps.logInfo("push search index skipped stale write: user=%s id=%s", owner, chatID)
+		return nil
+	}
+	// Building on top of an unreadable index means every previously
+	// indexed chat is absent from the new generation. Persist that so
+	// queries keep reporting needs_reindex instead of the first push
+	// after an unreadable load masking the lost coverage.
+	if state == searchLoadUnreadable {
+		ix.Incomplete = true
 	}
 	if err := ix.Upsert(chatID, entry, tokens); err != nil {
 		return err
@@ -379,11 +550,11 @@ func removeChatFromSearch(ctx context.Context, deps Deps, owner string, cek []by
 
 	unlock := lockSearchIndex(owner)
 	defer unlock()
-	ix, needsReindex, err := loadSearchIndex(ctx, deps, owner, indexKey)
+	ix, state, err := loadSearchIndex(ctx, deps, owner, indexKey)
 	if err != nil {
 		return err
 	}
-	if needsReindex {
+	if state != searchLoadOK {
 		return nil
 	}
 	if _, exists := ix.Chats[chatID]; !exists {
@@ -435,7 +606,37 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	defer cryptopkg.Zero(indexKey)
 
 	runlock := rlockSearchIndex(sess.Claims.Subject)
-	ix, needsReindex, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
+	ix, state, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
+	if err != nil {
+		runlock()
+		deps.logError("search query index load failed: user=%s err=%v", sess.Claims.Subject, err)
+		return nil, err
+	}
+	if len(ix.Chats) == 0 {
+		resp := &SearchQueryResponse{
+			Results:      []SearchQueryResult{},
+			NeedsReindex: state != searchLoadOK || ix.Incomplete,
+		}
+		runlock()
+		return resp, nil
+	}
+	runlock()
+
+	// Embed outside the lock: it is a network round trip and must not
+	// serialize against this user's pushes.
+	vecs, err := deps.Embedder.Embed(ctx, []string{searchQueryPrefix + query})
+	if err != nil {
+		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
+		return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
+	}
+
+	// Reload for the search itself instead of reusing the pointer
+	// from before the embedding gap: a stale pointer could observe
+	// (and serve) an in-place mutation whose persist failed, whereas
+	// a fresh load is a cache hit on the hot path and reflects only
+	// persisted state.
+	runlock = rlockSearchIndex(sess.Claims.Subject)
+	ix, state, err = loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
 	if err != nil {
 		runlock()
 		deps.logError("search query index load failed: user=%s err=%v", sess.Claims.Subject, err)
@@ -444,24 +645,8 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	resp := &SearchQueryResponse{
 		Results:      []SearchQueryResult{},
 		TotalIndexed: len(ix.Chats),
-		NeedsReindex: needsReindex,
+		NeedsReindex: state != searchLoadOK || ix.Incomplete,
 	}
-	runlock()
-	if resp.TotalIndexed == 0 {
-		return resp, nil
-	}
-	// Embed outside the lock: it is a network round trip and must not
-	// serialize against this user's pushes.
-	vecs, err := deps.Embedder.Embed(ctx, []string{searchQueryPrefix + query})
-	if err != nil {
-		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
-		return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
-	}
-	// Re-acquire for the search itself: writers mutate the cached
-	// index in place, only ever under the exclusive lock, so holding
-	// the shared lock makes reading ix safe even if the cache has
-	// since replaced it with a newer generation.
-	runlock = rlockSearchIndex(sess.Claims.Subject)
 	results := ix.Search(vecs[0], searchindex.Tokenize(query), req.Limit)
 	runlock()
 	for _, r := range results {
@@ -483,10 +668,11 @@ type searchReindexPageResult struct {
 }
 
 // searchReindexPage rebuilds one page of the caller's index from the
-// stored chat blobs. An empty cursor starts a rebuild, dropping the
-// previous index generation (which also flushes entries for
-// since-deleted chats). Driven by the reindex job runner.
-func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string) (*searchReindexPageResult, error) {
+// stored chat blobs. An empty cursor starts a rebuild, dropping index
+// entries from before startedAt (which also flushes entries for
+// since-deleted chats) while preserving entries that inline pushes
+// wrote after the job began. Driven by the reindex job runner.
+func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string, startedAt time.Time) (*searchReindexPageResult, error) {
 	cek, err := decodeKey(keys[0].Key)
 	if err != nil {
 		return nil, badRequest("invalid key: " + err.Error())
@@ -544,30 +730,77 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 
 	unlock := lockSearchIndex(sess.Claims.Subject)
 	defer unlock()
-	var ix *searchindex.Index
+	ix, _, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
+	if err != nil {
+		return nil, err
+	}
 	if cursor == "" {
-		ix = searchindex.New(deps.Embedder.Model())
-	} else {
-		ix, _, err = loadSearchIndex(ctx, deps, sess.Claims.Subject, indexKey)
-		if err != nil {
-			return nil, err
+		// Fresh rebuild: flush every entry from before the job
+		// started (deleted chats, stale generations) but keep entries
+		// written since. An inline push that raced the first page's
+		// pull+embed window would otherwise be silently dropped, and
+		// its chat may sort into a listing page this rebuild has
+		// already drained. Degraded loads (wrong key, corruption,
+		// model change) yield a fresh empty index here, which prunes
+		// to the same clean slate the old start-from-empty gave.
+		var stale []string
+		for id, e := range ix.Chats {
+			if searchEntryTime(e).Before(startedAt) {
+				stale = append(stale, id)
+			}
+		}
+		for _, id := range stale {
+			ix.Remove(id)
 		}
 	}
 	indexed := 0
 	vecIdx := 0
 	for _, p := range page {
+		vecs := vectors[vecIdx : vecIdx+len(p.chunks)]
+		vecIdx += len(p.chunks)
+		snapshotState, err := searchChatSnapshotState(ctx, deps, sess, p.id, p.etag)
+		if err != nil {
+			return nil, err
+		}
+		if snapshotState == searchSnapshotDeleted {
+			ix.Remove(p.id)
+			continue
+		}
+		if snapshotState == searchSnapshotStale {
+			if existing, ok := ix.Chats[p.id]; ok && searchEntrySupersedes(existing, p.etag, startedAt) {
+				indexed++
+			}
+			continue
+		}
+		// Keep an existing entry that is a newer blob generation than
+		// this job's pull snapshot (an inline push landed mid-job);
+		// the timestamp fallback keeps anything written since the job
+		// started.
+		if existing, ok := ix.Chats[p.id]; ok && searchEntrySupersedes(existing, p.etag, startedAt) {
+			indexed++
+			continue
+		}
 		entry := searchindex.Entry{
 			ETag:      p.etag,
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			Vectors:   quantizeAll(vectors[vecIdx : vecIdx+len(p.chunks)]),
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			Vectors:   quantizeAll(vecs),
 		}
-		vecIdx += len(p.chunks)
 		if err := ix.Upsert(p.id, entry, searchindex.Tokenize(strings.Join(p.chunks, "\n"))); err != nil {
 			failed++
 			continue
 		}
 		indexed++
 	}
+	// The index is complete only once the listing is drained; until
+	// then (and after a budget-truncated run) queries must keep
+	// steering the client back to reindex. Per-chat failures
+	// deliberately do not keep the flag set: they are permanent with
+	// respect to the supplied key set (undecryptable or corrupt
+	// blobs), so advertising needs_reindex for them would trap the
+	// client in a rebuild loop that re-embeds the whole corpus each
+	// round without ever converging. The job status reports the
+	// failed count instead.
+	ix.Incomplete = pull.NextCursor != ""
 	if err := saveSearchIndex(ctx, deps, sess.Claims.Subject, indexKey, ix); err != nil {
 		return nil, err
 	}

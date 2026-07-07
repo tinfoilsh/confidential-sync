@@ -65,7 +65,7 @@ func TestCanonicalPayloadAADStable(t *testing.T) {
 		t.Fatalf("not stable: %s vs %s", b1, b2)
 	}
 	// The payload AAD deliberately omits the CEK key id so the payload
-	// ciphertext survives a CEK rotation unchanged.
+	// ciphertext survives a rewrap unchanged.
 	want := `{"alg":"AES-256-GCM","clerk_user_id":"user_xyz","domain":"tinfoil-sync-envelope-v2","id":"chat_abc","scope":"chat","v":2}`
 	if string(b1) != want {
 		t.Fatalf("canonical payload AAD mismatch:\n got:  %s\n want: %s", b1, want)
@@ -83,7 +83,7 @@ func TestCanonicalDEKWrapAADStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The wrap AAD binds the CEK key id (the only field a rotation
+	// The wrap AAD binds the CEK key id (the only field a rewrap
 	// rewrites) plus the owning user, row, and scope.
 	want := `{"clerk_user_id":"user_xyz","domain":"tinfoil-dek-wrap-v2","id":"chat_abc","kid":"abababababababababababababababab","scope":"chat","v":2}`
 	if string(out) != want {

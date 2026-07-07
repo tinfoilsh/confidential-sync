@@ -373,3 +373,107 @@ func TestRandomizedOperationsMaintainInvariants(t *testing.T) {
 	}
 	verify()
 }
+
+// TestDecodeRejectsOversizedIndex pins the reload bounds: a corrupt or
+// poisoned stored object must not resurrect an index bigger than
+// Upsert could ever have built, or queries against it become far more
+// expensive than the enforced limits allow.
+func TestDecodeRejectsOversizedIndex(t *testing.T) {
+	tooManyChats := &Index{
+		Version:  FormatVersion,
+		Model:    "m",
+		Chats:    make(map[string]Entry, MaxChats+1),
+		Slots:    make([]string, MaxChats+1),
+		Postings: map[string][]int{},
+	}
+	for i := 0; i <= MaxChats; i++ {
+		id := fmt.Sprintf("c%d", i)
+		tooManyChats.Slots[i] = id
+		tooManyChats.Chats[id] = Entry{Slot: i}
+	}
+	data, err := tooManyChats.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatalf("Decode accepted %d chats, limit is %d", MaxChats+1, MaxChats)
+	}
+
+	tooManyVectors := New("m")
+	tooManyVectors.Dims = 2
+	vecs := make([]Vector, MaxChunksPerChat+1)
+	for i := range vecs {
+		vecs[i] = Vector{1, 2}
+	}
+	tooManyVectors.Chats["c"] = Entry{Slot: 0, Vectors: vecs}
+	tooManyVectors.Slots = []string{"c"}
+	data, err = tooManyVectors.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatalf("Decode accepted %d chunk vectors, limit is %d", MaxChunksPerChat+1, MaxChunksPerChat)
+	}
+
+	tooManySlots := New("m")
+	tooManySlots.Chats["c"] = Entry{Slot: maxSerializedSlots}
+	tooManySlots.Slots = make([]string, maxSerializedSlots+1)
+	tooManySlots.Slots[maxSerializedSlots] = "c"
+	data, err = tooManySlots.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatalf("Decode accepted %d slots, limit is %d", maxSerializedSlots+1, maxSerializedSlots)
+	}
+
+	tombstoneHeavy := New("m")
+	tombstoneHeavy.Chats["c"] = Entry{Slot: compactionMinDead}
+	tombstoneHeavy.Slots = make([]string, compactionMinDead+1)
+	tombstoneHeavy.Slots[compactionMinDead] = "c"
+	data, err = tombstoneHeavy.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(data); err == nil {
+		t.Fatal("Decode accepted a tombstone-heavy index that should have compacted")
+	}
+
+	badPostings := []string{
+		`{"version":1,"slots":["a"],"chats":{"a":{"slot":0}},"postings":{"duck":[]}}`,
+		`{"version":1,"slots":["a"],"chats":{"a":{"slot":0}},"postings":{"duck":[0,0]}}`,
+		`{"version":1,"slots":["a"],"chats":{"a":{"slot":0}},"postings":{"duck":[0,1]}}`,
+	}
+	for _, raw := range badPostings {
+		if _, err := Decode([]byte(raw)); err == nil {
+			t.Fatalf("Decode accepted malformed postings: %s", raw)
+		}
+	}
+}
+
+func TestUpsertFiltersCallerSuppliedTokensToDecodeBounds(t *testing.T) {
+	ix := New("m")
+	tokens := []string{"x", "duck", strings.Repeat("z", maxIdentifierLen+1)}
+	for i := 0; i < MaxTokensPerChat+20; i++ {
+		tokens = append(tokens, fmt.Sprintf("tok%03d", i))
+	}
+	if err := ix.Upsert("c", Entry{}, tokens); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ix.Postings["x"]; ok {
+		t.Fatal("short caller token was indexed")
+	}
+	if _, ok := ix.Postings[strings.Repeat("z", maxIdentifierLen+1)]; ok {
+		t.Fatal("overlong caller token was indexed")
+	}
+	if len(ix.Postings) != MaxTokensPerChat {
+		t.Fatalf("postings count = %d, want %d", len(ix.Postings), MaxTokensPerChat)
+	}
+	encoded, err := ix.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(encoded); err != nil {
+		t.Fatalf("Upsert produced an index Decode rejects: %v", err)
+	}
+}

@@ -19,9 +19,12 @@ type PushResponse struct {
 	ETag  string `json:"etag"`
 	KeyID string `json:"key_id"`
 	// SearchIndexed reports whether the inline search-index update
-	// succeeded for a chat push. False means the blob stored fine but
-	// the chat won't surface in search until a reindex.
-	SearchIndexed bool `json:"search_indexed,omitempty"`
+	// succeeded for a chat push: false means the blob stored fine but
+	// the chat won't surface in search until a reindex. A pointer so
+	// the failure signal survives JSON encoding (omitempty would drop
+	// a bare false); absent means search was not applicable to this
+	// push (non-chat scope or search backend unconfigured).
+	SearchIndexed *bool `json:"search_indexed,omitempty"`
 }
 
 type PullKey struct {
@@ -253,8 +256,8 @@ type SearchQueryResponse struct {
 	Results      []SearchQueryResult `json:"results"`
 	TotalIndexed int                 `json:"total_indexed"`
 	// NeedsReindex is true when no readable index exists for the
-	// caller's current CEK (never built, CEK rotated, or embedding
-	// model changed); the client should drive /v1/search/reindex.
+	// caller's current key (never built, wrong key, or embedding model
+	// changed); the client should drive /v1/search/reindex.
 	NeedsReindex bool `json:"needs_reindex,omitempty"`
 }
 

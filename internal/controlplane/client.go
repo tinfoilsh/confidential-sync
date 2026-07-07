@@ -415,6 +415,32 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string
 	}, nil
 }
 
+func (c *Client) HeadBlob(ctx context.Context, scope, id, jwt, clerkUserID string) (*BlobMeta, error) {
+	endpoint, err := c.urlFor(scope, id)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, parseError(resp.StatusCode, body)
+	}
+	return &BlobMeta{
+		ID:    id,
+		ETag:  resp.Header.Get(HeaderETag),
+		KeyID: resp.Header.Get(HeaderKeyID),
+	}, nil
+}
+
 type DeleteBlobRequest struct {
 	Scope          string
 	ID             string

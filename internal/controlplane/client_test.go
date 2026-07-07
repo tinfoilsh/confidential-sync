@@ -178,6 +178,22 @@ func TestGetBlobReturnsCiphertextAndHeaders(t *testing.T) {
 	}
 }
 
+func TestHeadBlobReturnsMetadataOnly(t *testing.T) {
+	st := newStub(t)
+	st.handle1("HEAD", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", "7")
+		w.Header().Set("X-Key-Id", strings.Repeat("c", 32))
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.HeadBlob(context.Background(), "chat", "chat_1", "j", "user_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID != "chat_1" || resp.ETag != "7" || resp.KeyID != strings.Repeat("c", 32) {
+		t.Fatalf("metadata: %+v", resp)
+	}
+}
+
 func TestListStatusEncodesQuery(t *testing.T) {
 	st := newStub(t)
 	st.handle1("GET", "/api/sync/list-status", func(w http.ResponseWriter, r *http.Request) {

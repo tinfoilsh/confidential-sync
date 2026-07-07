@@ -27,7 +27,7 @@ type V2 struct {
 	Alg string `json:"alg"`
 	// KID identifies the CEK that wrapped the data key (WDEK), not the
 	// key the payload is sealed under. It selects which key unwraps the
-	// data key on read and is the single field a CEK rotation rewrites.
+	// data key on read and is the single field a rewrap rewrites.
 	KID string `json:"kid"`
 	// WDEK is the per-message data key sealed under the CEK
 	// (AES-256-GCM ciphertext+tag, base64). WIV is its 12-byte nonce, hex.
@@ -167,9 +167,9 @@ type DecryptResult struct {
 //
 // Pipeline: gzip(plaintext) → AES-GCM-Seal(DEK, …) for the payload, and
 // AES-GCM-Seal(CEK, DEK, …) for the wrapped key. Splitting the content key
-// from the CEK lets a CEK rotation rewrap only the small data key and leave
-// the (potentially large) payload ciphertext untouched — which is also why
-// the payload AAD is independent of the CEK key id. Compression happens
+// from the CEK lets rewrap reseal only the small data key and leave the
+// (potentially large) payload ciphertext untouched, which is also why the
+// payload AAD is independent of the CEK key id. Compression happens
 // before encryption because ciphertext will not compress at any downstream
 // layer.
 func Encrypt(key []byte, plaintext []byte, aad AAD) ([]byte, error) {

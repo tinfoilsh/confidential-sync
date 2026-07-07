@@ -15,7 +15,7 @@ import (
 // plaintext field — never a panic, never a 5xx, never partial bytes.
 //
 // Adversary model: a buggy or malicious client supplies the wrong
-// CEK (e.g. an old key after rotation, or a random 32 bytes).
+// CEK (e.g. a stale key, or a random 32 bytes).
 //
 // Invariants:
 // 1. No 5xx — the enclave handles wrong-key gracefully.

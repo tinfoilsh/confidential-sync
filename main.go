@@ -73,26 +73,27 @@ func main() {
 	// without BUCKETS_URL set; refusing to start would block every
 	// non-attachment flow as well.
 	if !bucketsClient.Configured() {
-		log.Printf("WARN: buckets backend not configured (BUCKETS_URL or CHAT_ATTACHMENTS_BUCKET unset); attachment routes will return 503")
+		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / CHAT_ATTACHMENTS_BUCKET unset or invalid bucket name); attachment routes will return 503")
 	}
 
 	searchBucketsClient := buckets.NewClient(
 		os.Getenv("SEARCH_BUCKETS_URL"),
-		os.Getenv("SEARCH_BUCKETS_BUCKET"),
+		os.Getenv("SEARCH_INDEXES_BUCKET"),
 		&http.Client{Timeout: server.AttachmentRequestTimeout},
 	)
-	embedder := inference.NewClient(
-		os.Getenv("INFERENCE_URL"),
+	embedder, err := inference.NewClient(
 		os.Getenv("INFERENCE_API_KEY"),
 		envDefault("EMBEDDING_MODEL", "nomic-embed-text"),
-		&http.Client{Timeout: 60 * time.Second},
 	)
+	if err != nil {
+		log.Fatalf("init attested inference client: %v", err)
+	}
 	// Search is a soft feature the same way attachments are: when
 	// either half of its backend (the search index bucket or the
 	// embedding service) is unconfigured, the search routes return
 	// 503 and push/delete skip index upkeep.
 	if !searchBucketsClient.Configured() || !embedder.Configured() {
-		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_BUCKETS_BUCKET / INFERENCE_URL / INFERENCE_API_KEY); search routes will return 503")
+		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_INDEXES_BUCKET / INFERENCE_API_KEY unset or invalid bucket name); search routes will return 503")
 	}
 
 	logger := stdLogger{}

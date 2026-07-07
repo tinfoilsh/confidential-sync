@@ -2,43 +2,44 @@ package inference
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"errors"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 )
 
-func newTestClient(t *testing.T, handler http.HandlerFunc) *Client {
-	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, "test-key", "test-model", nil)
+type embeddingServiceFunc func(context.Context, openai.EmbeddingNewParams, ...option.RequestOption) (*openai.CreateEmbeddingResponse, error)
+
+func (f embeddingServiceFunc) New(ctx context.Context, params openai.EmbeddingNewParams, opts ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+	return f(ctx, params, opts...)
+}
+
+func testClient(service embeddingService) *Client {
+	return &Client{model: "test-model", embeddings: service}
 }
 
 func TestEmbedReturnsVectorsInInputOrder(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/embeddings" {
-			t.Errorf("unexpected path %s", r.URL.Path)
+	c := testClient(embeddingServiceFunc(func(_ context.Context, params openai.EmbeddingNewParams, _ ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+		if params.Model != "test-model" {
+			t.Errorf("unexpected model %q", params.Model)
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
-			t.Errorf("unexpected auth header %q", got)
+		if got := params.Input.OfArrayOfStrings; !reflect.DeepEqual(got, []string{"a", "b"}) {
+			t.Errorf("unexpected inputs %v", got)
 		}
-		var req embeddingsRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatal(err)
+		if params.EncodingFormat != openai.EmbeddingNewParamsEncodingFormatFloat {
+			t.Errorf("unexpected encoding format %q", params.EncodingFormat)
 		}
-		if req.Model != "test-model" || len(req.Input) != 2 {
-			t.Fatalf("unexpected request: %+v", req)
-		}
-		// Reply out of order to prove index-based reassembly.
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]any{
-				{"index": 1, "embedding": []float32{3, 4}},
-				{"index": 0, "embedding": []float32{1, 2}},
+		return &openai.CreateEmbeddingResponse{
+			Data: []openai.Embedding{
+				{Index: 1, Embedding: []float64{3, 4}},
+				{Index: 0, Embedding: []float64{1, 2}},
 			},
-		})
-	})
+		}, nil
+	}))
 	got, err := c.Embed(context.Background(), []string{"a", "b"})
 	if err != nil {
 		t.Fatal(err)
@@ -50,39 +51,74 @@ func TestEmbedReturnsVectorsInInputOrder(t *testing.T) {
 }
 
 func TestEmbedRejectsBadResponses(t *testing.T) {
-	cases := map[string]string{
-		"count mismatch":  `{"data":[{"index":0,"embedding":[1]}]}`,
-		"index range":     `{"data":[{"index":0,"embedding":[1]},{"index":5,"embedding":[1]}]}`,
-		"duplicate index": `{"data":[{"index":0,"embedding":[1]},{"index":0,"embedding":[1]}]}`,
-		"empty vector":    `{"data":[{"index":0,"embedding":[1]},{"index":1,"embedding":[]}]}`,
+	cases := map[string][]openai.Embedding{
+		"count mismatch":  {{Index: 0, Embedding: []float64{1}}},
+		"index range":     {{Index: 0, Embedding: []float64{1}}, {Index: 5, Embedding: []float64{1}}},
+		"duplicate index": {{Index: 0, Embedding: []float64{1}}, {Index: 0, Embedding: []float64{1}}},
+		"empty vector":    {{Index: 0, Embedding: []float64{1}}, {Index: 1}},
 	}
-	for name, body := range cases {
-		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(body))
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := testClient(embeddingServiceFunc(func(context.Context, openai.EmbeddingNewParams, ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+				return &openai.CreateEmbeddingResponse{Data: data}, nil
+			}))
+			if _, err := c.Embed(context.Background(), []string{"a", "b"}); err == nil {
+				t.Fatal("expected error")
+			}
 		})
-		if _, err := c.Embed(context.Background(), []string{"a", "b"}); err == nil {
-			t.Errorf("%s: expected error", name)
-		}
 	}
 }
 
-func TestEmbedSurfacesUpstreamStatus(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-	})
+func TestEmbedDoesNotLeakUpstreamErrors(t *testing.T) {
+	c := testClient(embeddingServiceFunc(func(context.Context, openai.EmbeddingNewParams, ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+		return nil, errors.New("plaintext echo")
+	}))
 	if _, err := c.Embed(context.Background(), []string{"a"}); err == nil {
-		t.Fatal("expected error on non-200")
+		t.Fatal("expected error")
+	} else if strings.Contains(err.Error(), "plaintext echo") {
+		t.Fatalf("upstream body leaked into error: %v", err)
+	}
+}
+
+func TestEmbedRejectsNilResponse(t *testing.T) {
+	c := testClient(embeddingServiceFunc(func(context.Context, openai.EmbeddingNewParams, ...option.RequestOption) (*openai.CreateEmbeddingResponse, error) {
+		return nil, nil
+	}))
+	if _, err := c.Embed(context.Background(), []string{"a"}); err == nil {
+		t.Fatal("expected error")
 	}
 }
 
 func TestConfigured(t *testing.T) {
-	if NewClient("", "k", "m", nil).Configured() {
-		t.Fatal("empty base URL should not be configured")
+	c, err := NewClient("", "m")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if NewClient("http://x", "", "m", nil).Configured() {
+	if c.Configured() {
 		t.Fatal("empty api key should not be configured")
 	}
-	if !NewClient("http://x", "k", "m", nil).Configured() {
+	c, err = NewClient("k", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Configured() {
+		t.Fatal("empty model should not be configured")
+	}
+	if !testClient(embeddingServiceFunc(nil)).Configured() {
 		t.Fatal("expected configured client")
+	}
+}
+
+func TestProductionClientUsesTinfoilSDK(t *testing.T) {
+	source, err := os.ReadFile("client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if strings.Contains(text, `"net/http"`) || strings.Contains(text, "http.Client") {
+		t.Fatal("production inference client must not use a plain HTTP client")
+	}
+	if !strings.Contains(text, "tinfoil.NewClientWithOptions") {
+		t.Fatal("production inference client must use the attested Tinfoil SDK")
 	}
 }

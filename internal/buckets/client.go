@@ -51,6 +51,10 @@ var ErrNotFound = errors.New("buckets: item not found")
 // with the supplied key (S3 error code DecryptionFailed).
 var ErrForbidden = errors.New("buckets: forbidden")
 
+// ErrTooLarge is returned when a bounded read exceeds the caller's
+// maximum accepted response size.
+var ErrTooLarge = errors.New("buckets: item too large")
+
 const (
 	defaultRequestTimeout = 5 * time.Minute
 
@@ -78,6 +82,26 @@ const (
 // client validates locally and fails loudly instead.
 var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
+// bucketNamePattern is the modern S3 bucket naming character rule
+// (lowercase letters, digits, dots, hyphens; 3-63 chars; starts and
+// ends alphanumeric). The bucket becomes a raw path segment of every
+// sidecar URL, so anything else (slashes, percent signs, spaces)
+// could silently reroute requests instead of failing.
+var bucketNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+
+// ipv4Pattern matches dotted-quad names, which S3 reserves: a bucket
+// must not be formatted as an IP address.
+var ipv4Pattern = regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`)
+
+// validBucketName applies the S3 naming rules a bucket this client
+// can legitimately target must satisfy, so a config typo fails fast
+// via Configured instead of reaching the sidecar.
+func validBucketName(s string) bool {
+	return bucketNamePattern.MatchString(s) &&
+		!strings.Contains(s, "..") &&
+		!ipv4Pattern.MatchString(s)
+}
+
 // deleteKeyPlaceholder satisfies the sidecar's mandatory
 // X-Tinfoil-Encryption-Key header on the delete path, which never
 // decrypts. The resolver rejects any request whose key does not decode
@@ -98,7 +122,10 @@ type Client struct {
 // NewClient builds a sidecar client. bucket is the S3 bucket the
 // sidecar routes to: it honors whatever bucket the request path names
 // (path-style `/{bucket}/{key}`), with IAM on the sidecar's
-// credentials as the enforcement point for reachability.
+// credentials as the enforcement point for reachability. The value
+// comes from deploy config, never user input, and must be a valid S3
+// bucket name; Configured rejects anything else so requests are never
+// built from a malformed value.
 func NewClient(baseURL, bucket string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultRequestTimeout}
@@ -110,11 +137,13 @@ func NewClient(baseURL, bucket string, httpClient *http.Client) *Client {
 	}
 }
 
-// Configured reports whether the client has both a sidecar URL and a
-// bucket. Callers use this to fail fast with a clean 503 when the
-// service isn't wired up (local dev, smoke tests).
+// Configured reports whether the client has a sidecar URL and a
+// valid target bucket. Callers use this to fail fast with a clean 503
+// when the service isn't wired up (local dev, smoke tests) or when a
+// deploy-config typo would otherwise be interpolated into request
+// URLs as a malformed path segment.
 func (c *Client) Configured() bool {
-	return c != nil && c.baseURL != "" && c.bucket != ""
+	return c != nil && c.baseURL != "" && validBucketName(c.bucket)
 }
 
 // Put stores plaintext for owner at the given access token, encrypted
@@ -151,6 +180,13 @@ func (c *Client) Put(ctx context.Context, owner, accessToken string, plaintext, 
 // access token. The supplied key must be the one the object was sealed
 // under at PUT.
 func (c *Client) Get(ctx context.Context, owner, accessToken string, key []byte) ([]byte, error) {
+	return c.GetLimited(ctx, owner, accessToken, key, 0)
+}
+
+// GetLimited fetches plaintext like Get, but rejects successful
+// responses whose body exceeds maxBytes. A non-positive maxBytes means
+// unbounded, matching Get.
+func (c *Client) GetLimited(ctx context.Context, owner, accessToken string, key []byte, maxBytes int64) ([]byte, error) {
 	if !c.Configured() {
 		return nil, errors.New("buckets: client not configured")
 	}
@@ -173,9 +209,16 @@ func (c *Client) Get(ctx context.Context, owner, accessToken string, key []byte)
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		plaintext, err := io.ReadAll(resp.Body)
+		var reader io.Reader = resp.Body
+		if maxBytes > 0 {
+			reader = io.LimitReader(resp.Body, maxBytes+1)
+		}
+		plaintext, err := io.ReadAll(reader)
 		if err != nil {
 			return nil, fmt.Errorf("buckets: read get: %w", err)
+		}
+		if maxBytes > 0 && int64(len(plaintext)) > maxBytes {
+			return nil, fmt.Errorf("buckets: get body exceeds %d bytes: %w", maxBytes, ErrTooLarge)
 		}
 		return plaintext, nil
 	case http.StatusNotFound:

@@ -156,20 +156,22 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		ProjectID:      projectID,
 	})
 	if err == nil {
+		committedAt := time.Now()
 		deps.logInfo("push ok: user=%s scope=%s id=%s kid=%s new_etag=%s",
 			sess.Claims.Subject, scope, req.ID, kidHex, resp.ETag)
 		// Search indexing is inline (the plaintext and CEK only exist
 		// for this request) but best-effort: the blob write already
 		// succeeded, so an indexing failure degrades search instead
 		// of failing the push. The reindex path repairs any gap.
-		searchIndexed := false
+		var searchIndexed *bool
 		if scope == envelope.ScopeChat && searchConfigured(deps) {
-			if idxErr := indexChatForSearch(ctx, deps, sess.Claims.Subject, key, req.ID, plaintext, resp.ETag); idxErr != nil {
+			indexed := true
+			if idxErr := indexCurrentChatForSearch(ctx, deps, sess, key, req.ID, plaintext, resp.ETag, committedAt); idxErr != nil {
 				deps.logError("push search index failed: user=%s id=%s err=%v",
 					sess.Claims.Subject, req.ID, idxErr)
-			} else {
-				searchIndexed = true
+				indexed = false
 			}
+			searchIndexed = &indexed
 		}
 		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID, SearchIndexed: searchIndexed}, nil
 	}
@@ -496,6 +498,11 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		if err != nil {
 			var cpe *controlplane.Error
 			if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
+				// The blob may be gone while its index entry survived
+				// (an earlier delete that failed after the blob write,
+				// or a crash between the two); the idempotent replay
+				// must still finish the search cleanup.
+				dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
 				deps.logInfo("delete already-gone: user=%s scope=%s id=%s",
 					sess.Claims.Subject, scope, req.ID)
 				return &OKResponse{OK: true}, nil
@@ -1035,7 +1042,7 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 			if err != nil {
 				// Auth-layer failures (user JWT expired without
 				// service-auth fallback, missing enclave secret,
-				// rotated keys) will hit every subsequent call
+				// wrong keys) will hit every subsequent call
 				// the same way. Surface Partial=true so the
 				// client retries with a fresh token instead of
 				// burning the loop on a thousand 401s.
@@ -1107,7 +1114,7 @@ func cloneScopeReport(in MigrateAllScopeReport) MigrateAllScopeReport {
 // call fails fast with STALE_KEY instead of letting the migration loop
 // fire a doomed rewrap against every blob — those all return STALE_KEY
 // from the controlplane CAS and only produce a 409 storm. The client
-// must reconcile the key (recovery / rotation) before retrying.
+// must reconcile the key (recovery / key change) before retrying.
 func ensureCurrentKeyRegistered(
 	ctx context.Context,
 	deps Deps,
@@ -1185,7 +1192,7 @@ func currentPrimaryKeyIs(ctx context.Context, deps Deps, sess Session, targetKID
 // isAuthError reports whether err originates from a 401/403 from
 // controlplane. Used to abort the migrate-all loop cleanly instead of
 // hammering CP once the auth chain has broken (expired user JWT,
-// missing service secret, rotated keys).
+// missing service secret, wrong keys).
 func isAuthError(err error) bool {
 	var cpe *controlplane.Error
 	if !errors.As(err, &cpe) {
@@ -1224,7 +1231,7 @@ func migrateOne(
 			// migration pass or a user push. The row is in the desired
 			// end state, so count it migrated rather than re-sealing it
 			// or recording a failure. A v2 row under a different key
-			// (a key rotation) still falls through to the rewrap below.
+			// still falls through to the rewrap below.
 			deps.logInfo("migrate item already at target: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, id, attempt)
 			return true

@@ -1095,8 +1095,8 @@ func TestMigrateLegacyBlob(t *testing.T) {
 // id as the row id — but a v2 profile envelope is sealed with the AAD
 // id fixed to the profile singleton. The migrate read path must
 // normalize the storage id back to that singleton before rebuilding
-// the AAD; otherwise a v2 profile (e.g. one being re-sealed under a
-// rotated CEK) fails to decrypt and the migration silently blocks.
+// the AAD; otherwise a v2 profile being re-sealed under a different
+// key fails to decrypt and the migration silently blocks.
 func TestMigrateV2ProfileAddressedByClerkUserID(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
@@ -1115,7 +1115,7 @@ func TestMigrateV2ProfileAddressedByClerkUserID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mint the rotation target key the migrate re-seals under.
+	// Mint the target key the migrate re-seals under.
 	targetRaw := make([]byte, cryptopkg.KeySize)
 	if _, err := rand.Read(targetRaw); err != nil {
 		t.Fatal(err)

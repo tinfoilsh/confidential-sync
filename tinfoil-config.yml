@@ -21,8 +21,7 @@ containers:
       # the same sidecar serves both buckets while attachment objects
       # and search index objects stay in separate S3 namespaces.
       - SEARCH_BUCKETS_URL: "http://buckets:9000"
-      - SEARCH_BUCKETS_BUCKET: "sync-search-indexes"
-      - INFERENCE_URL: "https://inference.tinfoil.sh"
+      - SEARCH_INDEXES_BUCKET: "sync-search-indexes"
       - EMBEDDING_MODEL: "nomic-embed-text"
       - CLERK_ISSUER: "https://clerk.tinfoil.sh"
     secrets:

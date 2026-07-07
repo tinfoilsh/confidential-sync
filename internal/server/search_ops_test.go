@@ -162,7 +162,7 @@ func TestPushIndexesChatAndSemanticSearchFinds(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 
-	if out := f.pushChat(t, tok, "chat_duck", "Pond visit", "I saw a duck at the pond today"); !out.SearchIndexed {
+	if out := f.pushChat(t, tok, "chat_duck", "Pond visit", "I saw a duck at the pond today"); out.SearchIndexed == nil || !*out.SearchIndexed {
 		t.Fatal("push did not report search_indexed")
 	}
 	f.pushChat(t, tok, "chat_tax", "Paperwork", "filing my tax return before the deadline")
@@ -297,9 +297,8 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 	f.pushChat(t, tok, "chat_dog", "Walk", "walked the dog in the park")
 	f.pushChat(t, tok, "chat_tax", "Paperwork", "tax return time")
 
-	// Simulate a lost index (e.g. CEK rotation or bucket wipe). Out-
-	// of-band storage changes are invisible to the in-memory cache,
-	// so drop it too, as a restart would.
+	// Simulate a lost index. Out-of-band storage changes are invisible
+	// to the in-memory cache, so drop it too, as a restart would.
 	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
 		t.Fatal(err)
 	}
@@ -388,8 +387,8 @@ func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
 	tok := f.jwt()
 
 	out := f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
-	if out.SearchIndexed {
-		t.Fatal("push should not report search_indexed when embedding fails")
+	if out.SearchIndexed == nil || *out.SearchIndexed {
+		t.Fatal("push should report search_indexed=false when embedding fails")
 	}
 	if !out.OK {
 		t.Fatal("push should still succeed")

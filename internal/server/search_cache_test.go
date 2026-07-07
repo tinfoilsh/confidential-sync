@@ -75,10 +75,10 @@ func TestSearchCacheHitMissAndKeyRotation(t *testing.T) {
 	if _, ok := c.get("bob", cacheKeyHash(1)); ok {
 		t.Fatal("unexpected hit for uncached owner")
 	}
-	// A different key hash means the CEK rotated: miss, and the stale
-	// entry must be gone entirely.
+	// A different key hash misses, and the stale entry must be gone
+	// entirely.
 	if _, ok := c.get("alice", cacheKeyHash(2)); ok {
-		t.Fatal("rotated key must not hit")
+		t.Fatal("different key must not hit")
 	}
 	if _, ok := c.get("alice", cacheKeyHash(1)); ok {
 		t.Fatal("stale entry must be evicted after key mismatch")
@@ -170,7 +170,7 @@ func TestQueryServedFromCacheWhenBucketDown(t *testing.T) {
 }
 
 // TestCacheNotPoisonedByWrongKeyQuery interleaves queries under a
-// rotated key with queries under the real key: the wrong key must
+// wrong key with queries under the real key: the wrong key must
 // consistently report needs_reindex, and must not evict or corrupt
 // the good state permanently.
 func TestCacheNotPoisonedByWrongKeyQuery(t *testing.T) {

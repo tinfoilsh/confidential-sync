@@ -171,10 +171,10 @@ func TestConcurrentPushesAllIndexed(t *testing.T) {
 func TestReindexUpdateReplacesEntry(t *testing.T) {
 	f := newSearchFixture(t)
 	ctx := context.Background()
-	if err := indexChatForSearch(ctx, f.handler.deps, f.userSub, f.userKey, "chat_a", chatJSON(t, "chat_a", "", "a duck on the pond"), "1"); err != nil {
+	if err := indexChatForSearch(ctx, f.handler.deps, f.userSub, f.userKey, "chat_a", chatJSON(t, "chat_a", "", "a duck on the pond"), "1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := indexChatForSearch(ctx, f.handler.deps, f.userSub, f.userKey, "chat_a", chatJSON(t, "chat_a", "", "a goose on the lake"), "2"); err != nil {
+	if err := indexChatForSearch(ctx, f.handler.deps, f.userSub, f.userKey, "chat_a", chatJSON(t, "chat_a", "", "a goose on the lake"), "2", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	tok := f.jwt()
@@ -292,8 +292,8 @@ func TestPushSucceedsWhenSearchBucketDown(t *testing.T) {
 	if !out.OK {
 		t.Fatal("push failed when search bucket was down")
 	}
-	if out.SearchIndexed {
-		t.Fatal("push claimed search_indexed with the bucket down")
+	if out.SearchIndexed == nil || *out.SearchIndexed {
+		t.Fatal("push must report search_indexed=false with the bucket down")
 	}
 }
 

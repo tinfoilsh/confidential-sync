@@ -28,11 +28,19 @@ type searchCacheEntry struct {
 // requests so the hot path skips the sidecar GET, gunzip, and decode
 // on every operation. LRU-evicted under a byte budget.
 //
+// Security model: this is a deliberate, bounded exception to the
+// per-request plaintext-lifetime rule. Index contents (tokens and
+// quantized vectors derived from chat text, never raw chat text or
+// key material) stay resident in the same attested, host-inaccessible
+// enclave memory that holds chat plaintext during requests, capped by
+// the LRU budget and gone on enclave restart. Storage remains the
+// source of truth: every mutation is persisted before it is served.
+//
 // Coherence model: this process is the only writer of index objects
 // (per-user RW locks serialize all mutations), so a cached index can
 // only go stale if the stored object is changed out-of-band. Entries
 // are bound to a hash of the encryption key they were loaded under,
-// so a CEK rotation is detected as a mismatch and falls through to
+// so a different key is detected as a mismatch and falls through to
 // storage. All methods are safe on a nil receiver (cache disabled).
 type searchIndexCache struct {
 	mu      sync.Mutex
@@ -51,8 +59,8 @@ func newSearchIndexCache(budget int) *searchIndexCache {
 }
 
 // get returns the cached index for owner if it was cached under the
-// same key. A key-hash mismatch means the CEK rotated: the stale
-// entry is dropped and the caller falls through to storage.
+// same key. A key-hash mismatch drops the stale entry and the caller
+// falls through to storage.
 func (c *searchIndexCache) get(owner string, keyHash [sha256.Size]byte) (*searchindex.Index, bool) {
 	if c == nil {
 		return nil, false

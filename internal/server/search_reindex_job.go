@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"sync"
 	"time"
 )
@@ -12,6 +13,13 @@ import (
 // own, and the client polls for status. This keeps a large rebuild
 // (thousands of embedding calls) from depending on the webapp tab
 // staying open for the whole run.
+//
+// Key lifetime: the job necessarily retains the caller's CEKs past
+// the kickoff request, since it must decrypt chats and seal the
+// rebuilt index on the caller's behalf. This is the same deliberate,
+// bounded exception migrate-all makes: the keys live only in this
+// process's memory, only for the job's budgeted lifetime, and are
+// never persisted.
 
 const (
 	// SearchReindexJobBudget caps one rebuild run. Sized for ~10k
@@ -29,6 +37,14 @@ type SearchReindexJob struct {
 	ID        string
 	UserID    string
 	StartedAt time.Time
+	// keyFP fingerprints the key set the job rebuilds under. A
+	// kickoff only joins an existing job when the fingerprints match:
+	// a different key set must not join an old job whose output is
+	// sealed under a key the client did not ask to use.
+	keyFP [sha256.Size]byte
+	// cancel aborts the job's context; the coordinator uses it to
+	// stop a superseded job before starting its replacement.
+	cancel context.CancelFunc
 
 	mu           sync.Mutex
 	updatedAt    time.Time
@@ -42,16 +58,31 @@ type SearchReindexJob struct {
 	done chan struct{}
 }
 
-func newSearchReindexJob(userID string) *SearchReindexJob {
+func newSearchReindexJob(userID string, keyFP [sha256.Size]byte) *SearchReindexJob {
 	now := time.Now().UTC()
 	return &SearchReindexJob{
 		ID:        newMigrationJobID(),
 		UserID:    userID,
 		StartedAt: now,
+		keyFP:     keyFP,
 		updatedAt: now,
 		status:    MigrationJobRunning,
 		done:      make(chan struct{}),
 	}
+}
+
+// reindexKeyFingerprint hashes the request's key set for job
+// identity. Only a digest is retained on the job, never the key
+// material itself.
+func reindexKeyFingerprint(keys []PullKey) [sha256.Size]byte {
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k.Key))
+		h.Write([]byte{0})
+	}
+	var fp [sha256.Size]byte
+	copy(fp[:], h.Sum(nil))
+	return fp
 }
 
 func (j *SearchReindexJob) reportPage(page *searchReindexPageResult) {
@@ -87,6 +118,27 @@ func (j *SearchReindexJob) finish(err error) {
 // Tests use this to wait for the job goroutine deterministically.
 func (j *SearchReindexJob) Done() <-chan struct{} { return j.done }
 
+// blocksRestart reports whether a kickoff should return this job
+// instead of starting a fresh one: while it is running, and while a
+// cleanly completed run is retained (a retried or duplicate kickoff
+// landing just after success must not pay for embedding the whole
+// corpus again). Failed and partial runs never block, because their
+// whole point of being terminal is to be re-kicked immediately.
+func (j *SearchReindexJob) blocksRestart() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.status == MigrationJobRunning {
+		return true
+	}
+	return j.status == MigrationJobCompleted && !j.partial
+}
+
+func (j *SearchReindexJob) running() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.status == MigrationJobRunning
+}
+
 func (j *SearchReindexJob) statusResponse() SearchReindexStatusResponse {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -113,10 +165,11 @@ func (j *SearchReindexJob) statusResponse() SearchReindexStatusResponse {
 }
 
 // SearchReindexCoordinator owns the per-user reindex jobs. A kickoff
-// while a job exists (running or within its retention window) returns
-// the existing job, so duplicate kickoffs from multiple tabs cannot
-// stack rebuilds — important here because every rebuild pays for
-// embedding the whole corpus again.
+// while a job is running or while a clean success sits in its
+// retention window returns the existing job, so duplicate kickoffs
+// from multiple tabs cannot stack rebuilds — important here because
+// every rebuild pays for embedding the whole corpus again. Failed and
+// partial runs are re-kickable immediately.
 type SearchReindexCoordinator struct {
 	mu         sync.Mutex
 	jobs       map[string]*SearchReindexJob
@@ -134,21 +187,44 @@ func NewSearchReindexCoordinator() *SearchReindexCoordinator {
 	}
 }
 
-// StartOrGet returns the user's existing job, or starts a new one in
+// StartOrGet returns the user's existing job when it is running or a
+// retained clean success for the same key set, or starts a new one in
 // a detached goroutine. The bool is true when a fresh job started
-// (handler answers 202 instead of 200).
+// (handler answers 202 instead of 200). Failed and partial terminal
+// jobs do not block: a query that still reports needs_reindex after
+// such a run must be able to re-kick without waiting out the
+// retention window. A kickoff with a different key set also never
+// joins: the old job's output is sealed under a key the client did
+// not ask to use, so the old job is cancelled and a fresh rebuild
+// starts once it has wound down.
 func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps Deps, sess Session, req SearchReindexRequest) (*SearchReindexJob, bool) {
 	userID := sess.Claims.Subject
+	keyFP := reindexKeyFingerprint(req.Keys)
 	c.mu.Lock()
-	if existing, ok := c.jobs[userID]; ok {
+	existing := c.jobs[userID]
+	if existing != nil && existing.keyFP == keyFP && existing.blocksRestart() {
 		c.mu.Unlock()
 		return existing, false
 	}
-	job := newSearchReindexJob(userID)
+	job := newSearchReindexJob(userID, keyFP)
+	// The job's context is created here, not in run, so a successor
+	// kickoff can cancel it before the goroutine is scheduled.
+	// Detached from the kickoff request so a closing webapp tab
+	// cannot cancel the rebuild mid-run; bounded by the job budget.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), c.budget)
+	job.cancel = cancel
 	c.jobs[userID] = job
 	c.mu.Unlock()
 
-	go c.run(parentCtx, deps, sess, req, job)
+	var predecessor *SearchReindexJob
+	if existing != nil && existing.running() {
+		// Two rebuilds must not interleave writes to the same index
+		// object: stop the superseded job and make the new one wait
+		// for it to wind down before paging.
+		existing.cancel()
+		predecessor = existing
+	}
+	go c.run(ctx, deps, sess, req, job, predecessor)
 	return job, true
 }
 
@@ -159,12 +235,14 @@ func (c *SearchReindexCoordinator) Status(userID string) *SearchReindexJob {
 	return c.jobs[userID]
 }
 
-func (c *SearchReindexCoordinator) run(parentCtx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob) {
-	// Detach from the kickoff request so a closing webapp tab cannot
-	// cancel the rebuild mid-run, then apply our own budget.
-	ctx := context.WithoutCancel(parentCtx)
-	ctx, cancel := context.WithTimeout(ctx, c.budget)
-	defer cancel()
+func (c *SearchReindexCoordinator) run(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob, predecessor *SearchReindexJob) {
+	defer job.cancel()
+	if predecessor != nil {
+		select {
+		case <-predecessor.Done():
+		case <-ctx.Done():
+		}
+	}
 
 	deps.logInfo("search reindex job begin: user=%s job=%s budget=%s", job.UserID, job.ID, c.budget)
 	err := c.runnerHook(ctx, deps, sess, req, job)
@@ -202,7 +280,7 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			deps.logInfo("search reindex job stopped at budget: user=%s job=%s", job.UserID, job.ID)
 			return nil
 		}
-		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor)
+		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, job.StartedAt)
 		if err != nil {
 			// A budget expiry mid-page surfaces as a context error
 			// wrapped in upstream failures; report it as partial

@@ -77,6 +77,11 @@ const (
 	// into the fused scoring.
 	rrfCandidateDepth = 128
 
+	// maxSerializedSlots admits the tombstones Upsert can leave
+	// between compactions while rejecting slot tables this package
+	// could never produce.
+	maxSerializedSlots = MaxChats * 2
+
 	// lexicalRRFWeight / semanticRRFWeight bias fusion toward keyword
 	// hits: exact keyword search is the reliable tier, semantic
 	// similarity the bonus tier.
@@ -174,6 +179,12 @@ type Index struct {
 	// models are not comparable, so a model change forces a rebuild.
 	Model string `json:"model,omitempty"`
 	Dims  int    `json:"dims,omitempty"`
+	// Incomplete marks an index known not to cover the full corpus:
+	// set when an inline push had to start over on top of an
+	// unreadable previous index (wrong key, corruption, model change)
+	// and while a rebuild is mid-flight. Queries surface it as
+	// needs_reindex; a completed rebuild clears it.
+	Incomplete bool `json:"incomplete,omitempty"`
 	// Slots maps slot -> chat id. An updated or removed chat leaves a
 	// tombstone ("" at its old slot) instead of eagerly rewriting
 	// every posting list; queries skip dead slots and compaction
@@ -215,6 +226,9 @@ func Decode(data []byte) (*Index, error) {
 	if ix.Postings == nil {
 		ix.Postings = map[string][]int{}
 	}
+	if len(ix.Slots) > maxSerializedSlots {
+		return nil, fmt.Errorf("searchindex: %d slots exceeds limit %d", len(ix.Slots), maxSerializedSlots)
+	}
 	live := 0
 	for _, id := range ix.Slots {
 		if id == "" {
@@ -230,17 +244,51 @@ func Decode(data []byte) (*Index, error) {
 	if live != len(ix.Chats) {
 		return nil, errors.New("searchindex: slot table does not match entries")
 	}
+	if ix.dead >= compactionMinDead && ix.dead > live {
+		return nil, errors.New("searchindex: tombstones exceed compaction invariant")
+	}
+	// Enforce the same bounds Upsert does, so a corrupt stored object
+	// cannot smuggle in an index far more expensive to search than
+	// anything this code could have built. Rejecting it makes the
+	// load path treat it as unreadable, which routes the client to a
+	// rebuild instead of serving the oversized index.
+	if len(ix.Chats) > MaxChats {
+		return nil, fmt.Errorf("searchindex: %d chats exceeds limit %d", len(ix.Chats), MaxChats)
+	}
 	for _, e := range ix.Chats {
+		if len(e.Vectors) > MaxChunksPerChat {
+			return nil, fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
+		}
 		for _, v := range e.Vectors {
 			if len(v) == 0 || len(v) != ix.Dims {
 				return nil, errors.New("searchindex: entry vector does not match index dims")
 			}
 		}
 	}
-	for _, slots := range ix.Postings {
+	maxPostings := len(ix.Slots) * MaxTokensPerChat
+	totalPostings := 0
+	for tok, slots := range ix.Postings {
+		if !validPostingToken(tok) {
+			return nil, errors.New("searchindex: posting token is invalid")
+		}
+		if len(slots) == 0 {
+			return nil, errors.New("searchindex: posting list is empty")
+		}
+		if len(slots) > len(ix.Slots) {
+			return nil, errors.New("searchindex: posting list exceeds slot table")
+		}
+		prev := -1
 		for _, s := range slots {
 			if s < 0 || s >= len(ix.Slots) {
 				return nil, errors.New("searchindex: posting references unknown slot")
+			}
+			if s <= prev {
+				return nil, errors.New("searchindex: posting list is not strictly ordered")
+			}
+			prev = s
+			totalPostings++
+			if totalPostings > maxPostings {
+				return nil, errors.New("searchindex: postings exceed token limit")
 			}
 		}
 	}
@@ -249,6 +297,10 @@ func Decode(data []byte) (*Index, error) {
 
 func (ix *Index) Encode() ([]byte, error) {
 	return json.Marshal(ix)
+}
+
+func validPostingToken(tok string) bool {
+	return len(tok) >= minTokenLen && len(tok) <= maxIdentifierLen
 }
 
 // Upsert records or replaces one chat's entry and its postings. The
@@ -287,7 +339,7 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	// IDF and score.
 	seen := make(map[string]struct{}, len(tokens))
 	for _, tok := range tokens {
-		if tok == "" {
+		if !validPostingToken(tok) {
 			continue
 		}
 		if _, dup := seen[tok]; dup {
@@ -295,6 +347,9 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 		}
 		seen[tok] = struct{}{}
 		ix.Postings[tok] = append(ix.Postings[tok], e.Slot)
+		if len(seen) >= MaxTokensPerChat {
+			break
+		}
 	}
 	ix.maybeCompact()
 	return nil

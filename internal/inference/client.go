@@ -1,66 +1,66 @@
-// Package inference is the sync-enclave's client for the Tinfoil
-// confidential inference service's OpenAI-compatible embeddings API.
-// The enclave sends chat text and search queries to an embedding
-// model running inside Tinfoil inference enclaves, so plaintext never
-// leaves the confidential-computing boundary: it travels from this
-// CVM to the inference CVM over TLS and is discarded after the
-// vectors are returned.
+// Package inference is the sync-enclave's attested client for the
+// Tinfoil confidential inference service's OpenAI-compatible
+// embeddings API. The Tinfoil SDK verifies the destination enclave
+// and encrypts request bodies to its attested key before chat text or
+// search queries leave this CVM.
 package inference
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
+	"math"
 	"time"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	tinfoil "github.com/tinfoilsh/tinfoil-go"
 )
 
 const (
 	defaultRequestTimeout = 60 * time.Second
 
-	// maxResponseBytes bounds the embeddings response body. A single
-	// 768-dim float vector is ~15 KiB of JSON; a full batch of
-	// MaxBatchSize inputs stays well under this cap.
-	maxResponseBytes = 32 << 20
-
 	// MaxBatchSize caps how many inputs one Embed call sends. The
 	// inference service accepts larger batches, but bounding it here
 	// keeps request bodies and worst-case latency predictable.
 	MaxBatchSize = 64
-
-	embeddingsPath = "/v1/embeddings"
 )
 
-// Client calls the embeddings endpoint of an OpenAI-compatible
-// inference service (Tinfoil confidential inference in production).
-type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+type embeddingService interface {
+	New(context.Context, openai.EmbeddingNewParams, ...option.RequestOption) (*openai.CreateEmbeddingResponse, error)
 }
 
-func NewClient(baseURL, apiKey, model string, httpClient *http.Client) *Client {
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultRequestTimeout}
+// Client calls the embeddings endpoint through the Tinfoil SDK's
+// attested, enclave-bound transport.
+type Client struct {
+	model      string
+	embeddings embeddingService
+}
+
+func NewClient(apiKey, model string) (*Client, error) {
+	client := &Client{model: model}
+	if apiKey == "" || model == "" {
+		return client, nil
 	}
-	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		apiKey:     apiKey,
-		model:      model,
-		httpClient: httpClient,
+	secureClient, err := tinfoil.NewClientWithOptions(
+		tinfoil.WithOpenAIOptions(
+			option.WithAPIKey(apiKey),
+			option.WithRequestTimeout(defaultRequestTimeout),
+			option.WithMaxRetries(0),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("inference: initialize attested client: %w", err)
 	}
+	client.embeddings = &secureClient.Embeddings
+	return client, nil
 }
 
 // Configured reports whether the client has everything it needs to
 // issue embedding requests. Callers use this to gate search features
 // with a clean 503 instead of a confusing upstream error.
 func (c *Client) Configured() bool {
-	return c != nil && c.baseURL != "" && c.apiKey != "" && c.model != ""
+	return c != nil && c.embeddings != nil && c.model != ""
 }
 
 // Model returns the embedding model identifier. The search index
@@ -71,19 +71,6 @@ func (c *Client) Model() string {
 		return ""
 	}
 	return c.model
-}
-
-type embeddingsRequest struct {
-	Model          string   `json:"model"`
-	Input          []string `json:"input"`
-	EncodingFormat string   `json:"encoding_format"`
-}
-
-type embeddingsResponse struct {
-	Data []struct {
-		Index     int       `json:"index"`
-		Embedding []float32 `json:"embedding"`
-	} `json:"data"`
 }
 
 // Embed returns one embedding vector per input, in input order.
@@ -97,51 +84,41 @@ func (c *Client) Embed(ctx context.Context, inputs []string) ([][]float32, error
 	if len(inputs) > MaxBatchSize {
 		return nil, fmt.Errorf("inference: batch of %d exceeds limit %d", len(inputs), MaxBatchSize)
 	}
-	body, err := json.Marshal(embeddingsRequest{
-		Model:          c.model,
-		Input:          inputs,
-		EncodingFormat: "float",
+	resp, err := c.embeddings.New(ctx, openai.EmbeddingNewParams{
+		Model: c.model,
+		Input: openai.EmbeddingNewParamsInputUnion{
+			OfArrayOfStrings: inputs,
+		},
+		EncodingFormat: openai.EmbeddingNewParamsEncodingFormatFloat,
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.New("inference: embeddings request failed")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+embeddingsPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	if resp == nil {
+		return nil, errors.New("inference: empty embeddings response")
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("inference: embeddings request: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return nil, fmt.Errorf("inference: read embeddings response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("inference: embeddings status %d: %s", resp.StatusCode, truncateForError(raw))
-	}
-	var parsed embeddingsResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("inference: decode embeddings response: %w", err)
-	}
-	if len(parsed.Data) != len(inputs) {
-		return nil, fmt.Errorf("inference: got %d embeddings for %d inputs", len(parsed.Data), len(inputs))
+	if len(resp.Data) != len(inputs) {
+		return nil, fmt.Errorf("inference: got %d embeddings for %d inputs", len(resp.Data), len(inputs))
 	}
 	out := make([][]float32, len(inputs))
-	for _, d := range parsed.Data {
-		if d.Index < 0 || d.Index >= len(inputs) {
+	for _, d := range resp.Data {
+		if d.Index < 0 || d.Index >= int64(len(inputs)) {
 			return nil, fmt.Errorf("inference: embedding index %d out of range", d.Index)
 		}
 		if len(d.Embedding) == 0 {
 			return nil, errors.New("inference: empty embedding vector")
 		}
-		if out[d.Index] != nil {
+		if out[int(d.Index)] != nil {
 			return nil, fmt.Errorf("inference: duplicate embedding index %d", d.Index)
 		}
-		out[d.Index] = d.Embedding
+		vector := make([]float32, len(d.Embedding))
+		for i, value := range d.Embedding {
+			if math.IsNaN(value) || math.IsInf(value, 0) || math.Abs(value) > math.MaxFloat32 {
+				return nil, fmt.Errorf("inference: invalid embedding value at index %d", d.Index)
+			}
+			vector[i] = float32(value)
+		}
+		out[int(d.Index)] = vector
 	}
 	for i, v := range out {
 		if v == nil {
@@ -149,13 +126,4 @@ func (c *Client) Embed(ctx context.Context, inputs []string) ([][]float32, error
 		}
 	}
 	return out, nil
-}
-
-func truncateForError(raw []byte) string {
-	const maxErrBytes = 512
-	s := strings.TrimSpace(string(raw))
-	if len(s) > maxErrBytes {
-		return s[:maxErrBytes] + "..."
-	}
-	return s
 }

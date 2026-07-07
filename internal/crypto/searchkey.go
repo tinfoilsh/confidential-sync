@@ -16,15 +16,8 @@ import (
 // the CEK's confidentiality without persisting any new key material:
 //
 //	K_search = HKDF-SHA-256(IKM=CEK, salt="", info="tinfoil-search-index-v1", L=32)
-//
-// A CEK rotation changes K_search, which makes any index sealed under
-// the previous CEK unreadable; callers treat that as "no index" and
-// rebuild via the reindex path.
 
 const (
-	// searchIndexKeyInfo is the HKDF info string for the search-index
-	// subkey. Version-tagged so future format changes can derive a
-	// fresh key without ambiguity.
 	searchIndexKeyInfo = "tinfoil-search-index-v1"
 
 	searchIndexKeySize = 32
