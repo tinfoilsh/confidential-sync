@@ -7,6 +7,10 @@ networks:
   web:
     egress: open
 
+networks:
+  web:
+    egress: open
+
 containers:
   - name: "sync-enclave"
     image: "ghcr.io/tinfoilsh/confidential-sync@sha256:0000000000000000000000000000000000000000000000000000000000000000"
