@@ -105,7 +105,7 @@ func Start(cfg Config) (*Stack, error) {
 		return nil, fmt.Errorf("verifier: %w", err)
 	}
 	cpClient := controlplane.NewClient(cpURL, &http.Client{Timeout: 10 * time.Second}, controlplane.WithServiceSecret(LocalStackSyncEnclaveSecret))
-	bucketsClient := buckets.NewClient(cpURL, &http.Client{Timeout: server.AttachmentRequestTimeout})
+	bucketsClient := buckets.NewClient(cpURL, LocalStackBucketsBucket, &http.Client{Timeout: server.AttachmentRequestTimeout})
 	handler := server.NewHandler(server.Deps{
 		Controlplane:      cpClient,
 		Buckets:           bucketsClient,

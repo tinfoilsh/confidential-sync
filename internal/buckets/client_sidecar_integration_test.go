@@ -19,21 +19,26 @@ import (
 // sidecar_integration tag:
 //
 //	BUCKETS_SIDECAR_URL=http://localhost:9000 \
+//	  BUCKETS_SIDECAR_BUCKET=<bucket> \
 //	  go test -tags sidecar_integration ./internal/buckets/...
 //
 // Bring the sidecar up first using the same image the enclave
-// colocates, in multitenant mode, backed by an S3 bucket it can reach:
+// colocates, in multitenant mode. The sidecar routes to whatever
+// bucket the request path names, so BUCKETS_SIDECAR_BUCKET must be a
+// bucket its AWS credentials can reach:
 //
 //	docker run --rm -p 9000:9000 \
-//	  -e PORT=9000 -e MULTITENANT=true \
-//	  -e BUCKET=<bucket> -e AWS_REGION=<region> \
+//	  -e PORT=9000 -e MULTITENANT=true -e AWS_REGION=<region> \
 //	  -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
 //	  ghcr.io/tinfoilsh/tinfoil-buckets-sidecar:<tag>
 //
 // Each test isolates itself under a random per-run owner so it never
 // collides with real tenants, and deletes everything it writes.
 
-const sidecarURLEnv = "BUCKETS_SIDECAR_URL"
+const (
+	sidecarURLEnv    = "BUCKETS_SIDECAR_URL"
+	sidecarBucketEnv = "BUCKETS_SIDECAR_BUCKET"
+)
 
 const integrationTimeout = 30 * time.Second
 
@@ -43,7 +48,11 @@ func newSidecarClient(t *testing.T) *Client {
 	if url == "" {
 		t.Skipf("set %s to a running multitenant tinfoil-buckets-sidecar to run this test", sidecarURLEnv)
 	}
-	return NewClient(url, nil)
+	bucket := os.Getenv(sidecarBucketEnv)
+	if bucket == "" {
+		t.Skipf("set %s to a bucket the sidecar's credentials can reach", sidecarBucketEnv)
+	}
+	return NewClient(url, bucket, nil)
 }
 
 func randomHex(t *testing.T, n int) string {

@@ -69,6 +69,7 @@ See [`LOCAL_TESTING.md`](./LOCAL_TESTING.md) for the full runbook, including the
 | `SYNC_ENCLAVE_SECRET` | - | Shared service secret used to authenticate the enclave to the controlplane. Required. |
 | `CLERK_AUDIENCE` | - | Expected `aud` claim on incoming JWTs. When unset, audience is not enforced. |
 | `BUCKETS_URL` | - | Base URL of the buckets sidecar used for attachment storage. When unset, attachment routes return 503 and rewrap / wipe paths skip bucket cleanup. |
+| `CHAT_ATTACHMENTS_BUCKET` | - | S3 bucket name sent in the sidecar's path-style request URL. The sidecar routes to whatever bucket the path names, so this must be set alongside `BUCKETS_URL`; when unset the buckets client is treated as unconfigured. |
 | `LISTEN_ADDR` | `:8089` | Address the enclave HTTP server listens on. |
 | `GIT_SHA` | `unknown` | Build identifier reported by the health endpoint. Normally injected at build time via `-ldflags`. |
 

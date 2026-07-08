@@ -62,6 +62,7 @@ func main() {
 
 	bucketsClient := buckets.NewClient(
 		os.Getenv("BUCKETS_URL"),
+		os.Getenv("CHAT_ATTACHMENTS_BUCKET"),
 		&http.Client{Timeout: server.AttachmentRequestTimeout},
 	)
 	// An unconfigured buckets client is a soft failure: the
@@ -71,7 +72,7 @@ func main() {
 	// without BUCKETS_URL set; refusing to start would block every
 	// non-attachment flow as well.
 	if !bucketsClient.Configured() {
-		log.Printf("WARN: buckets backend not configured (BUCKETS_URL unset); attachment routes will return 503")
+		log.Printf("WARN: buckets backend not configured (BUCKETS_URL or CHAT_ATTACHMENTS_BUCKET unset); attachment routes will return 503")
 	}
 
 	logger := stdLogger{}
