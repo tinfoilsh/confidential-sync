@@ -15,6 +15,7 @@ containers:
     env:
       - CONTROLPLANE_URL: "https://api.tinfoil.sh"
       - BUCKETS_URL: "http://buckets:9000"
+      - CHAT_ATTACHMENTS_BUCKET: "sync-chat-attachments"
       - CLERK_ISSUER: "https://clerk.tinfoil.sh"
     secrets:
       - SYNC_ENCLAVE_SECRET
@@ -25,12 +26,11 @@ containers:
       start_period: 5m
 
   - name: "buckets"
-    image: "ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:a0f5fd6a3dbdb0a95799ae687e127bb544b7998221458ae1face3fc8c3f43f30"
+    image: "ghcr.io/tinfoilsh/tinfoil-buckets-sidecar@sha256:03d43dd687a5ed352f3d4956db6af706ec9dee8ca2c0fbce651ee59317b2ede5"
     restart: always
     networks: [web]
     env:
       - PORT: "9000"
-      - BUCKET: "tinfoil-bucket-273354634536-us-east-2-an"
       - AWS_REGION: "us-east-2"
       - MULTITENANT: "true"
     secrets:

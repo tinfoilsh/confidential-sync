@@ -17,6 +17,7 @@ const (
 	testOwner      = "user_test"
 	testOtherOwner = "user_other"
 	testToken      = "************************************"
+	testBucket     = "test-attachments-bucket"
 )
 
 // newStubbedClient wires a client to an in-memory sidecar stub that
@@ -26,11 +27,11 @@ func newStubbedClient(t *testing.T) (*bucketstub.Store, *Client) {
 	t.Helper()
 	store := bucketstub.NewStore()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/bucket/{key}", store.Handle)
-	mux.HandleFunc("/bucket", store.Handle)
+	mux.HandleFunc("/"+testBucket+"/{key}", store.Handle)
+	mux.HandleFunc("/"+testBucket, store.Handle)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return store, NewClient(srv.URL, srv.Client())
+	return store, NewClient(srv.URL, testBucket, srv.Client())
 }
 
 func TestClientPutGetRoundTrip(t *testing.T) {
@@ -132,7 +133,8 @@ func TestClientRejectsInvalidOwner(t *testing.T) {
 }
 
 // TestClientPutWireContract locks the on-the-wire shape the sidecar
-// requires: a path-style PUT to /{bucket}/{key}, the two multitenant
+// requires: a path-style PUT to /{bucket}/{key} where {bucket} is the
+// configured bucket the sidecar routes to, the two multitenant
 // headers, a 32-byte base64 key, and an explicit Content-Length.
 func TestClientPutWireContract(t *testing.T) {
 	key := bytes.Repeat([]byte{9}, encryptionKeySize)
@@ -156,7 +158,7 @@ func TestClientPutWireContract(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := NewClient(srv.URL, srv.Client())
+	c := NewClient(srv.URL, testBucket, srv.Client())
 	if err := c.Put(context.Background(), testOwner, testToken, plaintext, key); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestClientPutWireContract(t *testing.T) {
 	if gotMethod != http.MethodPut {
 		t.Errorf("method = %s, want PUT", gotMethod)
 	}
-	if want := "/" + bucketPathSegment + "/" + testToken; gotPath != want {
+	if want := "/" + testBucket + "/" + testToken; gotPath != want {
 		t.Errorf("path = %s, want %s", gotPath, want)
 	}
 	if want := tenantPrefix + testOwner; gotTenant != want {

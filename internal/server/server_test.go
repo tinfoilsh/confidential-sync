@@ -589,7 +589,7 @@ func newFixture(t *testing.T) *fixture {
 	cpClient := controlplane.NewClient(cp.server.URL, nil)
 
 	bk := newBucketsStub(t)
-	bkClient := buckets.NewClient(bk.server.URL, nil)
+	bkClient := buckets.NewClient(bk.server.URL, testBucketName, nil)
 
 	deps := Deps{Controlplane: cpClient, Buckets: bkClient, GitSHA: "test-sha"}
 	handler := NewHandler(deps, v, nil)

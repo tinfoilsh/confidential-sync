@@ -124,8 +124,8 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("GET /api/sync/attachment-owner/{aid}", s.attachmentOwner)
 	mux.HandleFunc("POST /api/sync/pending-attachments/{aid}", s.reservePendingAttachment)
 	mux.HandleFunc("POST /api/sync/pending-attachments/sweep", s.sweepPendingAttachments)
-	mux.HandleFunc("/bucket/{key}", s.buckets.Handle)
-	mux.HandleFunc("/bucket", s.buckets.Handle)
+	mux.HandleFunc("/"+LocalStackBucketsBucket+"/{key}", s.buckets.Handle)
+	mux.HandleFunc("/"+LocalStackBucketsBucket, s.buckets.Handle)
 	s.mux = mux
 	return s
 }
@@ -139,6 +139,10 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 const LocalStackSyncEnclaveSecret = "local-stack-sync-enclave-secret"
+
+// LocalStackBucketsBucket is the bucket name the stubbed sidecar
+// serves and the enclave's buckets client is configured with.
+const LocalStackBucketsBucket = "local-stack-bucket"
 
 // -----------------------------------------------------------------------------
 // Test-facing poke API. Holding the stub's mutex while calling these is

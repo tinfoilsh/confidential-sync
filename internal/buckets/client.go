@@ -64,12 +64,6 @@ const (
 	// match the sidecar's [A-Za-z0-9_-]{1,64} rule.
 	tenantPrefix = "user-"
 
-	// bucketPathSegment is the {bucket} segment of the path-style S3
-	// URL. The sidecar ignores it and routes to its own configured
-	// BUCKET, so the value is cosmetic; it only has to be a valid
-	// non-empty path segment.
-	bucketPathSegment = "bucket"
-
 	headerTenantID      = "X-Tinfoil-Tenant-Id"
 	headerEncryptionKey = "X-Tinfoil-Encryption-Key"
 
@@ -97,24 +91,30 @@ var deleteKeyPlaceholder = make([]byte, encryptionKeySize)
 // encryption key headers.
 type Client struct {
 	baseURL    string
+	bucket     string
 	httpClient *http.Client
 }
 
-func NewClient(baseURL string, httpClient *http.Client) *Client {
+// NewClient builds a sidecar client. bucket is the S3 bucket the
+// sidecar routes to: it honors whatever bucket the request path names
+// (path-style `/{bucket}/{key}`), with IAM on the sidecar's
+// credentials as the enforcement point for reachability.
+func NewClient(baseURL, bucket string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
+		bucket:     bucket,
 		httpClient: httpClient,
 	}
 }
 
-// Configured reports whether the client has a sidecar URL. Callers use
-// this to fail fast with a clean 503 when the service isn't wired up
-// (local dev, smoke tests).
+// Configured reports whether the client has both a sidecar URL and a
+// bucket. Callers use this to fail fast with a clean 503 when the
+// service isn't wired up (local dev, smoke tests).
 func (c *Client) Configured() bool {
-	return c != nil && c.baseURL != ""
+	return c != nil && c.baseURL != "" && c.bucket != ""
 }
 
 // Put stores plaintext for owner at the given access token, encrypted
@@ -229,7 +229,7 @@ func (c *Client) Delete(ctx context.Context, owner, accessToken string) error {
 }
 
 func (c *Client) objectURL(accessToken string) string {
-	return c.baseURL + "/" + bucketPathSegment + "/" + accessToken
+	return c.baseURL + "/" + c.bucket + "/" + accessToken
 }
 
 func (c *Client) setTenantHeaders(req *http.Request, tenant string, key []byte) {

@@ -22,6 +22,11 @@ type bucketsStub struct {
 
 type bucketsItem = bucketstub.Item
 
+// testBucketName is the bucket the buckets.Client under test is
+// configured with; the stub only serves paths under this bucket, so a
+// client that addressed a different bucket would 404.
+const testBucketName = "test-attachments-bucket"
+
 func newBucketsStub(t *testing.T) *bucketsStub {
 	t.Helper()
 	s := &bucketsStub{
@@ -29,8 +34,8 @@ func newBucketsStub(t *testing.T) *bucketsStub {
 	}
 	s.items = bucketstub.NewStore()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/bucket/{key}", s.items.Handle)
-	mux.HandleFunc("/bucket", s.items.Handle)
+	mux.HandleFunc("/"+testBucketName+"/{key}", s.items.Handle)
+	mux.HandleFunc("/"+testBucketName, s.items.Handle)
 	s.server = httptest.NewServer(mux)
 	t.Cleanup(s.server.Close)
 	return s
