@@ -664,7 +664,7 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 	// so the cascade is fire-and-forget per-id and never fails the
 	// register-key call.
 	deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
-	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
+	return &KeyRegisterResponse{OK: true, KeyID: kidHex, SearchIndexFenced: cpResp.SearchIndexFenced}, nil
 }
 
 func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleRequest) (*OKResponse, error) {

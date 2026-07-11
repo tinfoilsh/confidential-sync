@@ -443,7 +443,8 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 	}
 	s.keys[body.KeyID] = struct{}{}
 	s.currentKID = body.KeyID
-	if body.CreatedVia == "start_fresh" || (previousKID != "" && previousKID != body.KeyID) {
+	searchIndexFenced := body.CreatedVia == "start_fresh" || (previousKID != "" && previousKID != body.KeyID)
+	if searchIndexFenced {
 		state := s.currentSearchState()
 		s.searchState = controlplane.SearchIndexState{
 			PublicationGeneration: state.PublicationGeneration + 1,
@@ -462,6 +463,9 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 	// start_fresh. wipedV2Attachments stays empty unless the test
 	// pre-seeded it via s.wipedAttachments.
 	w.Header().Set("Content-Type", "application/json")
+	if searchIndexFenced {
+		w.Header().Set(controlplane.HeaderSearchIndexFenced, "true")
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":                   true,
 		"key_id":               body.KeyID,

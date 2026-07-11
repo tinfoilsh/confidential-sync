@@ -128,8 +128,9 @@ type KeyRegisterBundleInput struct {
 }
 
 type KeyRegisterResponse struct {
-	OK    bool   `json:"ok"`
-	KeyID string `json:"key_id"`
+	OK                bool   `json:"ok"`
+	KeyID             string `json:"key_id"`
+	SearchIndexFenced bool   `json:"-"`
 }
 
 type AddBundleRequest struct {

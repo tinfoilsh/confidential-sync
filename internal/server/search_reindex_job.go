@@ -75,14 +75,18 @@ func newSearchReindexJob(userID string, keyFP [sha256.Size]byte) *SearchReindexJ
 	}
 }
 
-// reindexKeyFingerprint hashes the primary key for job identity.
-// Failed coverage keeps a job partial and immediately retryable, while
-// unused trailing-key variants cannot bypass clean-job deduplication.
+// reindexKeyFingerprint hashes the normalized key set for job identity.
+// A request with additional legacy keys can decrypt more of the corpus
+// and must replace a running job that lacks them.
 func reindexKeyFingerprint(keys []PullKey) [sha256.Size]byte {
-	if len(keys) == 0 {
-		return [sha256.Size]byte{}
+	h := sha256.New()
+	for _, key := range keys {
+		_, _ = h.Write([]byte(key.Key))
+		_, _ = h.Write([]byte{0})
 	}
-	return sha256.Sum256([]byte(keys[0].Key))
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], h.Sum(nil))
+	return fingerprint
 }
 
 func (j *SearchReindexJob) reportPage(page *searchReindexPageResult) {

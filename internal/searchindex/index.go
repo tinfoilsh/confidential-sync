@@ -316,6 +316,9 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	if id == "" {
 		return errors.New("searchindex: id is required")
 	}
+	if e.SourceRevision < 0 {
+		return errors.New("searchindex: entry source revision is negative")
+	}
 	if len(e.Vectors) > MaxChunksPerChat {
 		return fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
 	}

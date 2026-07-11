@@ -504,15 +504,20 @@ func TestReindexRestartPolicy(t *testing.T) {
 		{Key: legacyKey},
 		{Key: f.userKeyB64},
 	}}, tok)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("equivalent key-set re-kick: status %d body %s, want 200", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expanded key-set re-kick: status %d body %s, want 202", resp.StatusCode, body)
 	}
-	var equivalent SearchReindexStatusResponse
-	if err := json.Unmarshal(body, &equivalent); err != nil {
+	var expanded SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &expanded); err != nil {
 		t.Fatal(err)
 	}
-	if equivalent.JobID != clean.JobID {
-		t.Fatalf("trailing key variants bypassed retained-job dedup: got %s want %s", equivalent.JobID, clean.JobID)
+	if expanded.JobID == clean.JobID {
+		t.Fatal("additional legacy key did not start a repair job")
+	}
+	select {
+	case <-f.handler.reindexCoordinator.Status(f.userSub).Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("expanded-key repair job did not finish")
 	}
 
 	fp := reindexKeyFingerprint([]PullKey{{Key: f.userKeyB64}})
@@ -764,6 +769,72 @@ func TestStartFreshClearsSearchState(t *testing.T) {
 	}
 }
 
+func TestKeyRegistrationReplayKeepsRebuiltSearchIndex(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_old", "Pond", "a duck swam by")
+
+	newKeyBytes := bytes.Repeat([]byte{9}, cryptopkg.KeySize)
+	newKey := base64.StdEncoding.EncodeToString(newKeyBytes)
+	newKeyIDBytes, err := cryptopkg.DeriveKeyID(newKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKeyID := cryptopkg.KeyIDHex(newKeyIDBytes)
+	var calls int
+	f.cp.mu.Lock()
+	f.cp.registerHandler = func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			state := f.cp.currentSearchState()
+			f.cp.currentKID = newKeyID
+			f.cp.searchState = controlplane.SearchIndexState{
+				PublicationGeneration: state.PublicationGeneration + 1,
+				FenceGeneration:       state.FenceGeneration + 1,
+				PublicationIncomplete: true,
+			}
+			w.Header().Set(controlplane.HeaderSearchIndexFenced, "true")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":                   true,
+			"key_id":               newKeyID,
+			"etag":                 "1",
+			"wiped_v2_attachments": []string{},
+		})
+	}
+	f.cp.mu.Unlock()
+
+	req := KeyRegisterRequest{
+		Key:            newKey,
+		IfMatch:        "*",
+		CreatedVia:     "start_fresh",
+		IdempotencyKey: "start-fresh-replay",
+	}
+	resp, body := f.post("/v1/key/register", req, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first register: status %d body %s", resp.StatusCode, body)
+	}
+
+	const rebuiltObject = "search-index-v1-1-00000000000000000000000000000001"
+	if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, rebuiltObject, []byte("rebuilt"), f.indexKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.cp.mu.Lock()
+	f.cp.searchState.ObjectKey = rebuiltObject
+	f.cp.searchState.KeyID = newKeyID
+	f.cp.searchState.Model = f.embedder.Model()
+	f.cp.mu.Unlock()
+
+	resp, body = f.post("/v1/key/register", req, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("replayed register: status %d body %s", resp.StatusCode, body)
+	}
+	if !f.searchBk.has(rebuiltObject) {
+		t.Fatal("replayed key registration deleted the rebuilt search index")
+	}
+}
+
 func TestStartFreshWithoutSearchStorage(t *testing.T) {
 	f := newFixture(t)
 	newKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, cryptopkg.KeySize))
@@ -919,11 +990,10 @@ func TestPushResponseEmitsSearchIndexedFalse(t *testing.T) {
 	}
 }
 
-// TestReindexDifferentKeyReplacesRunningJob covers a different key
-// set racing a rebuild: a kickoff with a different key set must not
-// join the old job (its output is sealed under a key the client did
-// not ask to use); it cancels the old job and starts a fresh rebuild.
-func TestReindexDifferentKeyReplacesRunningJob(t *testing.T) {
+// TestReindexDifferentKeySetReplacesRunningJob covers additional
+// decryption coverage racing a rebuild: a legacy-key repair must not
+// join a primary-only job that cannot decrypt the archived rows.
+func TestReindexDifferentKeySetReplacesRunningJob(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
@@ -937,9 +1007,13 @@ func TestReindexDifferentKeyReplacesRunningJob(t *testing.T) {
 		return nil
 	}
 
-	kick := func(key string) (int, SearchReindexStatusResponse) {
+	kick := func(keys ...string) (int, SearchReindexStatusResponse) {
 		t.Helper()
-		resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: key}}}, tok)
+		reqKeys := make([]PullKey, 0, len(keys))
+		for _, key := range keys {
+			reqKeys = append(reqKeys, PullKey{Key: key})
+		}
+		resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: reqKeys}, tok)
 		var status SearchReindexStatusResponse
 		if err := json.Unmarshal(body, &status); err != nil {
 			t.Fatalf("kickoff body %s: %v", body, err)
@@ -957,10 +1031,10 @@ func TestReindexDifferentKeyReplacesRunningJob(t *testing.T) {
 		t.Fatalf("same-key kickoff must join the running job: status %d job %s", code, again.JobID)
 	}
 
-	differentKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
-	code, second := kick(differentKey)
+	legacyKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	code, second := kick(f.userKeyB64, legacyKey)
 	if code != http.StatusAccepted || second.JobID == first.JobID {
-		t.Fatalf("different-key kickoff must start a fresh job: status %d job %s", code, second.JobID)
+		t.Fatalf("legacy-key repair must start a fresh job: status %d job %s", code, second.JobID)
 	}
 	select {
 	case <-oldJob.Done():

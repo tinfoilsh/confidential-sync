@@ -158,6 +158,30 @@ func TestRegisterKeyExistingDataConflict(t *testing.T) {
 	}
 }
 
+func TestRegisterKeyReportsSearchIndexFenceHeader(t *testing.T) {
+	st := newStub(t)
+	st.handle1("POST", "/api/sync/keys", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderSearchIndexFenced, "true")
+		json.NewEncoder(w).Encode(map[string]string{
+			"key_id": strings.Repeat("a", 32),
+			"etag":   "1",
+		})
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.RegisterKey(context.Background(), RegisterKeyRequest{
+		JWT:        "j",
+		KeyIDHex:   strings.Repeat("a", 32),
+		CreatedVia: "start_fresh",
+		IfMatch:    "*",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.SearchIndexFenced {
+		t.Fatal("search index fence header was not surfaced")
+	}
+}
+
 func TestGetBlobReturnsCiphertextAndHeaders(t *testing.T) {
 	st := newStub(t)
 	st.handle1("GET", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {

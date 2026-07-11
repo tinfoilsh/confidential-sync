@@ -321,9 +321,7 @@ func (h *Handler) registerKey(w http.ResponseWriter, r *http.Request, sess Sessi
 		writeError(w, err)
 		return
 	}
-	keyChanged := req.CreatedVia == "start_fresh" ||
-		(req.IfMatch != "*" && req.IfMatch != resp.KeyID)
-	if keyChanged {
+	if resp.SearchIndexFenced {
 		if err := resetSearchForUser(r.Context(), h.deps, h.reindexCoordinator, sess.Claims.Subject, oldSearchObject); err != nil {
 			h.deps.logError("key-change search reset failed: user=%s err=%v", sess.Claims.Subject, err)
 			writeError(w, err)

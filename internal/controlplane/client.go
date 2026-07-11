@@ -65,17 +65,18 @@ func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client 
 // the enclave returns to its own clients but the controlplane does not
 // emit.
 const (
-	HeaderAuth          = "Authorization"
-	HeaderKeyID         = "X-Key-Id"
-	HeaderIfMatch       = "If-Match"
-	HeaderIdempotency   = "X-Idempotency-Key"
-	HeaderOperationHash = "X-Operation-Hash"
-	HeaderMessageCount  = "X-Message-Count"
-	HeaderProjectID     = "X-Project-Id"
-	HeaderProjectIDSet  = "X-Project-Id-Set"
-	HeaderETag          = "ETag"
-	HeaderContentType   = "Content-Type"
-	HeaderServiceSecret = "X-Sync-Enclave-Secret"
+	HeaderAuth              = "Authorization"
+	HeaderKeyID             = "X-Key-Id"
+	HeaderIfMatch           = "If-Match"
+	HeaderIdempotency       = "X-Idempotency-Key"
+	HeaderOperationHash     = "X-Operation-Hash"
+	HeaderMessageCount      = "X-Message-Count"
+	HeaderProjectID         = "X-Project-Id"
+	HeaderProjectIDSet      = "X-Project-Id-Set"
+	HeaderETag              = "ETag"
+	HeaderSearchIndexFenced = "X-Search-Index-Fenced"
+	HeaderContentType       = "Content-Type"
+	HeaderServiceSecret     = "X-Sync-Enclave-Secret"
 	// HeaderClerkUserID carries the user id the enclave already
 	// verified out of the user's JWT. Paired with HeaderServiceSecret
 	// it stands in for a fresh Clerk bearer token on the
@@ -802,6 +803,7 @@ type RegisterKeyResponse struct {
 	OK                 bool     `json:"ok"`
 	KeyID              string   `json:"key_id"`
 	ETag               string   `json:"etag"`
+	SearchIndexFenced  bool     `json:"-"`
 	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
 }
 
@@ -841,6 +843,7 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) (*Regi
 			return nil, fmt.Errorf("controlplane: decode register-key response: %w", err)
 		}
 	}
+	out.SearchIndexFenced = strings.EqualFold(resp.Header.Get(HeaderSearchIndexFenced), "true")
 	return out, nil
 }
 

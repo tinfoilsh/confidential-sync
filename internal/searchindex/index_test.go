@@ -107,6 +107,16 @@ func TestUpsertValidatesVectors(t *testing.T) {
 	if !reflect.DeepEqual(after, before) {
 		t.Fatal("rejected upsert mutated the index")
 	}
+	if err := ix.Upsert("negative-revision", Entry{SourceRevision: -1}, nil); err == nil {
+		t.Fatal("expected negative source revision error")
+	}
+	after, err = ix.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("negative source revision mutated the index")
+	}
 
 	mustUpsert(t, ix, "a", Entry{Vectors: []Vector{{1, 0}}}, nil)
 	if err := ix.Upsert("b", Entry{Vectors: []Vector{{1, 0, 0}}}, nil); err == nil {

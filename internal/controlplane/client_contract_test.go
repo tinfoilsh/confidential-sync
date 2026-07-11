@@ -19,16 +19,17 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 	t.Run("headers", func(t *testing.T) {
 		t.Parallel()
 		cases := map[string]struct{ have, want string }{
-			"HeaderKeyID":         {HeaderKeyID, "X-Key-Id"},
-			"HeaderIfMatch":       {HeaderIfMatch, "If-Match"},
-			"HeaderIdempotency":   {HeaderIdempotency, "X-Idempotency-Key"},
-			"HeaderOperationHash": {HeaderOperationHash, "X-Operation-Hash"},
-			"HeaderMessageCount":  {HeaderMessageCount, "X-Message-Count"},
-			"HeaderProjectID":     {HeaderProjectID, "X-Project-Id"},
-			"HeaderProjectIDSet":  {HeaderProjectIDSet, "X-Project-Id-Set"},
-			"HeaderETag":          {HeaderETag, "ETag"},
-			"HeaderLegacyClaim":   {HeaderLegacyClaim, "X-Legacy-Claim"},
-			"HeaderClerkUserID":   {HeaderClerkUserID, "X-Clerk-User-Id"},
+			"HeaderKeyID":             {HeaderKeyID, "X-Key-Id"},
+			"HeaderIfMatch":           {HeaderIfMatch, "If-Match"},
+			"HeaderIdempotency":       {HeaderIdempotency, "X-Idempotency-Key"},
+			"HeaderOperationHash":     {HeaderOperationHash, "X-Operation-Hash"},
+			"HeaderMessageCount":      {HeaderMessageCount, "X-Message-Count"},
+			"HeaderProjectID":         {HeaderProjectID, "X-Project-Id"},
+			"HeaderProjectIDSet":      {HeaderProjectIDSet, "X-Project-Id-Set"},
+			"HeaderETag":              {HeaderETag, "ETag"},
+			"HeaderSearchIndexFenced": {HeaderSearchIndexFenced, "X-Search-Index-Fenced"},
+			"HeaderLegacyClaim":       {HeaderLegacyClaim, "X-Legacy-Claim"},
+			"HeaderClerkUserID":       {HeaderClerkUserID, "X-Clerk-User-Id"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {
@@ -55,6 +56,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"StatusStaleBlob":                 {StatusStaleBlob, "STALE_BLOB"},
 			"StatusExistingDataUnderOtherKey": {StatusExistingDataUnderOtherKey, "EXISTING_DATA_UNDER_OTHER_KEY"},
 			"StatusIdempotencyConflict":       {StatusIdempotencyConflict, "IDEMPOTENCY_CONFLICT"},
+			"StatusSearchIndexConflict":       {StatusSearchIndexConflict, "SEARCH_INDEX_CONFLICT"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {

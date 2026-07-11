@@ -49,6 +49,7 @@ type searchUserInferenceLimit struct {
 
 type searchInferenceGate struct {
 	mu          sync.Mutex
+	rateMu      sync.Mutex
 	limits      searchInferenceLimits
 	global      *rate.Limiter
 	globalSlots chan struct{}
@@ -122,7 +123,7 @@ func (g *searchInferenceGate) acquire(ctx context.Context, userID string, inputs
 	limiter := user.foreground
 	if wait {
 		limiter = user.background
-		if !waitForSearchInferenceRate(ctx, limiter, g.global, inputs) {
+		if !waitForSearchInferenceRate(ctx, g, limiter, inputs) {
 			finish()
 			return nil, searchInferenceLimited()
 		}
@@ -136,7 +137,7 @@ func (g *searchInferenceGate) acquire(ctx context.Context, userID string, inputs
 		finish()
 		return nil, searchInferenceLimited()
 	}
-	if !wait && (!limiter.AllowN(time.Now(), inputs) || !g.global.AllowN(time.Now(), inputs)) {
+	if !wait && !g.reserveRate(limiter, inputs) {
 		<-g.globalSlots
 		<-user.slots
 		finish()
@@ -149,16 +150,14 @@ func (g *searchInferenceGate) acquire(ctx context.Context, userID string, inputs
 	}, nil
 }
 
-func waitForSearchInferenceRate(ctx context.Context, user, global *rate.Limiter, inputs int) bool {
-	if inputs > user.Burst() || inputs > global.Burst() {
+func waitForSearchInferenceRate(ctx context.Context, gate *searchInferenceGate, user *rate.Limiter, inputs int) bool {
+	if inputs > user.Burst() || inputs > gate.global.Burst() {
 		return false
 	}
 	ticker := time.NewTicker(searchLimiterRetryInterval)
 	defer ticker.Stop()
 	for {
-		now := time.Now()
-		if user.TokensAt(now) >= float64(inputs) && global.TokensAt(now) >= float64(inputs) &&
-			user.AllowN(now, inputs) && global.AllowN(now, inputs) {
+		if gate.reserveRate(user, inputs) {
 			return true
 		}
 		select {
@@ -167,6 +166,29 @@ func waitForSearchInferenceRate(ctx context.Context, user, global *rate.Limiter,
 		case <-ticker.C:
 		}
 	}
+}
+
+func (g *searchInferenceGate) reserveRate(user *rate.Limiter, inputs int) bool {
+	now := time.Now()
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+
+	userReservation := user.ReserveN(now, inputs)
+	if !userReservation.OK() || userReservation.DelayFrom(now) > 0 {
+		if userReservation.OK() {
+			userReservation.CancelAt(now)
+		}
+		return false
+	}
+	globalReservation := g.global.ReserveN(now, inputs)
+	if !globalReservation.OK() || globalReservation.DelayFrom(now) > 0 {
+		if globalReservation.OK() {
+			globalReservation.CancelAt(now)
+		}
+		userReservation.CancelAt(now)
+		return false
+	}
+	return true
 }
 
 func takeSearchInferenceSlot(ctx context.Context, slots chan struct{}, wait bool) bool {

@@ -906,12 +906,11 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 // searchReindexPageResult reports one page of a rebuild. NextCursor
 // feeds the next page; Done means the chat listing is drained.
 type searchReindexPageResult struct {
-	Indexed         int
-	Failed          int
-	RetryableFailed bool
-	NextCursor      string
-	Done            bool
-	TotalIndexed    int
+	Indexed      int
+	Failed       int
+	NextCursor   string
+	Done         bool
+	TotalIndexed int
 }
 
 // searchReindexPage rebuilds one page of the caller's index from the
@@ -954,14 +953,10 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 	}
 	var page []pending
 	failed := 0
-	retryableFailed := false
 	var texts []string
 	for _, item := range pull.Items {
 		if !item.OK {
 			failed++
-			if item.Code == CodeNetwork {
-				retryableFailed = true
-			}
 			continue
 		}
 		plaintext, err := base64.StdEncoding.DecodeString(item.Plaintext)
@@ -1072,12 +1067,11 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 			return nil, err
 		}
 		resp := &searchReindexPageResult{
-			Indexed:         indexed,
-			Failed:          attemptFailed,
-			RetryableFailed: retryableFailed,
-			NextCursor:      pull.NextCursor,
-			Done:            pull.NextCursor == "",
-			TotalIndexed:    len(ix.Chats),
+			Indexed:      indexed,
+			Failed:       attemptFailed,
+			NextCursor:   pull.NextCursor,
+			Done:         pull.NextCursor == "",
+			TotalIndexed: len(ix.Chats),
 		}
 		deps.logInfo("search reindex page ok: user=%s indexed=%d failed=%d done=%t total=%d",
 			sess.Claims.Subject, indexed, attemptFailed, resp.Done, resp.TotalIndexed)
