@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"sort"
 	"sync"
 	"time"
 )
@@ -22,6 +24,8 @@ import (
 // never persisted.
 
 const (
+	maxSearchReindexKeys = 8
+
 	// SearchReindexJobBudget caps one rebuild run. Sized for ~10k
 	// chats: ~600 embedding batches at a few hundred ms each.
 	SearchReindexJobBudget = 10 * time.Minute
@@ -71,18 +75,14 @@ func newSearchReindexJob(userID string, keyFP [sha256.Size]byte) *SearchReindexJ
 	}
 }
 
-// reindexKeyFingerprint hashes the request's key set for job
-// identity. Only a digest is retained on the job, never the key
-// material itself.
+// reindexKeyFingerprint hashes the primary key for job identity.
+// Failed coverage keeps a job partial and immediately retryable, while
+// unused trailing-key variants cannot bypass clean-job deduplication.
 func reindexKeyFingerprint(keys []PullKey) [sha256.Size]byte {
-	h := sha256.New()
-	for _, k := range keys {
-		h.Write([]byte(k.Key))
-		h.Write([]byte{0})
+	if len(keys) == 0 {
+		return [sha256.Size]byte{}
 	}
-	var fp [sha256.Size]byte
-	copy(fp[:], h.Sum(nil))
-	return fp
+	return sha256.Sum256([]byte(keys[0].Key))
 }
 
 func (j *SearchReindexJob) reportPage(page *searchReindexPageResult) {
@@ -209,7 +209,7 @@ func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps De
 			}
 			if existing.blocksRestart() {
 				c.mu.Unlock()
-				needsReindex, err := searchIndexNeedsReindex(parentCtx, deps, userID, req.Keys[0].Key)
+				needsReindex, err := searchIndexNeedsReindex(parentCtx, deps, sess, req.Keys[0].Key)
 				if err != nil {
 					return nil, false, err
 				}
@@ -254,6 +254,16 @@ func (c *SearchReindexCoordinator) Status(userID string) *SearchReindexJob {
 	return c.jobs[userID]
 }
 
+func (c *SearchReindexCoordinator) Cancel(userID string) {
+	c.mu.Lock()
+	job := c.jobs[userID]
+	delete(c.jobs, userID)
+	c.mu.Unlock()
+	if job != nil && job.cancel != nil {
+		job.cancel()
+	}
+}
+
 func (c *SearchReindexCoordinator) run(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob, predecessor *SearchReindexJob) {
 	defer job.cancel()
 	if predecessor != nil {
@@ -292,14 +302,24 @@ func (c *SearchReindexCoordinator) deleteIfSame(job *SearchReindexJob) {
 // the partially-built index is still valid (it simply misses the
 // undrained chats) and a fresh kickoff rebuilds from scratch.
 func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob) error {
+	publication, err := deps.Controlplane.GetSearchIndexState(ctx, sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		if ctx.Err() != nil {
+			job.markPartial()
+			return nil
+		}
+		return err
+	}
+	targetSourceRevision := publication.SourceRevision
 	cursor := ""
+	coverageFailure := false
 	for {
 		if ctx.Err() != nil {
 			job.markPartial()
 			deps.logInfo("search reindex job stopped at budget: user=%s job=%s", job.UserID, job.ID)
 			return nil
 		}
-		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, job.StartedAt)
+		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, job.StartedAt, targetSourceRevision, coverageFailure)
 		if err != nil {
 			// A budget expiry mid-page surfaces as a context error
 			// wrapped in upstream failures; report it as partial
@@ -312,6 +332,10 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			return err
 		}
 		job.reportPage(page)
+		if page.Failed > 0 {
+			job.markPartial()
+			coverageFailure = true
+		}
 		if page.Done {
 			return nil
 		}
@@ -319,17 +343,37 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 	}
 }
 
-// validateSearchReindexRequest runs synchronous shape checks before
-// any coordinator state is touched, so malformed keys surface as an
-// immediate 400 instead of an async "failed" status.
-func validateSearchReindexRequest(req SearchReindexRequest) error {
+// normalizeSearchReindexRequest runs synchronous shape checks before
+// any coordinator state is touched, then canonicalizes and dedupes the
+// bounded key set so equivalent requests share one job identity.
+func normalizeSearchReindexRequest(req SearchReindexRequest) (SearchReindexRequest, error) {
 	if len(req.Keys) == 0 {
-		return badRequest("keys is required and must not be empty")
+		return SearchReindexRequest{}, badRequest("keys is required and must not be empty")
 	}
-	_, cleanup, err := decodeKeys(req.Keys)
+	if len(req.Keys) > maxSearchReindexKeys {
+		return SearchReindexRequest{}, badRequest("too many keys")
+	}
+	keys, cleanup, err := decodeKeys(req.Keys)
 	if err != nil {
-		return err
+		return SearchReindexRequest{}, err
 	}
-	cleanup()
-	return nil
+	defer cleanup()
+
+	normalized := make([]PullKey, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, duplicate := seen[key.KeyIDHex]; duplicate {
+			continue
+		}
+		seen[key.KeyIDHex] = struct{}{}
+		normalized = append(normalized, PullKey{
+			Key:   base64.StdEncoding.EncodeToString(key.Bytes),
+			KeyID: key.KeyIDHex,
+		})
+	}
+	legacy := normalized[1:]
+	sort.Slice(legacy, func(i, j int) bool {
+		return legacy[i].KeyID < legacy[j].KeyID
+	})
+	return SearchReindexRequest{Keys: normalized}, nil
 }

@@ -36,12 +36,11 @@ type searchCacheEntry struct {
 // the LRU budget and gone on enclave restart. Storage remains the
 // source of truth: every mutation is persisted before it is served.
 //
-// Coherence model: this process is the only writer of index objects
-// (per-user RW locks serialize all mutations), so a cached index can
-// only go stale if the stored object is changed out-of-band. Entries
-// are bound to a hash of the encryption key they were loaded under,
-// so a different key is detected as a mismatch and falls through to
-// storage. All methods are safe on a nil receiver (cache disabled).
+// Coherence model: controlplane publication metadata selects an
+// immutable object. Entries are bound to a hash of that object key and
+// its encryption key, so another replica's publication or a key change
+// misses the cache and reloads storage. All methods are safe on a nil
+// receiver (cache disabled).
 type searchIndexCache struct {
 	mu      sync.Mutex
 	budget  int
@@ -58,9 +57,7 @@ func newSearchIndexCache(budget int) *searchIndexCache {
 	}
 }
 
-// get returns the cached index for owner if it was cached under the
-// same key. A key-hash mismatch drops the stale entry and the caller
-// falls through to storage.
+// get returns the cached index for owner if its cache identity matches.
 func (c *searchIndexCache) get(owner string, keyHash [sha256.Size]byte) (*searchindex.Index, bool) {
 	if c == nil {
 		return nil, false

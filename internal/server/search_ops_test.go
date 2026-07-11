@@ -157,6 +157,22 @@ func newSearchFixture(t *testing.T) *searchFixture {
 	return &searchFixture{fixture: f, searchBk: sbk, embedder: emb}
 }
 
+func (f *searchFixture) searchObjectKey(t *testing.T) string {
+	t.Helper()
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	if f.cp.searchState.ObjectKey == "" {
+		t.Fatal("search index has not been published")
+	}
+	return f.cp.searchState.ObjectKey
+}
+
+func (f *searchFixture) sourceRevision() int64 {
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	return f.cp.sourceRevision
+}
+
 func (f *searchFixture) pushChat(t *testing.T, tok, id, title, content string) PushResponse {
 	t.Helper()
 	chat := map[string]any{
@@ -209,13 +225,14 @@ func TestPushIndexesChatAndSemanticSearchFinds(t *testing.T) {
 	}
 	f.pushChat(t, tok, "chat_tax", "Paperwork", "filing my tax return before the deadline")
 
-	if !f.searchBk.has(searchIndexObjectKey) {
+	objectKey := f.searchObjectKey(t)
+	if !f.searchBk.has(objectKey) {
 		t.Fatal("search index object not stored in search bucket")
 	}
-	if f.bk.has(searchIndexObjectKey) {
+	if f.bk.has(objectKey) {
 		t.Fatal("search index leaked into the attachments bucket")
 	}
-	if item, ok := f.searchBk.item(searchIndexObjectKey); !ok || len(item.Value) < 2 || item.Value[0] != 0x1f || item.Value[1] != 0x8b {
+	if item, ok := f.searchBk.item(objectKey); !ok || len(item.Value) < 2 || item.Value[0] != 0x1f || item.Value[1] != 0x8b {
 		t.Fatal("stored index is not gzip-compressed")
 	}
 
@@ -243,7 +260,7 @@ func (f *searchFixture) loadIndex(t *testing.T) *searchindex.Index {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := f.handler.deps.SearchBuckets.Get(context.Background(), f.userSub, searchIndexObjectKey, indexKey)
+	raw, err := f.handler.deps.SearchBuckets.Get(context.Background(), f.userSub, f.searchObjectKey(t), indexKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,11 +317,11 @@ func TestLongChatIsChunkedAndFindableByLatePassage(t *testing.T) {
 	}
 }
 
-func TestSearchQueryReportsNeedsReindexWithoutIndex(t *testing.T) {
+func TestSearchQueryTreatsEmptySourceAsComplete(t *testing.T) {
 	f := newSearchFixture(t)
 	got := f.query(t, f.jwt(), "anything")
-	if !got.NeedsReindex || got.TotalIndexed != 0 || len(got.Results) != 0 {
-		t.Fatalf("expected empty needs_reindex response, got %+v", got)
+	if got.NeedsReindex || got.TotalIndexed != 0 || len(got.Results) != 0 {
+		t.Fatalf("expected complete empty response, got %+v", got)
 	}
 	if f.embedder.callCount() != 0 {
 		t.Fatal("query on empty index should not call the embedder")
@@ -341,7 +358,7 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 
 	// Simulate a lost index. Out-of-band storage changes are invisible
 	// to the in-memory cache, so drop it too, as a restart would.
-	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
@@ -452,7 +469,7 @@ func TestSearchReindexPreservesChunkMappingAcrossEmbeddingBatches(t *testing.T) 
 		}
 	}
 
-	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
@@ -497,6 +514,9 @@ func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
 	got := f.query(t, tok, "duck")
 	if len(got.Results) != 1 || got.Results[0].ID != "chat_duck" {
 		t.Fatalf("expected lexical hit for 'duck', got %+v", got.Results)
+	}
+	if !got.NeedsReindex {
+		t.Fatal("lexical-only fallback did not request semantic repair")
 	}
 }
 

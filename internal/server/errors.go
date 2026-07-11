@@ -27,18 +27,19 @@ const (
 	CodeNotFound                  = "NOT_FOUND"
 	CodeNetwork                   = "NETWORK"
 	CodeUpstream                  = "UPSTREAM"
+	CodeRateLimited               = "RATE_LIMITED"
 	CodeInternal                  = "INTERNAL"
 )
 
 // AppError is the wire representation of a non-2xx response. Extra context
 // fields (current_etag, current_key_id, reason) are folded in when relevant.
 type AppError struct {
-	Status        int    `json:"-"`
-	Code          string `json:"code"`
-	Message       string `json:"message,omitempty"`
-	CurrentKeyID  string `json:"current_key_id,omitempty"`
-	CurrentETag   string `json:"current_etag,omitempty"`
-	Reason        string `json:"reason,omitempty"`
+	Status       int    `json:"-"`
+	Code         string `json:"code"`
+	Message      string `json:"message,omitempty"`
+	CurrentKeyID string `json:"current_key_id,omitempty"`
+	CurrentETag  string `json:"current_etag,omitempty"`
+	Reason       string `json:"reason,omitempty"`
 }
 
 func (a *AppError) Error() string {

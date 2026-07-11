@@ -44,6 +44,28 @@ func TestDecodeHostileInputsDoNotPanic(t *testing.T) {
 	}
 }
 
+func FuzzDecodeNeverPanics(f *testing.F) {
+	f.Add([]byte(`{"version":1,"chats":{}}`))
+	f.Add([]byte(`{"version":1,"slots":["a"],"chats":{"a":{"slot":0}},"postings":{"duck":[0]}}`))
+	f.Add([]byte(`{"version":1,"slots":[`))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 1<<20 {
+			t.Skip()
+		}
+		ix, err := Decode(raw)
+		if err != nil {
+			return
+		}
+		encoded, err := ix.Encode()
+		if err != nil {
+			t.Fatalf("decoded index could not be re-encoded: %v", err)
+		}
+		if _, err := Decode(encoded); err != nil {
+			t.Fatalf("encoded index could not be decoded: %v", err)
+		}
+	})
+}
+
 func TestDecodeAcceptsTombstonesAndEmptyIndex(t *testing.T) {
 	empty, err := Decode([]byte(`{"version":1,"chats":{}}`))
 	if err != nil {

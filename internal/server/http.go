@@ -41,6 +41,9 @@ func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 	if deps.SearchCache == nil {
 		deps.SearchCache = newSearchIndexCache(searchCacheBudgetBytes)
 	}
+	if deps.searchGate == nil {
+		deps.searchGate = newSearchInferenceGate(defaultSearchInferenceLimits)
+	}
 	return &Handler{
 		deps:               deps,
 		verifier:           verifier,
@@ -230,6 +233,9 @@ func decode(r *http.Request, dst any) error {
 		}
 		return badRequest("invalid json: " + err.Error())
 	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return badRequest("invalid json: trailing data")
+	}
 	return nil
 }
 
@@ -301,10 +307,28 @@ func (h *Handler) registerKey(w http.ResponseWriter, r *http.Request, sess Sessi
 		writeError(w, err)
 		return
 	}
+	oldSearchObject := ""
+	if searchConfigured(h.deps) {
+		state, stateErr := h.deps.Controlplane.GetSearchIndexState(r.Context(), sess.RawJWT, sess.Claims.Subject)
+		if stateErr != nil {
+			h.deps.logError("key register search state lookup failed: user=%s err=%v", sess.Claims.Subject, stateErr)
+		} else {
+			oldSearchObject = state.ObjectKey
+		}
+	}
 	resp, err := RegisterKey(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	keyChanged := req.CreatedVia == "start_fresh" ||
+		(req.IfMatch != "*" && req.IfMatch != resp.KeyID)
+	if keyChanged {
+		if err := resetSearchForUser(r.Context(), h.deps, h.reindexCoordinator, sess.Claims.Subject, oldSearchObject); err != nil {
+			h.deps.logError("key-change search reset failed: user=%s err=%v", sess.Claims.Subject, err)
+			writeError(w, err)
+			return
+		}
 	}
 	encode(w, http.StatusOK, resp)
 }
@@ -575,7 +599,8 @@ func (h *Handler) searchReindex(w http.ResponseWriter, r *http.Request, sess Ses
 		writeError(w, searchUnavailable())
 		return
 	}
-	if err := validateSearchReindexRequest(req); err != nil {
+	req, err := normalizeSearchReindexRequest(req)
+	if err != nil {
 		writeError(w, err)
 		return
 	}

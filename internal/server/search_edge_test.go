@@ -279,7 +279,7 @@ func TestCorruptedIndexObjectsTriggerReindex(t *testing.T) {
 		"gzip of truncated json": gz(`{"version":1,"chats":{`),
 	}
 	for name, blob := range corruptions {
-		if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, searchIndexObjectKey, blob, indexKey); err != nil {
+		if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, f.searchObjectKey(t), blob, indexKey); err != nil {
 			t.Fatalf("%s: seed corruption: %v", name, err)
 		}
 		// Out-of-band corruption is invisible while the cache is warm;
@@ -328,7 +328,7 @@ func TestDeleteChatWhenIndexObjectMissing(t *testing.T) {
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
 
-	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{
@@ -359,6 +359,25 @@ func TestQueryLimitOutOfRangeIsClamped(t *testing.T) {
 		if len(out.Results) > maxSearchLimit {
 			t.Fatalf("limit %d: %d results exceeds cap", limit, len(out.Results))
 		}
+	}
+}
+
+func TestSearchQueryRejectsTrailingJSON(t *testing.T) {
+	f := newSearchFixture(t)
+	body := fmt.Sprintf(`{"key":%q,"query":"duck"}{}`, f.userKeyB64)
+	req, err := http.NewRequest(http.MethodPost, f.server.URL+"/v1/search/query", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.jwt())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("trailing JSON status = %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -420,6 +439,14 @@ func TestReindexKickoffValidation(t *testing.T) {
 	resp, _ = f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: "!!not-base64!!"}}}, tok)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed key: status %d, want 400", resp.StatusCode)
+	}
+	tooMany := make([]PullKey, maxSearchReindexKeys+1)
+	for i := range tooMany {
+		tooMany[i].Key = f.userKeyB64
+	}
+	resp, _ = f.post("/v1/search/reindex", SearchReindexRequest{Keys: tooMany}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("too many keys: status %d, want 400", resp.StatusCode)
 	}
 	if job := f.handler.reindexCoordinator.Status(f.userSub); job != nil {
 		t.Fatal("validation failure leaked a coordinator job")

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -18,7 +19,10 @@ import (
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/searchindex"
+	"golang.org/x/time/rate"
 )
 
 func (f *searchFixture) searchSession() Session {
@@ -70,6 +74,84 @@ func (b *blockingEmbedder) Embed(ctx context.Context, inputs []string) ([][]floa
 	return b.base.Embed(ctx, inputs)
 }
 
+func TestSearchQueryRateLimitReturns429(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	f.handler.deps.searchGate = newSearchInferenceGate(searchInferenceLimits{
+		globalRate:       rate.Inf,
+		globalBurst:      100,
+		globalConcurrent: 2,
+		userRate:         0,
+		userBurst:        1,
+		userConcurrent:   1,
+	})
+
+	if got := f.query(t, tok, "duck"); len(got.Results) == 0 {
+		t.Fatal("first query did not use the available inference permit")
+	}
+	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited query: status %d body %s", resp.StatusCode, body)
+	}
+	var appErr AppError
+	if err := json.Unmarshal(body, &appErr); err != nil {
+		t.Fatal(err)
+	}
+	if appErr.Code != CodeRateLimited {
+		t.Fatalf("rate-limited query returned code %q", appErr.Code)
+	}
+}
+
+func TestSearchQueryConcurrencyLimitReturns429(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	f.handler.deps.searchGate = newSearchInferenceGate(searchInferenceLimits{
+		globalRate:       rate.Inf,
+		globalBurst:      100,
+		globalConcurrent: 1,
+		userRate:         rate.Inf,
+		userBurst:        100,
+		userConcurrent:   1,
+	})
+	blocker := &blockingEmbedder{
+		base:    f.embedder,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f.handler.deps.Embedder = blocker
+
+	type queryResult struct {
+		status int
+		body   []byte
+	}
+	first := make(chan queryResult, 1)
+	go func() {
+		resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
+		first <- queryResult{status: resp.StatusCode, body: body}
+	}()
+	select {
+	case <-blocker.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first query did not reach embedding")
+	}
+
+	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("concurrency-limited query: status %d body %s", resp.StatusCode, body)
+	}
+	close(blocker.release)
+	select {
+	case got := <-first:
+		if got.status != http.StatusOK {
+			t.Fatalf("first query: status %d body %s", got.status, got.body)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("first query did not finish")
+	}
+}
+
 // TestPushAfterUnreadableIndexKeepsNeedsReindex covers the coverage-
 // masking hole: a push that rebuilds on top of an unreadable index
 // (wrong key, corruption) only contains that one chat, so queries
@@ -81,12 +163,11 @@ func TestPushAfterUnreadableIndexKeepsNeedsReindex(t *testing.T) {
 
 	// Corrupt the stored object and cool the cache, then push again:
 	// the new index holds only the new chat.
-	if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, searchIndexObjectKey, []byte("garbage"), f.indexKey(t)); err != nil {
+	if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, f.searchObjectKey(t), []byte("garbage"), f.indexKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
 	f.pushChat(t, tok, "chat_tax", "Paperwork", "tax return time")
-
 	got := f.query(t, tok, "tax")
 	if !got.NeedsReindex {
 		t.Fatal("push on top of an unreadable index must not clear needs_reindex")
@@ -109,13 +190,44 @@ func TestPushAfterUnreadableIndexKeepsNeedsReindex(t *testing.T) {
 	}
 }
 
+func TestPushPersistenceFailureMarksIndexIncomplete(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+
+	target, err := url.Parse(f.searchBk.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var putAttempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && putAttempts.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	f.handler.deps.SearchBuckets = buckets.NewClient(srv.URL, testBucketName, nil)
+
+	out := f.pushChat(t, tok, "chat_goose", "Park", "a goose flew past")
+	if out.SearchIndexed == nil || *out.SearchIndexed {
+		t.Fatalf("push did not report failed inline indexing: %+v", out)
+	}
+	got := f.query(t, tok, "goose")
+	if !got.NeedsReindex {
+		t.Fatalf("failed inline persistence produced an apparently complete index: %+v", got)
+	}
+}
+
 func TestPushAfterMissingIndexKeepsNeedsReindexWhenOtherChatsExist(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
 	f.pushChat(t, tok, "chat_dog", "Park", "a dog fetched a ball")
 
-	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
@@ -148,7 +260,7 @@ func TestOversizedStoredSearchIndexNeedsReindexAndCanBeReplaced(t *testing.T) {
 	maxIndexStoredBytes = 4
 	t.Cleanup(func() { maxIndexStoredBytes = oldLimit })
 
-	if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, searchIndexObjectKey, []byte("large"), f.indexKey(t)); err != nil {
+	if err := f.handler.deps.SearchBuckets.Put(context.Background(), f.userSub, f.searchObjectKey(t), []byte("large"), f.indexKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
@@ -201,7 +313,7 @@ func TestReindexPreservesEntriesWrittenDuringRebuild(t *testing.T) {
 
 	cursor := ""
 	for {
-		page, err := searchReindexPage(ctx, f.handler.deps, sess, keys, cursor, startedAt)
+		page, err := searchReindexPage(ctx, f.handler.deps, sess, keys, cursor, startedAt, f.sourceRevision(), false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -241,7 +353,7 @@ func TestStaleWriteCannotClobberNewerEntry(t *testing.T) {
 	e := ix.Chats["chat_a"]
 	e.UpdatedAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
 	ix.Chats["chat_a"] = e
-	if err := saveSearchIndex(ctx, f.handler.deps, f.userSub, f.indexKey(t), ix); err != nil {
+	if err := saveSearchIndex(ctx, f.handler.deps, f.userSub, f.searchObjectKey(t), f.indexKey(t), ix); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,6 +367,110 @@ func TestStaleWriteCannotClobberNewerEntry(t *testing.T) {
 	}
 	if got := after.Search(nil, []string{"duck"}, 5); len(got) != 0 {
 		t.Fatalf("stale write went through: %+v", got)
+	}
+}
+
+func TestPublicationConflictReloadsAndMergesWinner(t *testing.T) {
+	f := newSearchFixture(t)
+	ctx := context.Background()
+	f.pushChat(t, f.jwt(), "chat_a", "Alpha", "alpha term")
+
+	f.cp.mu.Lock()
+	initial := f.cp.currentSearchState()
+	f.cp.mu.Unlock()
+
+	winner := f.loadIndex(t)
+	if err := winner.Upsert("chat_b", searchindex.Entry{
+		ETag:           "1",
+		SourceRevision: 2,
+		UpdatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+	}, searchindex.Tokenize("bravo term")); err != nil {
+		t.Fatal(err)
+	}
+	winnerKey, err := newSearchIndexObjectKey(initial.FenceGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSearchIndex(ctx, f.handler.deps, f.userSub, winnerKey, f.indexKey(t), winner); err != nil {
+		t.Fatal(err)
+	}
+
+	f.cp.mu.Lock()
+	f.cp.sourceRevision = 3
+	f.cp.searchConflict = func(state controlplane.SearchIndexState) controlplane.SearchIndexState {
+		state.PublicationGeneration++
+		state.PublishedSourceRevision = 2
+		state.ObjectKey = winnerKey
+		state.KeyID = initial.KeyID
+		state.Model = initial.Model
+		state.PublicationIncomplete = false
+		return state
+	}
+	f.cp.mu.Unlock()
+
+	if err := indexChatForSearchWithHook(
+		ctx,
+		f.handler.deps,
+		f.searchSession(),
+		f.userKey,
+		"chat_c",
+		chatJSON(t, "chat_c", "", "charlie term"),
+		"1",
+		time.Now(),
+		3,
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got := f.loadIndex(t)
+	for _, id := range []string{"chat_a", "chat_b", "chat_c"} {
+		if _, ok := got.Chats[id]; !ok {
+			t.Fatalf("publication retry lost %s", id)
+		}
+	}
+	f.cp.mu.Lock()
+	state := f.cp.currentSearchState()
+	f.cp.mu.Unlock()
+	if state.PublishedSourceRevision != 3 || state.Incomplete {
+		t.Fatalf("publication did not converge: %+v", state)
+	}
+}
+
+func TestPublicationResponseLossReconcilesCommittedObject(t *testing.T) {
+	f := newSearchFixture(t)
+	target, err := url.Parse(f.cp.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var loseResponse atomic.Bool
+	loseResponse.Store(true)
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.Request.Method != http.MethodPut ||
+			resp.Request.URL.Path != controlplane.SearchIndexStatePath ||
+			!loseResponse.CompareAndSwap(true, false) {
+			return nil
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		resp.StatusCode = http.StatusServiceUnavailable
+		resp.Status = "503 Service Unavailable"
+		resp.Body = io.NopCloser(strings.NewReader(`{"code":"UPSTREAM"}`))
+		resp.ContentLength = -1
+		return nil
+	}
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	f.handler.deps.Controlplane = controlplane.NewClient(server.URL, nil)
+
+	out := f.pushChat(t, f.jwt(), "chat_response_loss", "Lake", "a duck swam by")
+	if out.SearchIndexed == nil || !*out.SearchIndexed {
+		t.Fatalf("committed publication was reported as failed: %+v", out)
+	}
+	got := f.query(t, f.jwt(), "duck")
+	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_response_loss" {
+		t.Fatalf("committed publication was not reconciled: %+v", got)
 	}
 }
 
@@ -281,6 +497,22 @@ func TestReindexRestartPolicy(t *testing.T) {
 	}
 	if dedup.JobID != clean.JobID {
 		t.Fatalf("re-kick after clean success must return the retained job: got %s want %s", dedup.JobID, clean.JobID)
+	}
+	legacyKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, cryptopkg.KeySize))
+	resp, body = f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{
+		{Key: f.userKeyB64},
+		{Key: legacyKey},
+		{Key: f.userKeyB64},
+	}}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("equivalent key-set re-kick: status %d body %s, want 200", resp.StatusCode, body)
+	}
+	var equivalent SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &equivalent); err != nil {
+		t.Fatal(err)
+	}
+	if equivalent.JobID != clean.JobID {
+		t.Fatalf("trailing key variants bypassed retained-job dedup: got %s want %s", equivalent.JobID, clean.JobID)
 	}
 
 	fp := reindexKeyFingerprint([]PullKey{{Key: f.userKeyB64}})
@@ -326,7 +558,7 @@ func TestRetainedReindexRestartsWhenIndexNeedsRepair(t *testing.T) {
 	if clean.Status != string(MigrationJobCompleted) || clean.Partial {
 		t.Fatalf("setup: expected clean completion, got %+v", clean)
 	}
-	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}, tok)
@@ -351,6 +583,115 @@ func TestRetainedReindexRestartsWhenIndexNeedsRepair(t *testing.T) {
 	}
 	if got := f.query(t, tok, "duck"); got.NeedsReindex || got.TotalIndexed != 1 || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
 		t.Fatalf("repair did not restore search coverage: %+v", got)
+	}
+}
+
+func TestReindexTransientPullFailureRemainsPartial(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_ok", "Pond", "a duck swam by")
+	f.pushChat(t, tok, "chat_flaky", "Park", "a goose flew past")
+
+	target, err := url.Parse(f.cp.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var failOnce atomic.Bool
+	failOnce.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/chat/chat_flaky") && failOnce.CompareAndSwap(true, false) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	f.handler.deps.Controlplane = controlplane.NewClient(srv.URL, nil)
+
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.handler.deps.SearchCache.drop(f.userSub)
+	partial := f.runReindexJob(t, tok)
+	if partial.Status != string(MigrationJobCompleted) || !partial.Partial || partial.Failed != 1 || partial.TotalIndexed != 1 {
+		t.Fatalf("transient failure produced a clean rebuild: %+v", partial)
+	}
+	if got := f.query(t, tok, "goose"); !got.NeedsReindex {
+		t.Fatalf("transient failure did not request repair: %+v", got)
+	}
+
+	repaired := f.runReindexJob(t, tok)
+	if repaired.Status != string(MigrationJobCompleted) || repaired.Partial || repaired.Failed != 0 || repaired.TotalIndexed != 2 {
+		t.Fatalf("retry did not repair transient failure: %+v", repaired)
+	}
+	if got := f.query(t, tok, "goose"); got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_flaky" {
+		t.Fatalf("repaired chat is not searchable: %+v", got)
+	}
+}
+
+func TestFinalReindexPagePreservesEarlierFailure(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_ok", "Pond", "a duck swam by")
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.handler.deps.SearchCache.drop(f.userSub)
+
+	page, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), []PullKey{{Key: f.userKeyB64}}, "", time.Now().UTC(), f.sourceRevision(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Done {
+		t.Fatal("setup did not exercise a final rebuild page")
+	}
+	if got := f.query(t, tok, "duck"); !got.NeedsReindex {
+		t.Fatalf("final page cleared an earlier coverage failure: %+v", got)
+	}
+}
+
+func TestReindexRetryWithLegacyKeyRepairsCoverage(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	legacyKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, cryptopkg.KeySize))
+	searchBuckets := f.handler.deps.SearchBuckets
+	f.handler.deps.SearchBuckets = nil
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "chat_legacy",
+		Key:            legacyKey,
+		Plaintext:      base64.StdEncoding.EncodeToString(chatJSON(t, "chat_legacy", "Archive", "a heron flew past")),
+		IdempotencyKey: "idem-chat-legacy",
+	}, tok)
+	f.handler.deps.SearchBuckets = searchBuckets
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy push: status %d body %s", resp.StatusCode, body)
+	}
+
+	partial := f.runReindexJob(t, tok)
+	if !partial.Partial || partial.Failed != 1 {
+		t.Fatalf("missing legacy key produced a clean rebuild: %+v", partial)
+	}
+	resp, body = f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{
+		{Key: f.userKeyB64},
+		{Key: legacyKey},
+	}}, tok)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("legacy-key repair kickoff: status %d body %s", resp.StatusCode, body)
+	}
+	job := f.handler.reindexCoordinator.Status(f.userSub)
+	select {
+	case <-job.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("legacy-key repair did not finish")
+	}
+	repaired := job.statusResponse()
+	if repaired.Partial || repaired.Failed != 0 || repaired.TotalIndexed != 1 {
+		t.Fatalf("legacy key did not repair coverage: %+v", repaired)
+	}
+	if got := f.query(t, tok, "heron"); got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_legacy" {
+		t.Fatalf("repaired legacy chat is not searchable: %+v", got)
 	}
 }
 
@@ -389,6 +730,79 @@ func TestDeleteAlreadyGoneStillCleansSearchIndex(t *testing.T) {
 	}
 }
 
+func TestStartFreshClearsSearchState(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	if got := f.query(t, tok, "duck"); len(got.Results) == 0 {
+		t.Fatal("setup: chat was not searchable")
+	}
+	oldObject := f.searchObjectKey(t)
+
+	newKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, cryptopkg.KeySize))
+	resp, body := f.post("/v1/key/register", KeyRegisterRequest{
+		Key:            newKey,
+		IfMatch:        "*",
+		CreatedVia:     "start_fresh",
+		IdempotencyKey: "start-fresh-search",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start fresh: status %d body %s", resp.StatusCode, body)
+	}
+	f.cp.mu.Lock()
+	publishedObject := f.cp.searchState.ObjectKey
+	f.cp.mu.Unlock()
+	if publishedObject != "" {
+		t.Fatal("start fresh left the old search object published")
+	}
+	if f.searchBk.has(oldObject) {
+		t.Fatal("start fresh left the old search object in storage")
+	}
+	got := f.query(t, tok, "duck")
+	if len(got.Results) != 0 || got.TotalIndexed != 0 || !got.NeedsReindex {
+		t.Fatalf("old search state remained accessible after start fresh: %+v", got)
+	}
+}
+
+func TestStartFreshWithoutSearchStorage(t *testing.T) {
+	f := newFixture(t)
+	newKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, cryptopkg.KeySize))
+	resp, body := f.post("/v1/key/register", KeyRegisterRequest{
+		Key:            newKey,
+		IfMatch:        "*",
+		CreatedVia:     "start_fresh",
+		IdempotencyKey: "start-fresh-no-search",
+	}, f.jwt())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start fresh without search storage: status %d body %s", resp.StatusCode, body)
+	}
+}
+
+func TestDeleteCleanupPreservesRecreatedChat(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	first := f.pushChat(t, tok, "chat_same", "Old", "a duck swam by")
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "chat_same",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString(chatJSON(t, "chat_same", "New", "a goose flew past")),
+		IfMatch:        &first.ETag,
+		IdempotencyKey: "idem-chat-same-recreated",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recreate chat_same: status %d body %s", resp.StatusCode, body)
+	}
+
+	if err := removeDeletedChatFromSearch(context.Background(), f.handler.deps, f.searchSession(), f.userKey, "chat_same", 0); err != nil {
+		t.Fatal(err)
+	}
+	got := f.query(t, tok, "goose")
+	if got.TotalIndexed != 1 || len(got.Results) == 0 || got.Results[0].ID != "chat_same" {
+		t.Fatalf("delete cleanup removed the recreated generation: %+v", got)
+	}
+}
+
 func TestDelayedPushIndexingDoesNotResurrectDeletedChat(t *testing.T) {
 	f := newSearchFixture(t)
 	ctx := context.Background()
@@ -397,6 +811,7 @@ func TestDelayedPushIndexingDoesNotResurrectDeletedChat(t *testing.T) {
 	searchBuckets := f.handler.deps.SearchBuckets
 	f.handler.deps.SearchBuckets = nil
 	out := f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	pushSourceRevision := f.sourceRevision()
 	f.handler.deps.SearchBuckets = searchBuckets
 
 	resp, body := f.post("/v1/sync/delete", DeleteRequest{
@@ -409,7 +824,7 @@ func TestDelayedPushIndexingDoesNotResurrectDeletedChat(t *testing.T) {
 		t.Fatalf("delete: status %d body %s", resp.StatusCode, body)
 	}
 
-	if err := indexCurrentChatForSearch(ctx, f.handler.deps, f.searchSession(), f.userKey, "chat_duck", chatJSON(t, "chat_duck", "", "a duck swam by"), out.ETag, time.Now()); err != nil {
+	if err := indexCurrentChatForSearch(ctx, f.handler.deps, f.searchSession(), f.userKey, "chat_duck", chatJSON(t, "chat_duck", "", "a duck swam by"), out.ETag, time.Now(), pushSourceRevision); err != nil {
 		t.Fatal(err)
 	}
 	got := f.query(t, tok, "duck")
@@ -435,8 +850,10 @@ func TestReindexDoesNotResurrectChatDeletedDuringEmbedding(t *testing.T) {
 	f.handler.deps.Embedder = blocker
 
 	done := make(chan error, 1)
+	targetSourceRevision := f.sourceRevision()
 	go func() {
-		_, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), []PullKey{{Key: f.userKeyB64}}, "", time.Now().UTC())
+		keys := []PullKey{{Key: f.userKeyB64}}
+		_, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), keys, "", time.Now().UTC(), targetSourceRevision, false)
 		done <- err
 	}()
 	select {
@@ -640,6 +1057,9 @@ func TestQueryDoesNotServeUnpersistedWrites(t *testing.T) {
 	got := f.query(t, tok, "goose")
 	if got.TotalIndexed != 1 {
 		t.Fatalf("unpersisted write counted in the index: total=%d", got.TotalIndexed)
+	}
+	if !got.NeedsReindex {
+		t.Fatal("failed persistence did not mark the durable index incomplete")
 	}
 	for _, r := range got.Results {
 		if r.ID == "chat_b" {

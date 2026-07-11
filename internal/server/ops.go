@@ -29,6 +29,7 @@ type Deps struct {
 	// SearchCache holds decoded search indices between requests.
 	// Populated by NewHandler; nil disables caching.
 	SearchCache *searchIndexCache
+	searchGate  *searchInferenceGate
 	GitSHA      string
 	// SyncEnclaveSecret is the shared secret used to verify the
 	// X-Legacy-Claim header CP stamps on legacy attachment reads.
@@ -166,7 +167,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		var searchIndexed *bool
 		if scope == envelope.ScopeChat && searchConfigured(deps) {
 			indexed := true
-			if idxErr := indexCurrentChatForSearch(ctx, deps, sess, key, req.ID, plaintext, resp.ETag, committedAt); idxErr != nil {
+			if idxErr := indexCurrentChatForSearch(ctx, deps, sess, key, req.ID, plaintext, resp.ETag, committedAt, resp.SourceRevision); idxErr != nil {
 				deps.logError("push search index failed: user=%s id=%s err=%v",
 					sess.Claims.Subject, req.ID, idxErr)
 				indexed = false
@@ -478,10 +479,14 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				sess.Claims.Subject, scope, req.ID, err)
 			return nil, err
 		}
-		if scope == envelope.ScopeChat && cpResp != nil {
-			deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
+		sourceRevision := int64(0)
+		if cpResp != nil {
+			sourceRevision = cpResp.SourceRevision
+			if scope == envelope.ScopeChat {
+				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
+			}
 		}
-		dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
+		dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
 		deps.logInfo("delete ok: user=%s scope=%s id=%s", sess.Claims.Subject, scope, req.ID)
 		return resp, nil
 	}
@@ -502,7 +507,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// (an earlier delete that failed after the blob write,
 				// or a crash between the two); the idempotent replay
 				// must still finish the search cleanup.
-				dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
+				dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, 0)
 				deps.logInfo("delete already-gone: user=%s scope=%s id=%s",
 					sess.Claims.Subject, scope, req.ID)
 				return &OKResponse{OK: true}, nil
@@ -519,6 +524,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		attemptReq.IdempotencyKey = idem
 		resp, cpResp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
 		if err == nil {
+			sourceRevision := int64(0)
 			if scope == envelope.ScopeChat && cpResp != nil {
 				// cpResp.WipedV2Attachments is the controlplane's
 				// authoritative list of v2 attachment ids that
@@ -529,7 +535,10 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// trusts controlplane authority over ownership.
 				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 			}
-			dropChatFromSearch(ctx, deps, sess, scope, req.ID, key)
+			if cpResp != nil {
+				sourceRevision = cpResp.SourceRevision
+			}
+			dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
 			deps.logInfo("delete ok: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, req.ID, attempt)
 			return resp, nil

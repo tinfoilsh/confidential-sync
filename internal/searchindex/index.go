@@ -165,8 +165,9 @@ type Entry struct {
 	Slot int `json:"slot"`
 	// ETag is the sync blob etag the entry was built from, so callers
 	// can skip re-embedding chats that have not changed.
-	ETag      string `json:"etag,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	ETag           string `json:"etag,omitempty"`
+	SourceRevision int64  `json:"source_revision,omitempty"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
 	// Vectors holds one quantized embedding per text chunk; the
 	// semantic score for the chat is the max similarity over them.
 	Vectors []Vector `json:"vectors,omitempty"`
@@ -256,6 +257,9 @@ func Decode(data []byte) (*Index, error) {
 		return nil, fmt.Errorf("searchindex: %d chats exceeds limit %d", len(ix.Chats), MaxChats)
 	}
 	for _, e := range ix.Chats {
+		if e.SourceRevision < 0 {
+			return nil, errors.New("searchindex: entry source revision is negative")
+		}
 		if len(e.Vectors) > MaxChunksPerChat {
 			return nil, fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
 		}
@@ -315,21 +319,24 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	if len(e.Vectors) > MaxChunksPerChat {
 		return fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
 	}
+	dims := ix.Dims
 	for _, v := range e.Vectors {
 		if len(v) == 0 {
 			return errors.New("searchindex: empty chunk vector")
 		}
-		if ix.Dims == 0 {
-			ix.Dims = len(v)
-		} else if len(v) != ix.Dims {
-			return fmt.Errorf("searchindex: vector has %d dims, index has %d", len(v), ix.Dims)
+		if dims == 0 {
+			dims = len(v)
+		} else if len(v) != dims {
+			return fmt.Errorf("searchindex: vector has %d dims, index has %d", len(v), dims)
 		}
 	}
+	if _, exists := ix.Chats[id]; !exists && len(ix.Chats) >= MaxChats {
+		return ErrTooLarge
+	}
+	ix.Dims = dims
 	if old, exists := ix.Chats[id]; exists {
 		ix.Slots[old.Slot] = ""
 		ix.dead++
-	} else if len(ix.Chats) >= MaxChats {
-		return ErrTooLarge
 	}
 	e.Slot = len(ix.Slots)
 	ix.Slots = append(ix.Slots, id)
