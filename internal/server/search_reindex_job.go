@@ -118,12 +118,10 @@ func (j *SearchReindexJob) finish(err error) {
 // Tests use this to wait for the job goroutine deterministically.
 func (j *SearchReindexJob) Done() <-chan struct{} { return j.done }
 
-// blocksRestart reports whether a kickoff should return this job
-// instead of starting a fresh one: while it is running, and while a
-// cleanly completed run is retained (a retried or duplicate kickoff
-// landing just after success must not pay for embedding the whole
-// corpus again). Failed and partial runs never block, because their
-// whole point of being terminal is to be re-kicked immediately.
+// blocksRestart reports whether this job's lifecycle can block a
+// restart: always while running, and after a clean completion when
+// the current index is still healthy. Failed and partial runs never
+// block because they must be re-kickable immediately.
 func (j *SearchReindexJob) blocksRestart() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -166,10 +164,11 @@ func (j *SearchReindexJob) statusResponse() SearchReindexStatusResponse {
 
 // SearchReindexCoordinator owns the per-user reindex jobs. A kickoff
 // while a job is running or while a clean success sits in its
-// retention window returns the existing job, so duplicate kickoffs
-// from multiple tabs cannot stack rebuilds — important here because
-// every rebuild pays for embedding the whole corpus again. Failed and
-// partial runs are re-kickable immediately.
+// retention window with a healthy index returns the existing job, so
+// duplicate kickoffs from multiple tabs cannot stack rebuilds —
+// important here because every rebuild pays for embedding the whole
+// corpus again. Failed, partial, and repair-required runs are
+// re-kickable immediately.
 type SearchReindexCoordinator struct {
 	mu         sync.Mutex
 	jobs       map[string]*SearchReindexJob
@@ -188,44 +187,64 @@ func NewSearchReindexCoordinator() *SearchReindexCoordinator {
 }
 
 // StartOrGet returns the user's existing job when it is running or a
-// retained clean success for the same key set, or starts a new one in
-// a detached goroutine. The bool is true when a fresh job started
-// (handler answers 202 instead of 200). Failed and partial terminal
-// jobs do not block: a query that still reports needs_reindex after
-// such a run must be able to re-kick without waiting out the
-// retention window. A kickoff with a different key set also never
-// joins: the old job's output is sealed under a key the client did
-// not ask to use, so the old job is cancelled and a fresh rebuild
-// starts once it has wound down.
-func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps Deps, sess Session, req SearchReindexRequest) (*SearchReindexJob, bool) {
+// retained clean success for the same key set whose index is still
+// healthy, or starts a new one in a detached goroutine. The bool is
+// true when a fresh job started (handler answers 202 instead of 200).
+// Failed, partial, and repair-required terminal jobs do not block: a
+// query that still reports needs_reindex must be able to re-kick
+// without waiting out the retention window. A kickoff with a
+// different key set also never joins: the old job's output is sealed
+// under a key the client did not ask to use, so the old job is
+// cancelled and a fresh rebuild starts once it has wound down.
+func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps Deps, sess Session, req SearchReindexRequest) (*SearchReindexJob, bool, error) {
 	userID := sess.Claims.Subject
 	keyFP := reindexKeyFingerprint(req.Keys)
-	c.mu.Lock()
-	existing := c.jobs[userID]
-	if existing != nil && existing.keyFP == keyFP && existing.blocksRestart() {
+	for {
+		c.mu.Lock()
+		existing := c.jobs[userID]
+		if existing != nil && existing.keyFP == keyFP {
+			if existing.running() {
+				c.mu.Unlock()
+				return existing, false, nil
+			}
+			if existing.blocksRestart() {
+				c.mu.Unlock()
+				needsReindex, err := searchIndexNeedsReindex(parentCtx, deps, userID, req.Keys[0].Key)
+				if err != nil {
+					return nil, false, err
+				}
+				c.mu.Lock()
+				if c.jobs[userID] != existing {
+					c.mu.Unlock()
+					continue
+				}
+				if !needsReindex {
+					c.mu.Unlock()
+					return existing, false, nil
+				}
+			}
+		}
+		job := newSearchReindexJob(userID, keyFP)
+		// The job's context is created here, not in run, so a successor
+		// kickoff can cancel it before the goroutine is scheduled.
+		// Detached from the kickoff request so a closing webapp tab
+		// cannot cancel the rebuild mid-run; bounded by the job budget.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), c.budget)
+		job.cancel = cancel
+		c.jobs[userID] = job
 		c.mu.Unlock()
-		return existing, false
-	}
-	job := newSearchReindexJob(userID, keyFP)
-	// The job's context is created here, not in run, so a successor
-	// kickoff can cancel it before the goroutine is scheduled.
-	// Detached from the kickoff request so a closing webapp tab
-	// cannot cancel the rebuild mid-run; bounded by the job budget.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), c.budget)
-	job.cancel = cancel
-	c.jobs[userID] = job
-	c.mu.Unlock()
 
-	var predecessor *SearchReindexJob
-	if existing != nil && existing.running() {
-		// Two rebuilds must not interleave writes to the same index
-		// object: stop the superseded job and make the new one wait
-		// for it to wind down before paging.
-		existing.cancel()
-		predecessor = existing
+		var predecessor *SearchReindexJob
+		if existing != nil && existing.running() {
+			// Two rebuilds must not interleave writes to the same index
+			// object: stop the superseded job and make the new one wait
+			// for it to wind down before paging.
+			existing.cancel()
+			predecessor = existing
+		}
+		go c.run(ctx, deps, sess, req, job, predecessor)
+		return job, true, nil
 	}
-	go c.run(ctx, deps, sess, req, job, predecessor)
-	return job, true
 }
 
 // Status returns the tracked job for a user, or nil when none exists.

@@ -185,6 +185,28 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner string, indexKey []by
 	return ix, searchLoadOK, nil
 }
 
+func searchIndexNeedsReindex(ctx context.Context, deps Deps, owner, key string) (bool, error) {
+	cek, err := decodeKey(key)
+	if err != nil {
+		return false, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(cek)
+	indexKey, err := cryptopkg.DeriveSearchIndexKey(cek)
+	if err != nil {
+		return false, err
+	}
+	defer cryptopkg.Zero(indexKey)
+
+	runlock := rlockSearchIndex(owner)
+	defer runlock()
+	deps.SearchCache.drop(owner)
+	ix, state, err := loadSearchIndex(ctx, deps, owner, indexKey)
+	if err != nil {
+		return false, err
+	}
+	return state != searchLoadOK || ix.Incomplete, nil
+}
+
 // searchEntryTime parses an entry's UpdatedAt for ordering decisions.
 // Unparseable or absent timestamps sort as oldest, so legacy entries
 // lose to anything freshly written.

@@ -579,7 +579,11 @@ func (h *Handler) searchReindex(w http.ResponseWriter, r *http.Request, sess Ses
 		writeError(w, err)
 		return
 	}
-	job, started := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, req)
+	job, started, err := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	status := http.StatusOK
 	if started {
 		status = http.StatusAccepted

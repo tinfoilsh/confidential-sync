@@ -317,6 +317,43 @@ func TestReindexRestartPolicy(t *testing.T) {
 	}
 }
 
+func TestRetainedReindexRestartsWhenIndexNeedsRepair(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+
+	clean := f.runReindexJob(t, tok)
+	if clean.Status != string(MigrationJobCompleted) || clean.Partial {
+		t.Fatalf("setup: expected clean completion, got %+v", clean)
+	}
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}, tok)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("repair kickoff: status %d body %s, want 202", resp.StatusCode, body)
+	}
+	var repair SearchReindexStatusResponse
+	if err := json.Unmarshal(body, &repair); err != nil {
+		t.Fatal(err)
+	}
+	if repair.JobID == "" || repair.JobID == clean.JobID {
+		t.Fatalf("repair must start a fresh job: got %s after %s", repair.JobID, clean.JobID)
+	}
+	job := f.handler.reindexCoordinator.Status(f.userSub)
+	select {
+	case <-job.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("repair job did not finish")
+	}
+	if status := job.statusResponse(); status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("repair did not complete cleanly: %+v", status)
+	}
+	if got := f.query(t, tok, "duck"); got.NeedsReindex || got.TotalIndexed != 1 || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
+		t.Fatalf("repair did not restore search coverage: %+v", got)
+	}
+}
+
 // TestDeleteAlreadyGoneStillCleansSearchIndex covers the idempotent
 // replay path: when the blob is already gone but a stale index entry
 // survived, the delete must still remove the entry.
