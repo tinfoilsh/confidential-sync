@@ -379,12 +379,22 @@ func chatSearchChunks(plaintext []byte) []string {
 	}
 	for _, part := range parts {
 		for len(part) > 0 {
-			if cur.Len() >= searchChunkChars {
+			if cur.Len() > 0 && len(part)+1 <= searchChunkChars-cur.Len() {
+				cur.WriteByte('\n')
+				cur.WriteString(part)
+				break
+			}
+			if cur.Len() > 0 && len(part) <= searchChunkChars {
 				if !flush() {
 					return chunks
 				}
+				continue
 			}
-			piece := truncateUTF8(part, searchChunkChars-cur.Len())
+			available := searchChunkChars - cur.Len()
+			if cur.Len() > 0 {
+				available--
+			}
+			piece := truncateUTF8(part, available)
 			if piece == "" {
 				// Less room left than the next rune needs; close the
 				// chunk and retry with a fresh one.
@@ -398,6 +408,9 @@ func chatSearchChunks(plaintext []byte) []string {
 			}
 			cur.WriteString(piece)
 			part = part[len(piece):]
+			if len(part) > 0 && !flush() {
+				return chunks
+			}
 		}
 	}
 	flush()

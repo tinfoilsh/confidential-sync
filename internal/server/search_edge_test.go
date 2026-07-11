@@ -62,6 +62,19 @@ func TestChatSearchChunksEdgeCases(t *testing.T) {
 		t.Fatal("splitting an oversized message lost text")
 	}
 
+	// The separator counts toward the target, and a message that fits
+	// intact in a fresh chunk stays on its own boundary.
+	nearLimit := strings.Repeat("c", searchChunkChars-1)
+	boundaryChunks := chatSearchChunks(chatJSON(t, "x", "T", nearLimit))
+	if len(boundaryChunks) != 2 || boundaryChunks[0] != "T" || boundaryChunks[1] != nearLimit {
+		t.Fatalf("near-limit message was split across title chunk: %v", boundaryChunks)
+	}
+	halfChunk := searchChunkChars / 2
+	exactChunks := chatSearchChunks(chatJSON(t, "x", strings.Repeat("t", halfChunk), strings.Repeat("m", searchChunkChars-halfChunk-1)))
+	if len(exactChunks) != 1 || len(exactChunks[0]) != searchChunkChars {
+		t.Fatalf("separator was not included in exact chunk size: lengths=%v", chunkLengths(exactChunks))
+	}
+
 	// Multibyte runes must never be split across a chunk boundary.
 	euros := strings.Repeat("\u20ac", searchChunkChars) // 3 bytes each
 	uniChunks := chatSearchChunks(chatJSON(t, "x", "", euros))
@@ -76,13 +89,26 @@ func TestChatSearchChunksEdgeCases(t *testing.T) {
 
 	// Total coverage is capped at MaxChunksPerChat.
 	var contents []string
-	for i := 0; i < 30; i++ {
-		contents = append(contents, strings.Repeat("b", searchChunkChars))
+	for i := 0; i < searchindex.MaxChunksPerChat+1; i++ {
+		contents = append(contents, strings.Repeat(string(rune('a'+i)), searchChunkChars))
 	}
 	capped := chatSearchChunks(chatJSON(t, "x", "", contents...))
-	if len(capped) > searchindex.MaxChunksPerChat {
-		t.Fatalf("chunk cap exceeded: %d", len(capped))
+	if len(capped) != searchindex.MaxChunksPerChat {
+		t.Fatalf("chunk count = %d, want %d", len(capped), searchindex.MaxChunksPerChat)
 	}
+	for i, chunk := range capped {
+		if chunk != contents[i] {
+			t.Fatalf("chunk %d does not preserve the expected capped content", i)
+		}
+	}
+}
+
+func chunkLengths(chunks []string) []int {
+	lengths := make([]int, len(chunks))
+	for i, chunk := range chunks {
+		lengths[i] = len(chunk)
+	}
+	return lengths
 }
 
 func TestTruncateUTF8(t *testing.T) {

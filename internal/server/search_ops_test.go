@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"net/http"
@@ -97,6 +98,47 @@ func (s *stubEmbedder) Embed(_ context.Context, inputs []string) ([][]float32, e
 		out[i] = vec
 	}
 	return out, nil
+}
+
+const mappingTopicCount = 5
+
+type mappingEmbedder struct {
+	mu         sync.Mutex
+	batchSizes []int
+}
+
+func (m *mappingEmbedder) Configured() bool { return true }
+func (m *mappingEmbedder) Model() string    { return "mapping-test" }
+
+func (m *mappingEmbedder) Embed(_ context.Context, inputs []string) ([][]float32, error) {
+	m.mu.Lock()
+	m.batchSizes = append(m.batchSizes, len(inputs))
+	m.mu.Unlock()
+	out := make([][]float32, len(inputs))
+	for inputIndex, input := range inputs {
+		vector := make([]float32, mappingTopicCount)
+		for topic := range vector {
+			if strings.Contains(input, fmt.Sprintf("documentconcept%d", topic)) ||
+				strings.Contains(input, fmt.Sprintf("queryconcept%d", topic)) {
+				vector[topic] = 1
+				break
+			}
+		}
+		out[inputIndex] = vector
+	}
+	return out, nil
+}
+
+func (m *mappingEmbedder) resetBatchSizes() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchSizes = nil
+}
+
+func (m *mappingEmbedder) batches() []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int(nil), m.batchSizes...)
 }
 
 type searchFixture struct {
@@ -378,6 +420,62 @@ func TestSearchReindexRebuildsIndex(t *testing.T) {
 	}
 	if len(got.Results) < 2 || got.Results[0].ID == "chat_tax" || got.Results[1].ID == "chat_tax" {
 		t.Fatalf("expected duck/dog chats to lead for 'animal', got %+v", got.Results)
+	}
+}
+
+func TestSearchReindexPreservesChunkMappingAcrossEmbeddingBatches(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	embedder := &mappingEmbedder{}
+	f.handler.deps.Embedder = embedder
+
+	for chat := 0; chat < mappingTopicCount; chat++ {
+		contents := make([]string, searchindex.MaxChunksPerChat)
+		for chunk := range contents {
+			marker := ""
+			if chunk == (chat*3)%searchindex.MaxChunksPerChat {
+				marker = fmt.Sprintf(" documentconcept%d", chat)
+			}
+			contents[chunk] = strings.Repeat("x", searchChunkChars-len(marker)) + marker
+		}
+		id := fmt.Sprintf("chat_mapping_%d", chat)
+		plaintext := chatJSON(t, id, "", contents...)
+		resp, body := f.post("/v1/sync/push", PushRequest{
+			Scope:          "chat",
+			ID:             id,
+			Key:            f.userKeyB64,
+			Plaintext:      base64.StdEncoding.EncodeToString(plaintext),
+			IdempotencyKey: "push-" + id,
+		}, tok)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("push %s: status %d body %s", id, resp.StatusCode, body)
+		}
+	}
+
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, searchIndexObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	f.handler.deps.SearchCache.drop(f.userSub)
+	embedder.resetBatchSizes()
+	status := f.runReindexJob(t, tok)
+	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 || status.TotalIndexed != mappingTopicCount {
+		t.Fatalf("unexpected reindex status: %+v", status)
+	}
+	finalBatchSize := mappingTopicCount*searchindex.MaxChunksPerChat - searchEmbedBatch
+	if got := embedder.batches(); len(got) != 2 || got[0] != searchEmbedBatch || got[1] != finalBatchSize {
+		t.Fatalf("embedding batch sizes = %v, want [%d %d]", got, searchEmbedBatch, finalBatchSize)
+	}
+
+	ix := f.loadIndex(t)
+	for chat := 0; chat < mappingTopicCount; chat++ {
+		id := fmt.Sprintf("chat_mapping_%d", chat)
+		if got := len(ix.Chats[id].Vectors); got != searchindex.MaxChunksPerChat {
+			t.Fatalf("%s vectors = %d, want %d", id, got, searchindex.MaxChunksPerChat)
+		}
+		result := f.query(t, tok, fmt.Sprintf("queryconcept%d", chat))
+		if len(result.Results) == 0 || result.Results[0].ID != id {
+			t.Fatalf("query for topic %d mapped to wrong chat: %+v", chat, result.Results)
+		}
 	}
 }
 
