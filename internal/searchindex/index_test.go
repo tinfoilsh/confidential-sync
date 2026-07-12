@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func mustUpsert(t *testing.T, ix *Index, id string, e Entry, tokens []string) {
@@ -88,6 +89,74 @@ func TestDecodeRejectsBadInput(t *testing.T) {
 	// Slot table naming a chat that has no entry.
 	if _, err := Decode([]byte(`{"version":1,"slots":["a","b"],"chats":{"a":{"slot":0}},"postings":{}}`)); err == nil {
 		t.Fatal("expected error for slot/entry mismatch")
+	}
+}
+
+func TestReindexProgressRoundTripAndValidation(t *testing.T) {
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	ix := New("m")
+	ix.Incomplete = true
+	ix.Reindex = &ReindexProgress{
+		NextCursor:           "next-page",
+		TargetSourceRevision: 42,
+		StartedAt:            startedAt,
+	}
+	encoded, err := ix.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded.Reindex, ix.Reindex) {
+		t.Fatalf("reindex progress mismatch: got %+v want %+v", decoded.Reindex, ix.Reindex)
+	}
+
+	tests := []struct {
+		name       string
+		incomplete bool
+		progress   *ReindexProgress
+	}{
+		{
+			name:       "complete index",
+			incomplete: false,
+			progress:   ix.Reindex,
+		},
+		{
+			name:       "empty cursor",
+			incomplete: true,
+			progress:   &ReindexProgress{TargetSourceRevision: 42, StartedAt: startedAt},
+		},
+		{
+			name:       "oversized cursor",
+			incomplete: true,
+			progress:   &ReindexProgress{NextCursor: strings.Repeat("x", maxReindexCursorLength+1), TargetSourceRevision: 42, StartedAt: startedAt},
+		},
+		{
+			name:       "negative revision",
+			incomplete: true,
+			progress:   &ReindexProgress{NextCursor: "next-page", TargetSourceRevision: -1, StartedAt: startedAt},
+		},
+		{
+			name:       "invalid start time",
+			incomplete: true,
+			progress:   &ReindexProgress{NextCursor: "next-page", TargetSourceRevision: 42, StartedAt: "not-a-time"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := New("m")
+			candidate.Incomplete = tt.incomplete
+			candidate.Reindex = tt.progress
+			data, err := candidate.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Decode(data); err == nil {
+				t.Fatal("Decode accepted invalid reindex progress")
+			}
+		})
 	}
 }
 

@@ -906,18 +906,22 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 // searchReindexPageResult reports one page of a rebuild. NextCursor
 // feeds the next page; Done means the chat listing is drained.
 type searchReindexPageResult struct {
-	Indexed      int
-	Failed       int
-	NextCursor   string
-	Done         bool
-	TotalIndexed int
+	Indexed                    int
+	Failed                     int
+	NextCursor                 string
+	Done                       bool
+	Partial                    bool
+	TotalIndexed               int
+	ResumeStartedAt            time.Time
+	ResumeTargetSourceRevision int64
 }
 
 // searchReindexPage rebuilds one page of the caller's index from the
 // stored chat blobs. An empty cursor starts a rebuild, dropping index
 // entries from before startedAt (which also flushes entries for
 // since-deleted chats) while preserving entries that inline pushes
-// wrote after the job began. Driven by the reindex job runner.
+// wrote after the job began. Every clean non-final page checkpoints
+// its next cursor inside the encrypted index so a later job can resume.
 func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string, startedAt time.Time, targetSourceRevision int64, priorFailure bool) (*searchReindexPageResult, error) {
 	cek, err := decodeKey(keys[0].Key)
 	if err != nil {
@@ -996,6 +1000,31 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		if err != nil {
 			return nil, err
 		}
+		if ix.Reindex != nil {
+			checkpointStartedAt, err := time.Parse(time.RFC3339Nano, ix.Reindex.StartedAt)
+			if err != nil {
+				return nil, err
+			}
+			checkpointMatches := cursor == ix.Reindex.NextCursor &&
+				targetSourceRevision == ix.Reindex.TargetSourceRevision &&
+				startedAt.Equal(checkpointStartedAt)
+			if !checkpointMatches {
+				return &searchReindexPageResult{
+					NextCursor:                 ix.Reindex.NextCursor,
+					TotalIndexed:               len(ix.Chats),
+					ResumeStartedAt:            checkpointStartedAt,
+					ResumeTargetSourceRevision: ix.Reindex.TargetSourceRevision,
+				}, nil
+			}
+		} else if cursor != "" {
+			return &searchReindexPageResult{
+				Done:                       true,
+				Partial:                    ix.Incomplete || publication.PublicationIncomplete,
+				TotalIndexed:               len(ix.Chats),
+				ResumeStartedAt:            startedAt,
+				ResumeTargetSourceRevision: targetSourceRevision,
+			}, nil
+		}
 		if cursor == "" {
 			var stale []string
 			for id, entry := range ix.Chats {
@@ -1058,6 +1087,17 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		if publication.PublishedSourceRevision > coveredSourceRevision {
 			coveredSourceRevision = publication.PublishedSourceRevision
 		}
+		if !incomplete {
+			ix.Reindex = nil
+		} else if !priorFailure && attemptFailed == 0 && pull.NextCursor != "" {
+			ix.Reindex = &searchindex.ReindexProgress{
+				NextCursor:           pull.NextCursor,
+				TargetSourceRevision: targetSourceRevision,
+				StartedAt:            startedAt.UTC().Format(time.RFC3339Nano),
+			}
+		} else {
+			ix.Reindex = nil
+		}
 		ix.Incomplete = incomplete
 		if _, err := publishSearchIndex(ctx, deps, sess, publication, indexKey, keyID, coveredSourceRevision, incomplete, ix); err != nil {
 			var conflict *controlplane.SearchIndexConflictError
@@ -1067,15 +1107,56 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 			return nil, err
 		}
 		resp := &searchReindexPageResult{
-			Indexed:      indexed,
-			Failed:       attemptFailed,
-			NextCursor:   pull.NextCursor,
-			Done:         pull.NextCursor == "",
-			TotalIndexed: len(ix.Chats),
+			Indexed:                    indexed,
+			Failed:                     attemptFailed,
+			NextCursor:                 pull.NextCursor,
+			Done:                       pull.NextCursor == "",
+			TotalIndexed:               len(ix.Chats),
+			ResumeStartedAt:            startedAt,
+			ResumeTargetSourceRevision: targetSourceRevision,
 		}
 		deps.logInfo("search reindex page ok: user=%s indexed=%d failed=%d done=%t total=%d",
 			sess.Claims.Subject, indexed, attemptFailed, resp.Done, resp.TotalIndexed)
 		return resp, nil
 	}
 	return nil, errors.New("search index reindex publication retries exhausted")
+}
+
+func loadSearchReindexCheckpoint(ctx context.Context, deps Deps, sess Session, encodedCEK string, publication *controlplane.SearchIndexState) (string, time.Time, int64, bool, error) {
+	if publication.ObjectKey == "" || !publication.PublicationIncomplete {
+		return "", time.Time{}, 0, false, nil
+	}
+	cek, err := decodeKey(encodedCEK)
+	if err != nil {
+		return "", time.Time{}, 0, false, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(cek)
+	keyIDBytes, err := cryptopkg.DeriveKeyID(cek)
+	if err != nil {
+		return "", time.Time{}, 0, false, err
+	}
+	if publication.KeyID != cryptopkg.KeyIDHex(keyIDBytes) || publication.Model != deps.Embedder.Model() {
+		return "", time.Time{}, 0, false, nil
+	}
+	indexKey, err := cryptopkg.DeriveSearchIndexKey(cek)
+	if err != nil {
+		return "", time.Time{}, 0, false, err
+	}
+	defer cryptopkg.Zero(indexKey)
+
+	unlock := rlockSearchIndex(sess.Claims.Subject)
+	defer unlock()
+	ix, state, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, publication.ObjectKey, indexKey)
+	if err != nil {
+		return "", time.Time{}, 0, false, err
+	}
+	if state != searchLoadOK || ix.Reindex == nil || !ix.Incomplete ||
+		publication.PublishedSourceRevision != ix.Reindex.TargetSourceRevision {
+		return "", time.Time{}, 0, false, nil
+	}
+	startedAt, err := time.Parse(time.RFC3339Nano, ix.Reindex.StartedAt)
+	if err != nil {
+		return "", time.Time{}, 0, false, err
+	}
+	return ix.Reindex.NextCursor, startedAt, ix.Reindex.TargetSourceRevision, true, nil
 }

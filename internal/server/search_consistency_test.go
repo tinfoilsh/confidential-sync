@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -335,6 +336,96 @@ func TestReindexPreservesEntriesWrittenDuringRebuild(t *testing.T) {
 	}
 	if got := ix.Search(nil, []string{"heron"}, 5); len(got) != 1 || got[0].ID != "chat_old" {
 		t.Fatalf("rebuild clobbered a mid-job update with the pull snapshot: %+v", got)
+	}
+}
+
+func TestReindexResumesFromPersistedCheckpoint(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	ids := make([]string, reindexPageSize+4)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("chat_resume_%02d", i)
+		f.pushChat(t, tok, ids[i], "Resume", fmt.Sprintf("checkpoint topic %d", i))
+	}
+
+	target, err := url.Parse(f.cp.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/sync/list-status" {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		start := 0
+		switch r.URL.Query().Get("cursor") {
+		case "":
+		case "page-2":
+			start = reindexPageSize
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		end := min(start+reindexPageSize, len(ids))
+		updates := make([]controlplane.BlobMeta, 0, end-start)
+		f.cp.mu.Lock()
+		for _, id := range ids[start:end] {
+			blob := f.cp.blobs[f.cp.putBlobKey("chat", id)]
+			updates = append(updates, controlplane.BlobMeta{
+				ID:    id,
+				ETag:  formatETag(blob.ETag),
+				KeyID: blob.KeyID,
+			})
+		}
+		f.cp.mu.Unlock()
+		nextCursor := ""
+		if end < len(ids) {
+			nextCursor = "page-2"
+		}
+		_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{
+			Updates:    updates,
+			NextCursor: nextCursor,
+		})
+	}))
+	defer srv.Close()
+	f.handler.deps.Controlplane = controlplane.NewClient(srv.URL, nil)
+
+	startedAt := time.Now().UTC()
+	page, err := searchReindexPage(
+		context.Background(),
+		f.handler.deps,
+		f.searchSession(),
+		[]PullKey{{Key: f.userKeyB64}},
+		"",
+		startedAt,
+		f.sourceRevision(),
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Done || page.NextCursor != "page-2" || page.TotalIndexed != reindexPageSize {
+		t.Fatalf("first page did not checkpoint cleanly: %+v", page)
+	}
+	checkpoint := f.loadIndex(t).Reindex
+	if checkpoint == nil || checkpoint.NextCursor != "page-2" {
+		t.Fatalf("persisted checkpoint = %+v, want page-2", checkpoint)
+	}
+	callsAfterCheckpoint := f.embedder.callCount()
+
+	f.handler.reindexCoordinator = NewSearchReindexCoordinator()
+	status := f.runReindexJob(t, tok)
+	if status.Status != string(MigrationJobCompleted) || status.Partial ||
+		status.Failed != 0 || status.TotalIndexed != len(ids) {
+		t.Fatalf("resumed rebuild did not complete cleanly: %+v", status)
+	}
+	if calls := f.embedder.callCount() - callsAfterCheckpoint; calls != 1 {
+		t.Fatalf("resume made %d embedding calls, want only the remaining page", calls)
+	}
+	ix := f.loadIndex(t)
+	if ix.Incomplete || ix.Reindex != nil || len(ix.Chats) != len(ids) {
+		t.Fatalf("completed resumed index has stale progress: incomplete=%t progress=%+v chats=%d", ix.Incomplete, ix.Reindex, len(ix.Chats))
 	}
 }
 

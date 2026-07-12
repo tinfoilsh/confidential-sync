@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -76,6 +77,10 @@ const (
 	// huge corpus doesn't drag thousands of near-zero-signal entries
 	// into the fused scoring.
 	rrfCandidateDepth = 128
+
+	// maxReindexCursorLength bounds the opaque controlplane cursor
+	// persisted in a partial index between resumable rebuild runs.
+	maxReindexCursorLength = 4096
 
 	// maxSerializedSlots admits the tombstones Upsert can leave
 	// between compactions while rejecting slot tables this package
@@ -173,6 +178,16 @@ type Entry struct {
 	Vectors []Vector `json:"vectors,omitempty"`
 }
 
+// ReindexProgress checkpoints a clean page boundary for a partial
+// rebuild. It lives inside the encrypted index object so a later job
+// can resume after an enclave restart without retaining key material
+// or progress in a separate plaintext store.
+type ReindexProgress struct {
+	NextCursor           string `json:"next_cursor"`
+	TargetSourceRevision int64  `json:"target_source_revision"`
+	StartedAt            string `json:"started_at"`
+}
+
 // Index is the serialized per-user search index.
 type Index struct {
 	Version int `json:"version"`
@@ -186,6 +201,9 @@ type Index struct {
 	// and while a rebuild is mid-flight. Queries surface it as
 	// needs_reindex; a completed rebuild clears it.
 	Incomplete bool `json:"incomplete,omitempty"`
+	// Reindex is present only after a clean, non-final rebuild page.
+	// Failures clear it so the next run starts over and retries gaps.
+	Reindex *ReindexProgress `json:"reindex,omitempty"`
 	// Slots maps slot -> chat id. An updated or removed chat leaves a
 	// tombstone ("" at its old slot) instead of eagerly rewriting
 	// every posting list; queries skip dead slots and compaction
@@ -255,6 +273,20 @@ func Decode(data []byte) (*Index, error) {
 	// rebuild instead of serving the oversized index.
 	if len(ix.Chats) > MaxChats {
 		return nil, fmt.Errorf("searchindex: %d chats exceeds limit %d", len(ix.Chats), MaxChats)
+	}
+	if ix.Reindex != nil {
+		if !ix.Incomplete {
+			return nil, errors.New("searchindex: complete index has reindex progress")
+		}
+		if ix.Reindex.NextCursor == "" || len(ix.Reindex.NextCursor) > maxReindexCursorLength {
+			return nil, errors.New("searchindex: reindex cursor is invalid")
+		}
+		if ix.Reindex.TargetSourceRevision < 0 {
+			return nil, errors.New("searchindex: reindex source revision is negative")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, ix.Reindex.StartedAt); err != nil {
+			return nil, errors.New("searchindex: reindex start time is invalid")
+		}
 	}
 	for _, e := range ix.Chats {
 		if e.SourceRevision < 0 {

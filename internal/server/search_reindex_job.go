@@ -26,9 +26,9 @@ import (
 const (
 	maxSearchReindexKeys = 8
 
-	// SearchReindexJobBudget caps one rebuild run. Sized for ~10k
-	// chats: ~600 embedding batches at a few hundred ms each.
-	SearchReindexJobBudget = 10 * time.Minute
+	// SearchReindexJobBudget bounds one run's key lifetime. Clean
+	// page checkpoints let a later kickoff resume larger corpora.
+	SearchReindexJobBudget = 20 * time.Minute
 
 	// SearchReindexJobRetention keeps a finished job addressable so
 	// late polls see the terminal state instead of an idle gap.
@@ -301,10 +301,9 @@ func (c *SearchReindexCoordinator) deleteIfSame(job *SearchReindexJob) {
 }
 
 // runSearchReindex is the production runner: it drains the user's
-// chats page by page, rebuilding the index from an empty cursor. A
-// budget or cancellation mid-run leaves the job completed-but-partial;
-// the partially-built index is still valid (it simply misses the
-// undrained chats) and a fresh kickoff rebuilds from scratch.
+// chats page by page, resuming a clean partial checkpoint when one is
+// present. A budget or cancellation mid-page retries that page on the
+// next kickoff; completed pages survive clean timeouts and restarts.
 func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob) error {
 	publication, err := deps.Controlplane.GetSearchIndexState(ctx, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
@@ -316,6 +315,19 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 	}
 	targetSourceRevision := publication.SourceRevision
 	cursor := ""
+	startedAt := job.StartedAt
+	if resumeCursor, resumeStartedAt, resumeTargetSourceRevision, ok, err := loadSearchReindexCheckpoint(ctx, deps, sess, req.Keys[0].Key, publication); err != nil {
+		if ctx.Err() != nil {
+			job.markPartial()
+			return nil
+		}
+		return err
+	} else if ok {
+		cursor = resumeCursor
+		startedAt = resumeStartedAt
+		targetSourceRevision = resumeTargetSourceRevision
+		deps.logInfo("search reindex job resume: user=%s job=%s cursor=%q", job.UserID, job.ID, cursor)
+	}
 	coverageFailure := false
 	for {
 		if ctx.Err() != nil {
@@ -323,7 +335,7 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			deps.logInfo("search reindex job stopped at budget: user=%s job=%s", job.UserID, job.ID)
 			return nil
 		}
-		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, job.StartedAt, targetSourceRevision, coverageFailure)
+		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, startedAt, targetSourceRevision, coverageFailure)
 		if err != nil {
 			// A budget expiry mid-page surfaces as a context error
 			// wrapped in upstream failures; report it as partial
@@ -340,10 +352,15 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			job.markPartial()
 			coverageFailure = true
 		}
+		if page.Partial {
+			job.markPartial()
+		}
 		if page.Done {
 			return nil
 		}
 		cursor = page.NextCursor
+		startedAt = page.ResumeStartedAt
+		targetSourceRevision = page.ResumeTargetSourceRevision
 	}
 }
 
