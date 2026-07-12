@@ -72,7 +72,7 @@ See [`LOCAL_TESTING.md`](./LOCAL_TESTING.md) for the full runbook, including the
 | `CHAT_ATTACHMENTS_BUCKET` | - | S3 bucket name sent in the sidecar's path-style request URL. The sidecar routes to whatever bucket the path names, so this must be set alongside `BUCKETS_URL`; when unset the buckets client is treated as unconfigured. |
 | `SEARCH_BUCKETS_URL` | - | Base URL of the buckets sidecar used for encrypted search indexes. When unset (or the embedding service is unconfigured), search routes return 503 and push/delete skip index upkeep. |
 | `SEARCH_INDEXES_BUCKET` | - | Name of the S3 bucket for search indexes. Required alongside `SEARCH_BUCKETS_URL`. |
-| `INFERENCE_API_KEY` | - | API key for the inference service. |
+| `TINFOIL_API_KEY` | - | API key for the Tinfoil inference service. |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model identifier recorded in the search index. |
 | `LISTEN_ADDR` | `:8089` | Address the enclave HTTP server listens on. |
 | `GIT_SHA` | `unknown` | Build identifier reported by the health endpoint. Normally injected at build time via `-ldflags`. |

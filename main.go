@@ -82,7 +82,7 @@ func main() {
 		&http.Client{Timeout: server.AttachmentRequestTimeout},
 	)
 	embedder, err := inference.NewClient(
-		os.Getenv("INFERENCE_API_KEY"),
+		os.Getenv("TINFOIL_API_KEY"),
 		envDefault("EMBEDDING_MODEL", "nomic-embed-text"),
 	)
 	if err != nil {
@@ -93,7 +93,7 @@ func main() {
 	// embedding service) is unconfigured, the search routes return
 	// 503 and push/delete skip index upkeep.
 	if !searchBucketsClient.Configured() || !embedder.Configured() {
-		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_INDEXES_BUCKET / INFERENCE_API_KEY unset or invalid bucket name); search routes will return 503")
+		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_INDEXES_BUCKET / TINFOIL_API_KEY unset or invalid bucket name); search routes will return 503")
 	}
 
 	logger := stdLogger{}
