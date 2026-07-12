@@ -352,7 +352,7 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			job.markPartial()
 			coverageFailure = true
 		}
-		if page.Partial {
+		if page.Done && page.Partial {
 			job.markPartial()
 		}
 		if page.Done {

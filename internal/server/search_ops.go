@@ -1111,6 +1111,7 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 			Failed:                     attemptFailed,
 			NextCursor:                 pull.NextCursor,
 			Done:                       pull.NextCursor == "",
+			Partial:                    incomplete,
 			TotalIndexed:               len(ix.Chats),
 			ResumeStartedAt:            startedAt,
 			ResumeTargetSourceRevision: targetSourceRevision,

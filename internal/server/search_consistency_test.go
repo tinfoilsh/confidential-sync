@@ -747,6 +747,56 @@ func TestFinalReindexPagePreservesEarlierFailure(t *testing.T) {
 	}
 }
 
+func TestFinalReindexPageReportsNewerPublicationGap(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_old", "Pond", "a duck swam by")
+	f.pushChat(t, tok, "chat_new", "Park", "a goose flew past")
+
+	f.cp.mu.Lock()
+	stale := f.cp.currentSearchState()
+	stale.SourceRevision--
+	stale.PublishedSourceRevision--
+	stale.Incomplete = false
+	stale.PublicationIncomplete = false
+	f.cp.searchState.PublicationIncomplete = true
+	f.cp.mu.Unlock()
+
+	target, err := url.Parse(f.cp.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var firstState atomic.Bool
+	firstState.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet &&
+			r.URL.Path == controlplane.SearchIndexStatePath &&
+			firstState.CompareAndSwap(true, false) {
+			_ = json.NewEncoder(w).Encode(stale)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	f.handler.deps.Controlplane = controlplane.NewClient(srv.URL, nil)
+
+	req := SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}
+	job := newSearchReindexJob(f.userSub, reindexKeyFingerprint(req.Keys))
+	err = runSearchReindex(context.Background(), f.handler.deps, f.searchSession(), req, job)
+	job.finish(err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := job.statusResponse()
+	if status.Status != string(MigrationJobCompleted) || !status.Partial {
+		t.Fatalf("newer publication gap was reported healthy: %+v", status)
+	}
+	if ix := f.loadIndex(t); !ix.Incomplete {
+		t.Fatal("newer publication gap did not leave the index incomplete")
+	}
+}
+
 func TestReindexRetryWithLegacyKeyRepairsCoverage(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
