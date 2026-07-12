@@ -16,9 +16,17 @@ containers:
       - CONTROLPLANE_URL: "https://api.tinfoil.sh"
       - BUCKETS_URL: "http://buckets:9000"
       - CHAT_ATTACHMENTS_BUCKET: "sync-chat-attachments"
+      # The enclave addresses each bucket by name in the request path
+      # and the multi-bucket sidecar routes on that path segment, so
+      # the same sidecar serves both buckets while attachment objects
+      # and search index objects stay in separate S3 namespaces.
+      - SEARCH_BUCKETS_URL: "http://buckets:9000"
+      - SEARCH_INDEXES_BUCKET: "sync-search-indexes"
+      - EMBEDDING_MODEL: "nomic-embed-text"
       - CLERK_ISSUER: "https://clerk.tinfoil.sh"
     secrets:
       - SYNC_ENCLAVE_SECRET
+      - TINFOIL_API_KEY
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8089/health"]
       interval: 30s
@@ -62,5 +70,8 @@ shim:
     - /v1/import/upload
     - /v1/import/start
     - /v1/import/status
+    - /v1/search/query
+    - /v1/search/reindex
+    - /v1/search/reindex-status
     - /v1/share/seal
     - /v1/share/open

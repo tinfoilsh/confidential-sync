@@ -65,17 +65,18 @@ func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client 
 // the enclave returns to its own clients but the controlplane does not
 // emit.
 const (
-	HeaderAuth          = "Authorization"
-	HeaderKeyID         = "X-Key-Id"
-	HeaderIfMatch       = "If-Match"
-	HeaderIdempotency   = "X-Idempotency-Key"
-	HeaderOperationHash = "X-Operation-Hash"
-	HeaderMessageCount  = "X-Message-Count"
-	HeaderProjectID     = "X-Project-Id"
-	HeaderProjectIDSet  = "X-Project-Id-Set"
-	HeaderETag          = "ETag"
-	HeaderContentType   = "Content-Type"
-	HeaderServiceSecret = "X-Sync-Enclave-Secret"
+	HeaderAuth              = "Authorization"
+	HeaderKeyID             = "X-Key-Id"
+	HeaderIfMatch           = "If-Match"
+	HeaderIdempotency       = "X-Idempotency-Key"
+	HeaderOperationHash     = "X-Operation-Hash"
+	HeaderMessageCount      = "X-Message-Count"
+	HeaderProjectID         = "X-Project-Id"
+	HeaderProjectIDSet      = "X-Project-Id-Set"
+	HeaderETag              = "ETag"
+	HeaderSearchIndexFenced = "X-Search-Index-Fenced"
+	HeaderContentType       = "Content-Type"
+	HeaderServiceSecret     = "X-Sync-Enclave-Secret"
 	// HeaderClerkUserID carries the user id the enclave already
 	// verified out of the user's JWT. Paired with HeaderServiceSecret
 	// it stands in for a fresh Clerk bearer token on the
@@ -95,6 +96,7 @@ const (
 	StatusStaleBlob                 = "STALE_BLOB"
 	StatusExistingDataUnderOtherKey = "EXISTING_DATA_UNDER_OTHER_KEY"
 	StatusIdempotencyConflict       = "IDEMPOTENCY_CONFLICT"
+	StatusSearchIndexConflict       = "SEARCH_INDEX_CONFLICT"
 	StatusLegacyBlobNotMigrated     = "LEGACY_BLOB_NOT_MIGRATED"
 )
 
@@ -181,8 +183,9 @@ type PutBlobRequest struct {
 }
 
 type PutBlobResponse struct {
-	ETag  string `json:"etag"`
-	KeyID string `json:"key_id"`
+	ETag           string `json:"etag"`
+	KeyID          string `json:"key_id"`
+	SourceRevision int64  `json:"source_revision,omitempty"`
 }
 
 type GetBlobResponse struct {
@@ -415,6 +418,32 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string
 	}, nil
 }
 
+func (c *Client) HeadBlob(ctx context.Context, scope, id, jwt, clerkUserID string) (*BlobMeta, error) {
+	endpoint, err := c.urlFor(scope, id)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, parseError(resp.StatusCode, body)
+	}
+	return &BlobMeta{
+		ID:    id,
+		ETag:  resp.Header.Get(HeaderETag),
+		KeyID: resp.Header.Get(HeaderKeyID),
+	}, nil
+}
+
 type DeleteBlobRequest struct {
 	Scope          string
 	ID             string
@@ -432,6 +461,7 @@ type DeleteBlobRequest struct {
 type DeleteBlobResponse struct {
 	OK                 bool     `json:"ok"`
 	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
+	SourceRevision     int64    `json:"source_revision,omitempty"`
 }
 
 func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*DeleteBlobResponse, error) {
@@ -513,6 +543,112 @@ func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int
 		return nil, fmt.Errorf("controlplane: decode list-status: %w", err)
 	}
 	return &out, nil
+}
+
+const SearchIndexStatePath = "/api/sync/search-index"
+
+type SearchIndexState struct {
+	SourceRevision          int64  `json:"source_revision"`
+	PublicationGeneration   int64  `json:"publication_generation"`
+	FenceGeneration         int64  `json:"fence_generation"`
+	PublishedSourceRevision int64  `json:"published_source_revision"`
+	ObjectKey               string `json:"object_key,omitempty"`
+	KeyID                   string `json:"key_id,omitempty"`
+	Model                   string `json:"model,omitempty"`
+	Incomplete              bool   `json:"incomplete"`
+	PublicationIncomplete   bool   `json:"publication_incomplete"`
+}
+
+type PublishSearchIndexRequest struct {
+	JWT                   string
+	ClerkUserID           string
+	ExpectedGeneration    int64
+	ExpectedFence         int64
+	CoveredSourceRevision int64
+	ObjectKey             string
+	KeyID                 string
+	Model                 string
+	Incomplete            bool
+}
+
+type SearchIndexConflictError struct {
+	State SearchIndexState
+}
+
+func (e *SearchIndexConflictError) Error() string {
+	return "controlplane: search index publication conflict"
+}
+
+func (c *Client) GetSearchIndexState(ctx context.Context, jwt, clerkUserID string) (*SearchIndexState, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+SearchIndexStatePath, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, body)
+	}
+	var state SearchIndexState
+	if err := json.Unmarshal(body, &state); err != nil {
+		return nil, fmt.Errorf("controlplane: decode search index state: %w", err)
+	}
+	return &state, nil
+}
+
+func (c *Client) PublishSearchIndex(ctx context.Context, req PublishSearchIndexRequest) (*SearchIndexState, error) {
+	body, err := json.Marshal(map[string]any{
+		"expected_generation":     req.ExpectedGeneration,
+		"expected_fence":          req.ExpectedFence,
+		"covered_source_revision": req.CoveredSourceRevision,
+		"object_key":              req.ObjectKey,
+		"key_id":                  req.KeyID,
+		"model":                   req.Model,
+		"incomplete":              req.Incomplete,
+	})
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+SearchIndexStatePath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusConflict {
+		var conflict struct {
+			Code  string           `json:"code"`
+			State SearchIndexState `json:"state"`
+		}
+		if err := json.Unmarshal(respBody, &conflict); err == nil && conflict.Code == StatusSearchIndexConflict {
+			return nil, &SearchIndexConflictError{State: conflict.State}
+		}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, respBody)
+	}
+	var state SearchIndexState
+	if err := json.Unmarshal(respBody, &state); err != nil {
+		return nil, fmt.Errorf("controlplane: decode published search index state: %w", err)
+	}
+	return &state, nil
 }
 
 type ListNeedsMigrationResponse struct {
@@ -667,6 +803,7 @@ type RegisterKeyResponse struct {
 	OK                 bool     `json:"ok"`
 	KeyID              string   `json:"key_id"`
 	ETag               string   `json:"etag"`
+	SearchIndexFenced  bool     `json:"-"`
 	WipedV2Attachments []string `json:"wiped_v2_attachments,omitempty"`
 }
 
@@ -706,6 +843,7 @@ func (c *Client) RegisterKey(ctx context.Context, req RegisterKeyRequest) (*Regi
 			return nil, fmt.Errorf("controlplane: decode register-key response: %w", err)
 		}
 	}
+	out.SearchIndexFenced = strings.EqualFold(resp.Header.Get(HeaderSearchIndexFenced), "true")
 	return out, nil
 }
 

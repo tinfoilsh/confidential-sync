@@ -24,11 +24,12 @@ const MaxRequestBytes = 64 << 20
 const AttachmentRequestTimeout = 5 * time.Minute
 
 type Handler struct {
-	deps              Deps
-	verifier          auth.Verifier
-	logger            Logger
-	coordinator       *MigrationCoordinator
-	importCoordinator *ImportCoordinator
+	deps               Deps
+	verifier           auth.Verifier
+	logger             Logger
+	coordinator        *MigrationCoordinator
+	importCoordinator  *ImportCoordinator
+	reindexCoordinator *SearchReindexCoordinator
 }
 
 type Logger interface {
@@ -37,12 +38,19 @@ type Logger interface {
 }
 
 func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
+	if deps.SearchCache == nil {
+		deps.SearchCache = newSearchIndexCache(searchCacheBudgetBytes)
+	}
+	if deps.searchGate == nil {
+		deps.searchGate = newSearchInferenceGate(defaultSearchInferenceLimits)
+	}
 	return &Handler{
-		deps:              deps,
-		verifier:          verifier,
-		logger:            logger,
-		coordinator:       NewMigrationCoordinator(),
-		importCoordinator: NewImportCoordinator(),
+		deps:               deps,
+		verifier:           verifier,
+		logger:             logger,
+		coordinator:        NewMigrationCoordinator(),
+		importCoordinator:  NewImportCoordinator(),
+		reindexCoordinator: NewSearchReindexCoordinator(),
 	}
 }
 
@@ -107,6 +115,14 @@ func (h *Handler) routeSpecs() []routeSpec {
 		}},
 		{"POST", "/v1/import/start", func(h *Handler) http.Handler { return h.authMiddleware(h.importStart) }},
 		{"POST", "/v1/import/status", func(h *Handler) http.Handler { return h.authMiddleware(h.importStatus) }},
+
+		// Chat search. Query runs under the regular auth timeout (one
+		// embedding round trip plus one index read). Reindex kicks off
+		// a detached background job and returns immediately, like
+		// migrate-all; status is a pure in-memory poll.
+		{"POST", "/v1/search/query", func(h *Handler) http.Handler { return h.authMiddleware(h.searchQuery) }},
+		{"POST", "/v1/search/reindex", func(h *Handler) http.Handler { return h.authMiddleware(h.searchReindex) }},
+		{"POST", "/v1/search/reindex-status", func(h *Handler) http.Handler { return h.authMiddleware(h.searchReindexStatus) }},
 
 		{"POST", "/v1/share/seal", func(h *Handler) http.Handler { return h.authMiddleware(h.shareSeal) }},
 		// /v1/share/open is intentionally unauthenticated. Knowing the
@@ -217,6 +233,9 @@ func decode(r *http.Request, dst any) error {
 		}
 		return badRequest("invalid json: " + err.Error())
 	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return badRequest("invalid json: trailing data")
+	}
 	return nil
 }
 
@@ -288,10 +307,26 @@ func (h *Handler) registerKey(w http.ResponseWriter, r *http.Request, sess Sessi
 		writeError(w, err)
 		return
 	}
+	oldSearchObject := ""
+	if searchConfigured(h.deps) {
+		state, stateErr := h.deps.Controlplane.GetSearchIndexState(r.Context(), sess.RawJWT, sess.Claims.Subject)
+		if stateErr != nil {
+			h.deps.logError("key register search state lookup failed: user=%s err=%v", sess.Claims.Subject, stateErr)
+		} else {
+			oldSearchObject = state.ObjectKey
+		}
+	}
 	resp, err := RegisterKey(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if resp.SearchIndexFenced {
+		if err := resetSearchForUser(r.Context(), h.deps, h.reindexCoordinator, sess.Claims.Subject, oldSearchObject); err != nil {
+			h.deps.logError("key-change search reset failed: user=%s err=%v", sess.Claims.Subject, err)
+			writeError(w, err)
+			return
+		}
 	}
 	encode(w, http.StatusOK, resp)
 }
@@ -536,6 +571,56 @@ func importStatusResponse(snap ImportJobSnapshot) ImportStatusResponse {
 		Errors:   snap.Errors,
 		JobID:    snap.ID,
 	}
+}
+
+func (h *Handler) searchQuery(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req SearchQueryRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := SearchQuery(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) searchReindex(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req SearchReindexRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if !searchConfigured(h.deps) {
+		writeError(w, searchUnavailable())
+		return
+	}
+	req, err := normalizeSearchReindexRequest(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	job, started, err := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if started {
+		status = http.StatusAccepted
+	}
+	encode(w, status, job.statusResponse())
+}
+
+func (h *Handler) searchReindexStatus(w http.ResponseWriter, r *http.Request, sess Session) {
+	job := h.reindexCoordinator.Status(sess.Claims.Subject)
+	if job == nil {
+		encode(w, http.StatusOK, SearchReindexStatusResponse{Status: string(MigrationJobIdle)})
+		return
+	}
+	encode(w, http.StatusOK, job.statusResponse())
 }
 
 func (h *Handler) shareSeal(w http.ResponseWriter, r *http.Request, sess Session) {

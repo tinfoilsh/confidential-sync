@@ -56,9 +56,9 @@ var (
 // CanonicalPayloadAAD returns the AAD that binds the payload layer of a v2
 // envelope — the gzipped plaintext sealed under the per-message data key.
 // It deliberately omits the CEK key id so the payload ciphertext is
-// independent of which CEK is current; that is what lets a CEK rotation
-// rewrap only the data key and leave the (potentially large) payload
-// untouched. JSON: sorted keys, no insignificant whitespace, UTF-8.
+// independent of which CEK is current; rewrapping only needs to reseal
+// the data key and can leave the (potentially large) payload untouched.
+// JSON: sorted keys, no insignificant whitespace, UTF-8.
 func CanonicalPayloadAAD(a AAD) ([]byte, error) {
 	if !a.Scope.Valid() {
 		return nil, ErrAADInvalid
@@ -88,8 +88,8 @@ func CanonicalPayloadAAD(a AAD) ([]byte, error) {
 // envelope — the per-message data key sealed under the user's CEK. It binds
 // the wrap to the owning user, the row, the scope, and the specific CEK key
 // id, so a stored wrapped data key cannot be lifted onto another row, user,
-// scope, or key. The kid is the only field that changes across a CEK
-// rotation, which is why it lives here and not in the payload AAD.
+// scope, or key. The kid lives here, not in the payload AAD, so
+// rewrapping can change it without touching the payload ciphertext.
 func CanonicalDEKWrapAAD(a AAD) ([]byte, error) {
 	if !a.Scope.Valid() {
 		return nil, ErrAADInvalid

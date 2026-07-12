@@ -12,6 +12,7 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/inference"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/server"
 )
 
@@ -72,13 +73,35 @@ func main() {
 	// without BUCKETS_URL set; refusing to start would block every
 	// non-attachment flow as well.
 	if !bucketsClient.Configured() {
-		log.Printf("WARN: buckets backend not configured (BUCKETS_URL or CHAT_ATTACHMENTS_BUCKET unset); attachment routes will return 503")
+		log.Printf("WARN: buckets backend not configured (BUCKETS_URL / CHAT_ATTACHMENTS_BUCKET unset or invalid bucket name); attachment routes will return 503")
+	}
+
+	searchBucketsClient := buckets.NewClient(
+		os.Getenv("SEARCH_BUCKETS_URL"),
+		os.Getenv("SEARCH_INDEXES_BUCKET"),
+		&http.Client{Timeout: server.AttachmentRequestTimeout},
+	)
+	embedder, err := inference.NewClient(
+		os.Getenv("TINFOIL_API_KEY"),
+		envDefault("EMBEDDING_MODEL", "nomic-embed-text"),
+	)
+	if err != nil {
+		log.Fatalf("init attested inference client: %v", err)
+	}
+	// Search is a soft feature the same way attachments are: when
+	// either half of its backend (the search index bucket or the
+	// embedding service) is unconfigured, the search routes return
+	// 503 and push/delete skip index upkeep.
+	if !searchBucketsClient.Configured() || !embedder.Configured() {
+		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_INDEXES_BUCKET / TINFOIL_API_KEY unset or invalid bucket name); search routes will return 503")
 	}
 
 	logger := stdLogger{}
 	deps := server.Deps{
 		Controlplane:      cpClient,
 		Buckets:           bucketsClient,
+		SearchBuckets:     searchBucketsClient,
+		Embedder:          embedder,
 		GitSHA:            gitSHA,
 		SyncEnclaveSecret: syncEnclaveSecret,
 		Logger:            logger,

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/bucketstub"
@@ -64,6 +65,25 @@ func TestClientGetEmptyValue(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("empty value decoded to %d bytes", len(got))
+	}
+}
+
+func TestClientGetLimitedRejectsOversizedBody(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, encryptionKeySize)
+	_, c := newStubbedClient(t)
+
+	if err := c.Put(context.Background(), testOwner, testToken, []byte("hello"), key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := c.GetLimited(context.Background(), testOwner, testToken, key, 4); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("expected ErrTooLarge, got %v", err)
+	}
+	got, err := c.GetLimited(context.Background(), testOwner, testToken, key, 5)
+	if err != nil {
+		t.Fatalf("get limited: %v", err)
+	}
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -181,5 +201,44 @@ func TestClientPutWireContract(t *testing.T) {
 	}
 	if !bytes.Equal(gotBody, plaintext) {
 		t.Errorf("body = %q, want %q", gotBody, plaintext)
+	}
+}
+
+// TestConfiguredRejectsMalformedBuckets pins the fail-fast contract: a
+// deploy-config typo must surface as unconfigured (503 path) instead
+// of being interpolated into sidecar request URLs.
+func TestConfiguredRejectsMalformedBuckets(t *testing.T) {
+	valid := []string{"bucket", "sync-chat-attachments", "my.bucket-01", "1.2.3.4.5"}
+	for _, b := range valid {
+		if !NewClient("http://sidecar:9000", b, nil).Configured() {
+			t.Errorf("Configured() = false for valid bucket %q", b)
+		}
+	}
+	invalid := []string{
+		"",
+		"ab",
+		"Bucket",
+		"bucket/extra",
+		"bucket name",
+		"bucket%2Fkey",
+		"bucket?x=1",
+		"-bucket",
+		"bucket-",
+		"bucket\n",
+		"a..b",
+		"192.168.5.4",
+		strings.Repeat("a", 64),
+	}
+	for _, b := range invalid {
+		if NewClient("http://sidecar:9000", b, nil).Configured() {
+			t.Errorf("Configured() = true for malformed bucket %q", b)
+		}
+	}
+	if NewClient("", "bucket", nil).Configured() {
+		t.Error("Configured() = true with empty base URL")
+	}
+	var nilClient *Client
+	if nilClient.Configured() {
+		t.Error("Configured() = true on nil client")
 	}
 }

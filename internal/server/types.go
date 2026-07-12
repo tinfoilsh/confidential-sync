@@ -18,6 +18,13 @@ type PushResponse struct {
 	OK    bool   `json:"ok"`
 	ETag  string `json:"etag"`
 	KeyID string `json:"key_id"`
+	// SearchIndexed reports whether the inline search-index update
+	// succeeded for a chat push: false means the blob stored fine but
+	// the chat won't surface in search until a reindex. A pointer so
+	// the failure signal survives JSON encoding (omitempty would drop
+	// a bare false); absent means search was not applicable to this
+	// push (non-chat scope or search backend unconfigured).
+	SearchIndexed *bool `json:"search_indexed,omitempty"`
 }
 
 type PullKey struct {
@@ -121,8 +128,9 @@ type KeyRegisterBundleInput struct {
 }
 
 type KeyRegisterResponse struct {
-	OK    bool   `json:"ok"`
-	KeyID string `json:"key_id"`
+	OK                bool   `json:"ok"`
+	KeyID             string `json:"key_id"`
+	SearchIndexFenced bool   `json:"-"`
 }
 
 type AddBundleRequest struct {
@@ -232,6 +240,52 @@ type MigrateAllStatusResponse struct {
 	Partial            bool                    `json:"partial"`
 	Scopes             []MigrateAllScopeReport `json:"scopes"`
 	Error              string                  `json:"error,omitempty"`
+}
+
+type SearchQueryRequest struct {
+	Key   string `json:"key"` // base64 32-byte CEK
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type SearchQueryResult struct {
+	ID    string  `json:"id"`
+	Score float64 `json:"score"`
+}
+
+type SearchQueryResponse struct {
+	Results      []SearchQueryResult `json:"results"`
+	TotalIndexed int                 `json:"total_indexed"`
+	// NeedsReindex is true when no readable index exists for the
+	// caller's current key (never built, wrong key, or embedding model
+	// changed); the client should drive /v1/search/reindex.
+	NeedsReindex bool `json:"needs_reindex,omitempty"`
+}
+
+// SearchReindexRequest kicks off a background job that rebuilds the
+// caller's search index from the stored chat blobs. The enclave pages
+// through the chats internally; callers poll /v1/search/reindex-status
+// (or re-POST reindex, which returns the in-flight job) until the
+// status is terminal.
+type SearchReindexRequest struct {
+	Keys []PullKey `json:"keys"`
+}
+
+// SearchReindexStatusResponse is the wire shape returned by both the
+// reindex kickoff and the status poll. Status values match the
+// migration job lifecycle: idle, running, completed, failed.
+type SearchReindexStatusResponse struct {
+	JobID        string `json:"job_id,omitempty"`
+	Status       string `json:"status"`
+	Indexed      int    `json:"indexed"`
+	Failed       int    `json:"failed"`
+	TotalIndexed int    `json:"total_indexed"`
+	// Partial is true when the run stopped at its wall-clock budget
+	// before draining every chat; a fresh kickoff restarts the build.
+	Partial   bool   `json:"partial"`
+	StartedAt string `json:"started_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type HealthResponse struct {

@@ -67,6 +67,9 @@ type cpStub struct {
 	goneAttachments   map[string]bool   // attachmentID → already promoted to v2 (410)
 	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
 	attachmentOwner   map[string]string // attachmentID → clerkUserID (set by tests)
+	sourceRevision    int64
+	searchState       controlplane.SearchIndexState
+	searchConflict    func(controlplane.SearchIndexState) controlplane.SearchIndexState
 	// wipedAttachments seeds the start_fresh response so tests can
 	// exercise the enclave-side buckets cleanup cascade. Real
 	// controlplane returns the ids of the v2 attachments it nulled
@@ -137,6 +140,8 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
 	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
+	s.mux.HandleFunc("GET /api/sync/search-index", s.handleGetSearchIndex)
+	s.mux.HandleFunc("PUT /api/sync/search-index", s.handlePublishSearchIndex)
 	s.mux.HandleFunc("GET /api/sync/needs-migration", s.handleNeedsMigration)
 	s.mux.HandleFunc("POST /api/sync/migration-failure", s.handleMigrationFailure)
 	// key registry
@@ -209,9 +214,15 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 			KeyID: r.Header.Get("X-Key-Id"),
 			Body:  body,
 		}
+		if scope == "chat" {
+			s.sourceRevision++
+		}
 		w.Header().Set("ETag", formatETag(nextETag))
 		w.Header().Set("X-Key-Id", r.Header.Get("X-Key-Id"))
-		json.NewEncoder(w).Encode(map[string]string{"etag": formatETag(nextETag)})
+		json.NewEncoder(w).Encode(map[string]any{
+			"etag":            formatETag(nextETag),
+			"source_revision": s.sourceRevision,
+		})
 	}
 }
 
@@ -251,6 +262,9 @@ func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 			return
 		}
 		delete(s.blobs, key)
+		if scope == "chat" {
+			s.sourceRevision++
+		}
 		// Mirror the real controlplane's chat-delete cascade: drop
 		// matching attachment-index rows and return their v2 ids so
 		// the enclave can wipe the buckets blobs. Tests rely on this
@@ -269,6 +283,7 @@ func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":                   true,
 			"wiped_v2_attachments": wipedV2,
+			"source_revision":      s.sourceRevision,
 		})
 	}
 }
@@ -288,6 +303,72 @@ func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates})
+}
+
+func (s *cpStub) currentSearchState() controlplane.SearchIndexState {
+	state := s.searchState
+	state.SourceRevision = s.sourceRevision
+	state.Incomplete = state.PublicationIncomplete || state.PublishedSourceRevision < state.SourceRevision
+	return state
+}
+
+func (s *cpStub) handleGetSearchIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.currentSearchState())
+}
+
+func (s *cpStub) handlePublishSearchIndex(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ExpectedGeneration    int64  `json:"expected_generation"`
+		ExpectedFence         int64  `json:"expected_fence"`
+		CoveredSourceRevision int64  `json:"covered_source_revision"`
+		ObjectKey             string `json:"object_key"`
+		KeyID                 string `json:"key_id"`
+		Model                 string `json:"model"`
+		Incomplete            bool   `json:"incomplete"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	state := s.currentSearchState()
+	if s.searchConflict != nil {
+		conflict := s.searchConflict
+		s.searchConflict = nil
+		s.searchState = conflict(state)
+		state = s.currentSearchState()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":  controlplane.StatusSearchIndexConflict,
+			"state": state,
+		})
+		return
+	}
+	if req.ExpectedGeneration != state.PublicationGeneration ||
+		req.ExpectedFence != state.FenceGeneration ||
+		req.CoveredSourceRevision < state.PublishedSourceRevision ||
+		req.CoveredSourceRevision > state.SourceRevision ||
+		(s.currentKID != "" && req.KeyID != s.currentKID) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":  controlplane.StatusSearchIndexConflict,
+			"state": state,
+		})
+		return
+	}
+	s.searchState = controlplane.SearchIndexState{
+		PublicationGeneration:   state.PublicationGeneration + 1,
+		FenceGeneration:         state.FenceGeneration,
+		PublishedSourceRevision: req.CoveredSourceRevision,
+		ObjectKey:               req.ObjectKey,
+		KeyID:                   req.KeyID,
+		Model:                   req.Model,
+		PublicationIncomplete:   req.Incomplete,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.currentSearchState())
 }
 
 func (s *cpStub) handleNeedsMigration(w http.ResponseWriter, r *http.Request) {
@@ -338,6 +419,7 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	previousKID := s.currentKID
 	if body.CreatedVia != "start_fresh" {
 		for _, b := range s.blobs {
 			if b.KeyID != "" && b.KeyID != body.KeyID {
@@ -353,11 +435,23 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 		for k, b := range s.blobs {
 			if b.KeyID != body.KeyID {
 				delete(s.blobs, k)
+				if strings.HasPrefix(k, "chat/") {
+					s.sourceRevision++
+				}
 			}
 		}
 	}
 	s.keys[body.KeyID] = struct{}{}
 	s.currentKID = body.KeyID
+	searchIndexFenced := body.CreatedVia == "start_fresh" || (previousKID != "" && previousKID != body.KeyID)
+	if searchIndexFenced {
+		state := s.currentSearchState()
+		s.searchState = controlplane.SearchIndexState{
+			PublicationGeneration: state.PublicationGeneration + 1,
+			FenceGeneration:       state.FenceGeneration + 1,
+			PublicationIncomplete: true,
+		}
+	}
 	if body.InitialBundle != nil {
 		if _, ok := s.bundles[body.KeyID]; !ok {
 			s.bundles[body.KeyID] = map[string]controlplane.CurrentKeyBundle{}
@@ -369,6 +463,9 @@ func (s *cpStub) handleRegisterKey(w http.ResponseWriter, r *http.Request) {
 	// start_fresh. wipedV2Attachments stays empty unless the test
 	// pre-seeded it via s.wipedAttachments.
 	w.Header().Set("Content-Type", "application/json")
+	if searchIndexFenced {
+		w.Header().Set(controlplane.HeaderSearchIndexFenced, "true")
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":                   true,
 		"key_id":               body.KeyID,
@@ -1095,8 +1192,8 @@ func TestMigrateLegacyBlob(t *testing.T) {
 // id as the row id — but a v2 profile envelope is sealed with the AAD
 // id fixed to the profile singleton. The migrate read path must
 // normalize the storage id back to that singleton before rebuilding
-// the AAD; otherwise a v2 profile (e.g. one being re-sealed under a
-// rotated CEK) fails to decrypt and the migration silently blocks.
+// the AAD; otherwise a v2 profile being re-sealed under a different
+// key fails to decrypt and the migration silently blocks.
 func TestMigrateV2ProfileAddressedByClerkUserID(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
@@ -1115,7 +1212,7 @@ func TestMigrateV2ProfileAddressedByClerkUserID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mint the rotation target key the migrate re-seals under.
+	// Mint the target key the migrate re-seals under.
 	targetRaw := make([]byte, cryptopkg.KeySize)
 	if _, err := rand.Read(targetRaw); err != nil {
 		t.Fatal(err)

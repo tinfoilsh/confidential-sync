@@ -19,7 +19,18 @@ import (
 type Deps struct {
 	Controlplane *controlplane.Client
 	Buckets      *buckets.Client
-	GitSHA       string
+	// SearchBuckets talks to the dedicated search-index sidecar,
+	// backed by its own S3 bucket. Optional: when unconfigured the
+	// search routes return 503 and push/delete skip index upkeep.
+	SearchBuckets *buckets.Client
+	// Embedder generates embedding vectors via the Tinfoil inference
+	// service. Optional, gated together with SearchBuckets.
+	Embedder Embedder
+	// SearchCache holds decoded search indices between requests.
+	// Populated by NewHandler; nil disables caching.
+	SearchCache *searchIndexCache
+	searchGate  *searchInferenceGate
+	GitSHA      string
 	// SyncEnclaveSecret is the shared secret used to verify the
 	// X-Legacy-Claim header CP stamps on legacy attachment reads.
 	// Empty in test fixtures, where the legacy-claim guard is
@@ -146,9 +157,24 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		ProjectID:      projectID,
 	})
 	if err == nil {
+		committedAt := time.Now()
 		deps.logInfo("push ok: user=%s scope=%s id=%s kid=%s new_etag=%s",
 			sess.Claims.Subject, scope, req.ID, kidHex, resp.ETag)
-		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID}, nil
+		// Search indexing is inline (the plaintext and CEK only exist
+		// for this request) but best-effort: the blob write already
+		// succeeded, so an indexing failure degrades search instead
+		// of failing the push. The reindex path repairs any gap.
+		var searchIndexed *bool
+		if scope == envelope.ScopeChat && searchConfigured(deps) {
+			indexed := true
+			if idxErr := indexCurrentChatForSearch(ctx, deps, sess, key, req.ID, plaintext, resp.ETag, committedAt, resp.SourceRevision); idxErr != nil {
+				deps.logError("push search index failed: user=%s id=%s err=%v",
+					sess.Claims.Subject, req.ID, idxErr)
+				indexed = false
+			}
+			searchIndexed = &indexed
+		}
+		return &PushResponse{OK: true, ETag: resp.ETag, KeyID: resp.KeyID, SearchIndexed: searchIndexed}, nil
 	}
 
 	if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
@@ -453,9 +479,14 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				sess.Claims.Subject, scope, req.ID, err)
 			return nil, err
 		}
-		if scope == envelope.ScopeChat && cpResp != nil {
-			deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
+		sourceRevision := int64(0)
+		if cpResp != nil {
+			sourceRevision = cpResp.SourceRevision
+			if scope == envelope.ScopeChat {
+				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
+			}
 		}
+		dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
 		deps.logInfo("delete ok: user=%s scope=%s id=%s", sess.Claims.Subject, scope, req.ID)
 		return resp, nil
 	}
@@ -472,6 +503,11 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		if err != nil {
 			var cpe *controlplane.Error
 			if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
+				// The blob may be gone while its index entry survived
+				// (an earlier delete that failed after the blob write,
+				// or a crash between the two); the idempotent replay
+				// must still finish the search cleanup.
+				dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, 0)
 				deps.logInfo("delete already-gone: user=%s scope=%s id=%s",
 					sess.Claims.Subject, scope, req.ID)
 				return &OKResponse{OK: true}, nil
@@ -488,6 +524,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 		attemptReq.IdempotencyKey = idem
 		resp, cpResp, err := deleteOnce(ctx, deps, sess, attemptReq, key, kidHex, blob.ETag)
 		if err == nil {
+			sourceRevision := int64(0)
 			if scope == envelope.ScopeChat && cpResp != nil {
 				// cpResp.WipedV2Attachments is the controlplane's
 				// authoritative list of v2 attachment ids that
@@ -498,6 +535,10 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// trusts controlplane authority over ownership.
 				deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
 			}
+			if cpResp != nil {
+				sourceRevision = cpResp.SourceRevision
+			}
+			dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
 			deps.logInfo("delete ok: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, req.ID, attempt)
 			return resp, nil
@@ -623,7 +664,7 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 	// so the cascade is fire-and-forget per-id and never fails the
 	// register-key call.
 	deleteBucketAttachments(ctx, deps, sess.Claims.Subject, cpResp.WipedV2Attachments)
-	return &KeyRegisterResponse{OK: true, KeyID: kidHex}, nil
+	return &KeyRegisterResponse{OK: true, KeyID: kidHex, SearchIndexFenced: cpResp.SearchIndexFenced}, nil
 }
 
 func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleRequest) (*OKResponse, error) {
@@ -1010,7 +1051,7 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 			if err != nil {
 				// Auth-layer failures (user JWT expired without
 				// service-auth fallback, missing enclave secret,
-				// rotated keys) will hit every subsequent call
+				// wrong keys) will hit every subsequent call
 				// the same way. Surface Partial=true so the
 				// client retries with a fresh token instead of
 				// burning the loop on a thousand 401s.
@@ -1082,7 +1123,7 @@ func cloneScopeReport(in MigrateAllScopeReport) MigrateAllScopeReport {
 // call fails fast with STALE_KEY instead of letting the migration loop
 // fire a doomed rewrap against every blob — those all return STALE_KEY
 // from the controlplane CAS and only produce a 409 storm. The client
-// must reconcile the key (recovery / rotation) before retrying.
+// must reconcile the key (recovery / key change) before retrying.
 func ensureCurrentKeyRegistered(
 	ctx context.Context,
 	deps Deps,
@@ -1160,7 +1201,7 @@ func currentPrimaryKeyIs(ctx context.Context, deps Deps, sess Session, targetKID
 // isAuthError reports whether err originates from a 401/403 from
 // controlplane. Used to abort the migrate-all loop cleanly instead of
 // hammering CP once the auth chain has broken (expired user JWT,
-// missing service secret, rotated keys).
+// missing service secret, wrong keys).
 func isAuthError(err error) bool {
 	var cpe *controlplane.Error
 	if !errors.As(err, &cpe) {
@@ -1199,7 +1240,7 @@ func migrateOne(
 			// migration pass or a user push. The row is in the desired
 			// end state, so count it migrated rather than re-sealing it
 			// or recording a failure. A v2 row under a different key
-			// (a key rotation) still falls through to the rewrap below.
+			// still falls through to the rewrap below.
 			deps.logInfo("migrate item already at target: user=%s scope=%s id=%s attempt=%d",
 				sess.Claims.Subject, scope, id, attempt)
 			return true

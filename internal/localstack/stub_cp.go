@@ -48,6 +48,8 @@ type StubCP struct {
 	currentKID string
 	bundles    map[string]map[string]controlplane.CurrentKeyBundle
 	deletes    map[string]time.Time
+	sourceRev  int64
+	search     controlplane.SearchIndexState
 
 	buckets             *bucketstub.Store
 	legacyAttachments   map[string][]byte
@@ -111,6 +113,8 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
+	mux.HandleFunc("GET /api/sync/search-index", s.getSearchIndex)
+	mux.HandleFunc("PUT /api/sync/search-index", s.publishSearchIndex)
 	mux.HandleFunc("GET /api/sync/needs-migration", s.needsMigration)
 	mux.HandleFunc("POST /api/sync/migration-failure", s.migrationFailure)
 	mux.HandleFunc("POST /api/sync/rewrap", s.rewrap)
@@ -274,10 +278,16 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 			Body:      body,
 			UpdatedAt: time.Now().UTC(),
 		}
+		if scope == "chat" {
+			s.sourceRev++
+		}
 		delete(s.deletes, key)
 		w.Header().Set("ETag", formatETag(next))
 		w.Header().Set("X-Key-Id", r.Header.Get("X-Key-Id"))
-		_ = json.NewEncoder(w).Encode(map[string]string{"etag": formatETag(next)})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"etag":            formatETag(next),
+			"source_revision": s.sourceRev,
+		})
 	}
 }
 
@@ -325,6 +335,9 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 			return
 		}
 		delete(s.blobs, key)
+		if scope == "chat" && blob != nil {
+			s.sourceRev++
+		}
 		s.deletes[key] = time.Now().UTC()
 		wipedV2 := []string{}
 		if scope == "chat" {
@@ -339,6 +352,7 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":                   true,
 			"wiped_v2_attachments": wipedV2,
+			"source_revision":      s.sourceRev,
 		})
 	}
 }
@@ -373,6 +387,63 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates, Deletes: deletes})
+}
+
+func (s *StubCP) currentSearchIndex() controlplane.SearchIndexState {
+	state := s.search
+	state.SourceRevision = s.sourceRev
+	state.Incomplete = state.PublicationIncomplete || state.PublishedSourceRevision < state.SourceRevision
+	return state
+}
+
+func (s *StubCP) getSearchIndex(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.currentSearchIndex())
+}
+
+func (s *StubCP) publishSearchIndex(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var req struct {
+		ExpectedGeneration    int64  `json:"expected_generation"`
+		ExpectedFence         int64  `json:"expected_fence"`
+		CoveredSourceRevision int64  `json:"covered_source_revision"`
+		ObjectKey             string `json:"object_key"`
+		KeyID                 string `json:"key_id"`
+		Model                 string `json:"model"`
+		Incomplete            bool   `json:"incomplete"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	state := s.currentSearchIndex()
+	if req.ExpectedGeneration != state.PublicationGeneration ||
+		req.ExpectedFence != state.FenceGeneration ||
+		req.CoveredSourceRevision < state.PublishedSourceRevision ||
+		req.CoveredSourceRevision > state.SourceRevision ||
+		(s.currentKID != "" && req.KeyID != s.currentKID) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":  controlplane.StatusSearchIndexConflict,
+			"state": state,
+		})
+		return
+	}
+	s.search = controlplane.SearchIndexState{
+		PublicationGeneration:   state.PublicationGeneration + 1,
+		FenceGeneration:         state.FenceGeneration,
+		PublishedSourceRevision: req.CoveredSourceRevision,
+		ObjectKey:               req.ObjectKey,
+		KeyID:                   req.KeyID,
+		Model:                   req.Model,
+		PublicationIncomplete:   req.Incomplete,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.currentSearchIndex())
 }
 
 func (s *StubCP) needsMigration(w http.ResponseWriter, r *http.Request) {
@@ -646,6 +717,7 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"code": controlplane.StatusStaleKey, "current_key_id": s.currentKID})
 		return
 	}
+	previousKID := s.currentKID
 	wipedAttachments := []string{}
 	if body.CreatedVia == "start_fresh" {
 		// Mirror the controlplane's atomic wipe: drop every blob
@@ -655,6 +727,9 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		for k, b := range s.blobs {
 			if b.KeyID != body.KeyID {
 				delete(s.blobs, k)
+				if strings.HasPrefix(k, "chat/") {
+					s.sourceRev++
+				}
 			}
 		}
 		for aid := range s.attachmentIndex {
@@ -675,6 +750,15 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 	}
 	s.keys[body.KeyID] = struct{}{}
 	s.currentKID = body.KeyID
+	searchIndexFenced := body.CreatedVia == "start_fresh" || (previousKID != "" && previousKID != body.KeyID)
+	if searchIndexFenced {
+		state := s.currentSearchIndex()
+		s.search = controlplane.SearchIndexState{
+			PublicationGeneration: state.PublicationGeneration + 1,
+			FenceGeneration:       state.FenceGeneration + 1,
+			PublicationIncomplete: true,
+		}
+	}
 	if body.InitialBundle != nil {
 		if _, ok := s.bundles[body.KeyID]; !ok {
 			s.bundles[body.KeyID] = map[string]controlplane.CurrentKeyBundle{}
@@ -682,6 +766,9 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		s.bundles[body.KeyID][body.InitialBundle.CredentialID] = *body.InitialBundle
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if searchIndexFenced {
+		w.Header().Set(controlplane.HeaderSearchIndexFenced, "true")
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":                   true,
 		"key_id":               body.KeyID,
