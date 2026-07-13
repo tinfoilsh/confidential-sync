@@ -65,18 +65,19 @@ func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client 
 // the enclave returns to its own clients but the controlplane does not
 // emit.
 const (
-	HeaderAuth              = "Authorization"
-	HeaderKeyID             = "X-Key-Id"
-	HeaderIfMatch           = "If-Match"
-	HeaderIdempotency       = "X-Idempotency-Key"
-	HeaderOperationHash     = "X-Operation-Hash"
-	HeaderMessageCount      = "X-Message-Count"
-	HeaderProjectID         = "X-Project-Id"
-	HeaderProjectIDSet      = "X-Project-Id-Set"
-	HeaderETag              = "ETag"
-	HeaderSearchIndexFenced = "X-Search-Index-Fenced"
-	HeaderContentType       = "Content-Type"
-	HeaderServiceSecret     = "X-Sync-Enclave-Secret"
+	HeaderAuth                = "Authorization"
+	HeaderKeyID               = "X-Key-Id"
+	HeaderIfMatch             = "If-Match"
+	HeaderIdempotency         = "X-Idempotency-Key"
+	HeaderOperationHash       = "X-Operation-Hash"
+	HeaderProfileSyncProtocol = "X-Profile-Sync-Protocol"
+	HeaderMessageCount        = "X-Message-Count"
+	HeaderProjectID           = "X-Project-Id"
+	HeaderProjectIDSet        = "X-Project-Id-Set"
+	HeaderETag                = "ETag"
+	HeaderSearchIndexFenced   = "X-Search-Index-Fenced"
+	HeaderContentType         = "Content-Type"
+	HeaderServiceSecret       = "X-Sync-Enclave-Secret"
 	// HeaderClerkUserID carries the user id the enclave already
 	// verified out of the user's JWT. Paired with HeaderServiceSecret
 	// it stands in for a fresh Clerk bearer token on the
@@ -86,18 +87,20 @@ const (
 )
 
 const (
-	IfMatchCreateOnly = "0"
-	IfMatchAnyKey     = "*"
+	IfMatchCreateOnly     = "0"
+	IfMatchAnyKey         = "*"
+	ProfileSyncProtocolV2 = 2
 )
 
 const (
-	StatusPreconditionRequired      = "PRECONDITION_REQUIRED"
-	StatusStaleKey                  = "STALE_KEY"
-	StatusStaleBlob                 = "STALE_BLOB"
-	StatusExistingDataUnderOtherKey = "EXISTING_DATA_UNDER_OTHER_KEY"
-	StatusIdempotencyConflict       = "IDEMPOTENCY_CONFLICT"
-	StatusSearchIndexConflict       = "SEARCH_INDEX_CONFLICT"
-	StatusLegacyBlobNotMigrated     = "LEGACY_BLOB_NOT_MIGRATED"
+	StatusPreconditionRequired       = "PRECONDITION_REQUIRED"
+	StatusStaleKey                   = "STALE_KEY"
+	StatusStaleBlob                  = "STALE_BLOB"
+	StatusExistingDataUnderOtherKey  = "EXISTING_DATA_UNDER_OTHER_KEY"
+	StatusIdempotencyConflict        = "IDEMPOTENCY_CONFLICT"
+	StatusSearchIndexConflict        = "SEARCH_INDEX_CONFLICT"
+	StatusProfileSyncUpgradeRequired = "PROFILE_SYNC_UPGRADE_REQUIRED"
+	StatusLegacyBlobNotMigrated      = "LEGACY_BLOB_NOT_MIGRATED"
 )
 
 // maxLegacyAttachmentBytes caps the body read for legacy attachment
@@ -163,13 +166,14 @@ type PutBlobRequest struct {
 	// enclave's auth boundary. Forwarded as X-Clerk-User-Id so the
 	// controlplane can accept the call via service auth and skip
 	// re-verifying the proxied JWT, which may expire mid-migration.
-	ClerkUserID    string
-	KeyIDHex       string
-	IfMatch        string
-	IdempotencyKey string
-	OperationHash  string
-	Rewrap         bool
-	Ciphertext     []byte
+	ClerkUserID         string
+	KeyIDHex            string
+	IfMatch             string
+	IdempotencyKey      string
+	OperationHash       string
+	ProfileSyncProtocol int
+	Rewrap              bool
+	Ciphertext          []byte
 	// MessageCount is forwarded as X-Message-Count for chat scope so
 	// the controlplane can persist the legacy column. Nil for scopes
 	// other than chat and for rewrap.
@@ -287,6 +291,9 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	}
 	if req.OperationHash != "" {
 		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	}
+	if req.ProfileSyncProtocol > 0 {
+		httpReq.Header.Set(HeaderProfileSyncProtocol, strconv.Itoa(req.ProfileSyncProtocol))
 	}
 	if req.MessageCount != nil {
 		httpReq.Header.Set(HeaderMessageCount, strconv.Itoa(*req.MessageCount))

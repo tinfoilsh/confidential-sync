@@ -111,6 +111,69 @@ func TestPutBlobSuccess(t *testing.T) {
 	}
 }
 
+func TestPutProfileForwardsSyncProtocol(t *testing.T) {
+	st := newStub(t)
+	st.handle1("PUT", "/api/sync/blob/profile", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderProfileSyncProtocol); got != "2" {
+			t.Errorf("%s: %q", HeaderProfileSyncProtocol, got)
+		}
+		w.Header().Set(HeaderETag, "1")
+		w.Header().Set(HeaderKeyID, strings.Repeat("a", 32))
+	})
+
+	c := NewClient(st.server.URL, nil)
+	_, err := c.PutBlob(context.Background(), PutBlobRequest{
+		Scope:               "profile",
+		ID:                  "profile",
+		KeyIDHex:            strings.Repeat("a", 32),
+		IfMatch:             IfMatchCreateOnly,
+		IdempotencyKey:      "profile-protocol",
+		OperationHash:       "opHash",
+		ProfileSyncProtocol: ProfileSyncProtocolV2,
+		Ciphertext:          []byte("envelope"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPutProfileUpgradeRequired(t *testing.T) {
+	st := newStub(t)
+	st.handle1("PUT", "/api/sync/blob/profile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUpgradeRequired)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code":             StatusProfileSyncUpgradeRequired,
+			"minimum_protocol": ProfileSyncProtocolV2,
+		})
+	})
+
+	c := NewClient(st.server.URL, nil)
+	_, err := c.PutBlob(context.Background(), PutBlobRequest{
+		Scope:               "profile",
+		ID:                  "profile",
+		KeyIDHex:            strings.Repeat("a", 32),
+		IfMatch:             "1",
+		IdempotencyKey:      "profile-upgrade",
+		OperationHash:       "opHash",
+		ProfileSyncProtocol: 1,
+		Ciphertext:          []byte("envelope"),
+	})
+	if err == nil {
+		t.Fatal("expected profile sync upgrade error")
+	}
+	if !IsCode(err, StatusProfileSyncUpgradeRequired) {
+		t.Fatalf("error = %v, want %s", err, StatusProfileSyncUpgradeRequired)
+	}
+	var cpErr *Error
+	if !errors.As(err, &cpErr) {
+		t.Fatalf("error type = %T, want *Error", err)
+	}
+	if cpErr.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("status = %d, want %d", cpErr.StatusCode, http.StatusUpgradeRequired)
+	}
+}
+
 func TestPutBlobStaleBlob(t *testing.T) {
 	st := newStub(t)
 	st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {

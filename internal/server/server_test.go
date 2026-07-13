@@ -58,18 +58,19 @@ type cpStub struct {
 	currentKID string
 	// noKeyHasData simulates a newer controlplane that answers the
 	// no-key case with 200 + has_data instead of a bare 404.
-	noKeyHasData      bool
-	bundles           map[string]map[string]controlplane.CurrentKeyBundle
-	registeredOps     map[string]bool
-	migrationFailures map[string]int
-	needsMigration    []cpNeedsMigration
-	legacyAttachments map[string][]byte // attachmentID → ciphertext (set by tests)
-	goneAttachments   map[string]bool   // attachmentID → already promoted to v2 (410)
-	attachmentIndex   map[string]string // attachmentID → chatID (populated by handler)
-	attachmentOwner   map[string]string // attachmentID → clerkUserID (set by tests)
-	sourceRevision    int64
-	searchState       controlplane.SearchIndexState
-	searchConflict    func(controlplane.SearchIndexState) controlplane.SearchIndexState
+	noKeyHasData               bool
+	bundles                    map[string]map[string]controlplane.CurrentKeyBundle
+	registeredOps              map[string]bool
+	migrationFailures          map[string]int
+	needsMigration             []cpNeedsMigration
+	legacyAttachments          map[string][]byte // attachmentID → ciphertext (set by tests)
+	goneAttachments            map[string]bool   // attachmentID → already promoted to v2 (410)
+	attachmentIndex            map[string]string // attachmentID → chatID (populated by handler)
+	attachmentOwner            map[string]string // attachmentID → clerkUserID (set by tests)
+	sourceRevision             int64
+	searchState                controlplane.SearchIndexState
+	searchConflict             func(controlplane.SearchIndexState) controlplane.SearchIndexState
+	minimumProfileSyncProtocol int
 	// wipedAttachments seeds the start_fresh response so tests can
 	// exercise the enclave-side buckets cleanup cascade. Real
 	// controlplane returns the ids of the v2 attachments it nulled
@@ -194,6 +195,18 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 		key := s.putBlobKey(scope, id)
 		ifMatch := r.Header.Get("If-Match")
 		blob := s.blobs[key]
+		if scope == "profile" && blob != nil && s.minimumProfileSyncProtocol > 0 {
+			protocol, _ := strconv.Atoi(r.Header.Get(controlplane.HeaderProfileSyncProtocol))
+			if protocol < s.minimumProfileSyncProtocol {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUpgradeRequired)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":             controlplane.StatusProfileSyncUpgradeRequired,
+					"minimum_protocol": s.minimumProfileSyncProtocol,
+				})
+				return
+			}
+		}
 		if blob != nil && ifMatch != "" {
 			if ifMatch != formatETag(blob.ETag) {
 				w.WriteHeader(http.StatusPreconditionFailed)
@@ -735,11 +748,11 @@ func TestBlobOperationHashIgnoresRandomizedEnvelopeBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, plaintext)
+	a, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", 0, aadBytes, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, plaintext)
+	b, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", 0, aadBytes, plaintext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -747,7 +760,7 @@ func TestBlobOperationHashIgnoresRandomizedEnvelopeBytes(t *testing.T) {
 		t.Fatal("op-hash changed for identical logical blob write")
 	}
 
-	c, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", aadBytes, []byte(`{"id":"chat_1","messages":[{"role":"user"}]}`))
+	c, err := operationHashForBlob(f.userKey, http.MethodPut, "chat", "chat_1", f.userKeyID, "0", "idem-1", 0, aadBytes, []byte(`{"id":"chat_1","messages":[{"role":"user"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1398,6 +1411,155 @@ func TestIdempotencyHeaderForwarded(t *testing.T) {
 	}
 	if gotHash == "" {
 		t.Fatalf("X-Operation-Hash not forwarded")
+	}
+}
+
+func TestProfileSyncProtocolForwardedAndHashBound(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	var (
+		mu           sync.Mutex
+		seenProtocol string
+		seenHash     string
+	)
+	f.cp.captureHeaders = func(r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/sync/blob/profile" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		seenProtocol = r.Header.Get(controlplane.HeaderProfileSyncProtocol)
+		seenHash = r.Header.Get(controlplane.HeaderOperationHash)
+	}
+
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "profile",
+		ID:             "profile",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"theme":"dark"}`)),
+		IdempotencyKey: "profile-protocol-2",
+		Metadata: map[string]any{
+			profileSyncProtocolMetadataKey: float64(controlplane.ProfileSyncProtocolV2),
+		},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d body=%s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	gotProtocol := seenProtocol
+	gotHash := seenHash
+	mu.Unlock()
+	if gotProtocol != strconv.Itoa(controlplane.ProfileSyncProtocolV2) {
+		t.Fatalf("%s = %q, want %d", controlplane.HeaderProfileSyncProtocol, gotProtocol, controlplane.ProfileSyncProtocolV2)
+	}
+	if gotHash == "" {
+		t.Fatal("profile operation hash was not forwarded")
+	}
+
+	aadBytes, err := envelope.CanonicalPayloadAAD(envelope.AAD{
+		KeyIDHex:    f.userKeyID,
+		Scope:       envelope.ScopeProfile,
+		ID:          envelope.ProfileSingletonID,
+		ClerkUserID: f.userSub,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte(`{"theme":"dark"}`)
+	v1Hash, err := operationHashForBlob(f.userKey, http.MethodPut, "profile", "profile", f.userKeyID, "0", "same-idem", 1, aadBytes, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Hash, err := operationHashForBlob(f.userKey, http.MethodPut, "profile", "profile", f.userKeyID, "0", "same-idem", controlplane.ProfileSyncProtocolV2, aadBytes, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1Hash == v2Hash {
+		t.Fatal("operation hash did not bind profile sync protocol")
+	}
+}
+
+func TestProfileSyncProtocolUpgradeRequiredPassesThrough(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	createResp, createBody := f.post("/v1/sync/push", PushRequest{
+		Scope:          "profile",
+		ID:             "profile",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"theme":"dark"}`)),
+		IdempotencyKey: "profile-create-before-gate",
+	}, tok)
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status: %d body=%s", createResp.StatusCode, createBody)
+	}
+
+	f.cp.mu.Lock()
+	f.cp.minimumProfileSyncProtocol = controlplane.ProfileSyncProtocolV2
+	f.cp.mu.Unlock()
+
+	etag := "1"
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "profile",
+		ID:             "profile",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"theme":"light"}`)),
+		IfMatch:        &etag,
+		IdempotencyKey: "profile-old-protocol",
+		Metadata: map[string]any{
+			profileSyncProtocolMetadataKey: 1,
+		},
+	}, tok)
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Fatalf("status: %d body=%s", resp.StatusCode, body)
+	}
+	var appErr AppError
+	if err := json.Unmarshal(body, &appErr); err != nil {
+		t.Fatal(err)
+	}
+	if appErr.Code != CodeProfileSyncUpgradeRequired {
+		t.Fatalf("code = %q, want %q", appErr.Code, CodeProfileSyncUpgradeRequired)
+	}
+}
+
+func TestProfileSyncProtocolMetadataIgnoredOutsideProfileScope(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	var (
+		mu           sync.Mutex
+		seenProtocol string
+	)
+	f.cp.captureHeaders = func(r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/sync/blob/chat/protocol-chat" {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		seenProtocol = r.Header.Get(controlplane.HeaderProfileSyncProtocol)
+	}
+
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "protocol-chat",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"messages":[]}`)),
+		IdempotencyKey: "chat-protocol-metadata",
+		Metadata: map[string]any{
+			profileSyncProtocolMetadataKey: "not-a-version",
+		},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d body=%s", resp.StatusCode, body)
+	}
+
+	mu.Lock()
+	gotProtocol := seenProtocol
+	mu.Unlock()
+	if gotProtocol != "" {
+		t.Fatalf("profile protocol leaked onto chat write: %q", gotProtocol)
 	}
 }
 

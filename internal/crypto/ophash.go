@@ -71,6 +71,9 @@ func DeriveOpHashKey(cek []byte) ([]byte, error) {
 //	                share / attachment)
 //	Envelope:       optional v2 envelope bytes for callers that need
 //	                to bind a specific ciphertext generation
+//	ProfileSyncProtocol:
+//	                optional profile merge protocol version forwarded
+//	                to the controlplane
 //
 // Blob writes pass plaintext in Body and canonical AAD in AAD. The
 // plaintext is protected by a keyed MAC under K_op before it ever
@@ -78,14 +81,15 @@ func DeriveOpHashKey(cek []byte) ([]byte, error) {
 // the controlplane's brute-force boundary while retries stay stable
 // across AES-GCM nonce changes.
 type CanonicalInput struct {
-	Method         string
-	Path           string
-	KeyIDHex       string
-	IfMatch        string
-	IdempotencyKey string
-	Body           []byte
-	AAD            []byte
-	Envelope       []byte
+	Method              string
+	Path                string
+	KeyIDHex            string
+	IfMatch             string
+	IdempotencyKey      string
+	Body                []byte
+	AAD                 []byte
+	Envelope            []byte
+	ProfileSyncProtocol string
 }
 
 // AppendCanonical writes the canonical encoding of the tuple to dst and
@@ -93,7 +97,8 @@ type CanonicalInput struct {
 // big-endian uint32. This is the exact byte string the MAC is computed
 // over and the same encoding the web client uses.
 //
-// AAD and Envelope are only appended when at least one is present.
+// AAD and Envelope are only appended when at least one is present or
+// ProfileSyncProtocol is set.
 // Body-only operations (RegisterKey, AddBundle, rewrap, etc.) keep
 // the historical encoding so cached sync_idempotency_keys entries
 // continue to verify after this rollout. Blob mutations carry AAD so
@@ -105,9 +110,12 @@ func AppendCanonical(dst []byte, in CanonicalInput) []byte {
 	dst = appendLenPrefixed(dst, []byte(in.IfMatch))
 	dst = appendLenPrefixed(dst, []byte(in.IdempotencyKey))
 	dst = appendLenPrefixed(dst, in.Body)
-	if in.AAD != nil || in.Envelope != nil {
+	if in.AAD != nil || in.Envelope != nil || in.ProfileSyncProtocol != "" {
 		dst = appendLenPrefixed(dst, in.AAD)
 		dst = appendLenPrefixed(dst, in.Envelope)
+	}
+	if in.ProfileSyncProtocol != "" {
+		dst = appendLenPrefixed(dst, []byte(in.ProfileSyncProtocol))
 	}
 	return dst
 }
