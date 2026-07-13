@@ -1299,6 +1299,13 @@ func profileSyncProtocolFromMetadata(scope string, metadata map[string]any) (int
 		return 0, nil
 	}
 
+	if value, ok := raw.(int); ok {
+		if value <= 0 || value > math.MaxInt32 {
+			return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
+		}
+		return value, nil
+	}
+
 	value, ok := raw.(float64)
 	if !ok || value <= 0 || value > math.MaxInt32 || math.Trunc(value) != value {
 		return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)

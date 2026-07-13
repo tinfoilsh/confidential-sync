@@ -1414,6 +1414,18 @@ func TestIdempotencyHeaderForwarded(t *testing.T) {
 	}
 }
 
+func TestProfileSyncProtocolFromMetadataAcceptsProgrammaticInt(t *testing.T) {
+	got, err := profileSyncProtocolFromMetadata("profile", map[string]any{
+		profileSyncProtocolMetadataKey: controlplane.ProfileSyncProtocolV2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != controlplane.ProfileSyncProtocolV2 {
+		t.Fatalf("protocol = %d, want %d", got, controlplane.ProfileSyncProtocolV2)
+	}
+}
+
 func TestProfileSyncProtocolForwardedAndHashBound(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
