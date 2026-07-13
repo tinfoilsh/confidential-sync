@@ -1299,26 +1299,11 @@ func profileSyncProtocolFromMetadata(scope string, metadata map[string]any) (int
 		return 0, nil
 	}
 
-	var protocol int64
-	switch value := raw.(type) {
-	case float64:
-		if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value > math.MaxInt32 {
-			return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
-		}
-		protocol = int64(value)
-	case int:
-		protocol = int64(value)
-	case int32:
-		protocol = int64(value)
-	case int64:
-		protocol = value
-	default:
+	value, ok := raw.(float64)
+	if !ok || value <= 0 || value > math.MaxInt32 || math.Trunc(value) != value {
 		return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
 	}
-	if protocol <= 0 || protocol > math.MaxInt32 {
-		return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
-	}
-	return int(protocol), nil
+	return int(value), nil
 }
 
 // projectIDFromMetadata pulls the optional `projectId` field out of
