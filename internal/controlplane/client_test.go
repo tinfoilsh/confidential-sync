@@ -200,6 +200,42 @@ func TestGetBlobReturnsCiphertextAndHeaders(t *testing.T) {
 	if resp.ETag != "7" || resp.KeyID != strings.Repeat("c", 32) {
 		t.Fatalf("headers: etag=%q keyid=%q", resp.ETag, resp.KeyID)
 	}
+	if resp.ProjectIDSet || resp.ProjectID != nil {
+		t.Fatalf("missing project headers became authoritative: %+v", resp)
+	}
+}
+
+func TestGetChatBlobReturnsAuthoritativeProjectMetadata(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderProjectIDSet, "1")
+		w.Header().Set(HeaderProjectID, "project-1")
+		_, _ = w.Write([]byte("opaque-bytes"))
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.GetBlob(context.Background(), "chat", "chat_1", "j", "user_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.ProjectIDSet || resp.ProjectID == nil || *resp.ProjectID != "project-1" {
+		t.Fatalf("project metadata: %+v", resp)
+	}
+}
+
+func TestGetChatBlobReturnsAuthoritativeRootProjectMetadata(t *testing.T) {
+	st := newStub(t)
+	st.handle1("GET", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(HeaderProjectIDSet, "1")
+		_, _ = w.Write([]byte("opaque-bytes"))
+	})
+	c := NewClient(st.server.URL, nil)
+	resp, err := c.GetBlob(context.Background(), "chat", "chat_1", "j", "user_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.ProjectIDSet || resp.ProjectID != nil {
+		t.Fatalf("project metadata: %+v", resp)
+	}
 }
 
 func TestHeadBlobReturnsMetadataOnly(t *testing.T) {
@@ -563,5 +599,56 @@ func TestAddAuthIgnoresJWTPayloadForUserID(t *testing.T) {
 	maliciousJWT := header + "." + body + ".sig"
 	if err := c.DeleteAttachmentIndex(context.Background(), maliciousJWT, "user_real", "att_1"); err != nil {
 		t.Fatalf("delete attachment index: %v", err)
+	}
+}
+
+func TestClaimSearchIndexDeletions(t *testing.T) {
+	st := newStub(t)
+	st.handle1("POST", "/api/sync/search-index-deletions/claim", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderServiceSecret); got != "sync-secret" {
+			t.Errorf("service secret: %q", got)
+		}
+		var body struct {
+			BatchSize int `json:"batch_size"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.BatchSize != 25 {
+			t.Errorf("batch size: %d", body.BatchSize)
+		}
+		_, _ = io.WriteString(w, `{"claim_token":"claim-1","deletions":[{"id":"row-1","clerk_user_id":"user-1","object_key":"object-1"}]}`)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	claim, err := c.ClaimSearchIndexDeletions(context.Background(), 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.ClaimToken != "claim-1" || len(claim.Deletions) != 1 || claim.Deletions[0].ObjectKey != "object-1" {
+		t.Fatalf("unexpected claim: %+v", claim)
+	}
+}
+
+func TestAckSearchIndexDeletions(t *testing.T) {
+	st := newStub(t)
+	st.handle1("POST", "/api/sync/search-index-deletions/ack", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HeaderServiceSecret); got != "sync-secret" {
+			t.Errorf("service secret: %q", got)
+		}
+		var body struct {
+			ClaimToken string   `json:"claim_token"`
+			IDs        []string `json:"ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.ClaimToken != "claim-1" || len(body.IDs) != 1 || body.IDs[0] != "row-1" {
+			t.Errorf("unexpected ack: %+v", body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	if err := c.AckSearchIndexDeletions(context.Background(), "claim-1", []string{"row-1"}); err != nil {
+		t.Fatal(err)
 	}
 }

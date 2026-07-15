@@ -682,7 +682,7 @@ func TestRetainedReindexRestartsWhenIndexNeedsRepair(t *testing.T) {
 	}
 }
 
-func TestReindexTransientPullFailureRemainsPartial(t *testing.T) {
+func TestReindexTransientPullFailureFailsWithPartialIndex(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_ok", "Pond", "a duck swam by")
@@ -710,8 +710,11 @@ func TestReindexTransientPullFailureRemainsPartial(t *testing.T) {
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
 	partial := f.runReindexJob(t, tok)
-	if partial.Status != string(MigrationJobCompleted) || !partial.Partial || partial.Failed != 1 || partial.TotalIndexed != 1 {
-		t.Fatalf("transient failure produced a clean rebuild: %+v", partial)
+	if partial.Status != string(MigrationJobFailed) || !partial.Partial || partial.Failed != 1 || partial.TotalIndexed != 1 {
+		t.Fatalf("transient failure did not fail with a partial index: %+v", partial)
+	}
+	if partial.Error != errSearchReindexIncomplete.Error() {
+		t.Fatalf("transient failure exposed unexpected error: %q", partial.Error)
 	}
 	if got := f.query(t, tok, "goose"); !got.NeedsReindex {
 		t.Fatalf("transient failure did not request repair: %+v", got)
@@ -723,6 +726,32 @@ func TestReindexTransientPullFailureRemainsPartial(t *testing.T) {
 	}
 	if got := f.query(t, tok, "goose"); got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_flaky" {
 		t.Fatalf("repaired chat is not searchable: %+v", got)
+	}
+}
+
+func TestReindexMalformedChatFailsWithPartialIndex(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_ok", "Pond", "a duck swam by")
+	f.pushChat(t, tok, "chat_bad", "Park", "a goose flew past")
+
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/chat_bad"].Body = []byte("malformed")
+	f.cp.mu.Unlock()
+	if err := f.handler.deps.SearchBuckets.Delete(context.Background(), f.userSub, f.searchObjectKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.handler.deps.SearchCache.drop(f.userSub)
+
+	status := f.runReindexJob(t, tok)
+	if status.Status != string(MigrationJobFailed) || !status.Partial || status.Failed != 1 || status.TotalIndexed != 1 {
+		t.Fatalf("malformed chat did not fail with a partial index: %+v", status)
+	}
+	if status.Error != errSearchReindexIncomplete.Error() {
+		t.Fatalf("malformed chat exposed unexpected error: %q", status.Error)
+	}
+	if got := f.query(t, tok, "duck"); !got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_ok" {
+		t.Fatalf("partial index was not retained: %+v", got)
 	}
 }
 
@@ -785,11 +814,11 @@ func TestFinalReindexPageReportsNewerPublicationGap(t *testing.T) {
 	job := newSearchReindexJob(f.userSub, reindexKeyFingerprint(req.Keys))
 	err = runSearchReindex(context.Background(), f.handler.deps, f.searchSession(), req, job)
 	job.finish(err)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errSearchReindexIncomplete) {
+		t.Fatalf("run error = %v, want incomplete", err)
 	}
 	status := job.statusResponse()
-	if status.Status != string(MigrationJobCompleted) || !status.Partial {
+	if status.Status != string(MigrationJobFailed) || !status.Partial || status.Error != errSearchReindexIncomplete.Error() {
 		t.Fatalf("newer publication gap was reported healthy: %+v", status)
 	}
 	if ix := f.loadIndex(t); !ix.Incomplete {

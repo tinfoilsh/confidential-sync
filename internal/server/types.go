@@ -48,14 +48,16 @@ type PullRequest struct {
 }
 
 type PullItem struct {
-	ID          string `json:"id"`
-	OK          bool   `json:"ok"`
-	Plaintext   string `json:"plaintext,omitempty"`
-	KeyID       string `json:"key_id,omitempty"`
-	ETag        string `json:"etag,omitempty"`
-	NeedsRewrap bool   `json:"needs_rewrap,omitempty"`
-	Code        string `json:"code,omitempty"`
-	Reason      string `json:"reason,omitempty"`
+	ID           string  `json:"id"`
+	OK           bool    `json:"ok"`
+	Plaintext    string  `json:"plaintext,omitempty"`
+	KeyID        string  `json:"key_id,omitempty"`
+	ETag         string  `json:"etag,omitempty"`
+	ProjectIDSet bool    `json:"project_id_set,omitempty"`
+	ProjectID    *string `json:"project_id,omitempty"`
+	NeedsRewrap  bool    `json:"needs_rewrap,omitempty"`
+	Code         string  `json:"code,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
 }
 
 type PullResponse struct {
@@ -280,8 +282,9 @@ type SearchReindexStatusResponse struct {
 	Indexed      int    `json:"indexed"`
 	Failed       int    `json:"failed"`
 	TotalIndexed int    `json:"total_indexed"`
-	// Partial is true when the run stopped at its wall-clock budget
-	// before draining every chat; a fresh kickoff restarts the build.
+	// Partial is true whenever the run did not establish complete
+	// coverage. Failed counts distinguish skipped chats from a clean,
+	// resumable wall-clock checkpoint.
 	Partial   bool   `json:"partial"`
 	StartedAt string `json:"started_at,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`

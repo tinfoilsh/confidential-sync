@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -34,6 +35,8 @@ const (
 	// late polls see the terminal state instead of an idle gap.
 	SearchReindexJobRetention = 5 * time.Minute
 )
+
+var errSearchReindexIncomplete = errors.New("search reindex incomplete")
 
 // SearchReindexJob tracks one user's in-flight or recently-finished
 // rebuild. Reuses the migration job lifecycle states.
@@ -124,8 +127,8 @@ func (j *SearchReindexJob) Done() <-chan struct{} { return j.done }
 
 // blocksRestart reports whether this job's lifecycle can block a
 // restart: always while running, and after a clean completion when
-// the current index is still healthy. Failed and partial runs never
-// block because they must be re-kickable immediately.
+// the current index is still healthy. Failed runs and clean partial
+// checkpoints never block because they must be re-kickable.
 func (j *SearchReindexJob) blocksRestart() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -333,6 +336,9 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 		if ctx.Err() != nil {
 			job.markPartial()
 			deps.logInfo("search reindex job stopped at budget: user=%s job=%s", job.UserID, job.ID)
+			if coverageFailure {
+				return errSearchReindexIncomplete
+			}
 			return nil
 		}
 		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, startedAt, targetSourceRevision, coverageFailure)
@@ -343,6 +349,9 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			// alarming the user.
 			if ctx.Err() != nil {
 				job.markPartial()
+				if coverageFailure {
+					return errSearchReindexIncomplete
+				}
 				return nil
 			}
 			return err
@@ -356,6 +365,9 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			job.markPartial()
 		}
 		if page.Done {
+			if coverageFailure || page.Partial {
+				return errSearchReindexIncomplete
+			}
 			return nil
 		}
 		cursor = page.NextCursor

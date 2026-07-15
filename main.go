@@ -108,6 +108,7 @@ func main() {
 	}
 	handler := server.NewHandler(deps, verifier, logger)
 	server.StartAttachmentOrphanReaper(ctx, deps, logger)
+	server.StartSearchIndexDeletionWorker(ctx, deps, logger)
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to

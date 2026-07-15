@@ -86,9 +86,11 @@ type cpNeedsMigration struct {
 }
 
 type cpBlob struct {
-	ETag  int64
-	KeyID string
-	Body  []byte
+	ETag         int64
+	KeyID        string
+	Body         []byte
+	ProjectIDSet bool
+	ProjectID    *string
 }
 
 func newCPStub(t *testing.T) *cpStub {
@@ -236,6 +238,12 @@ func (s *cpStub) handleGetBlob(scope string) http.HandlerFunc {
 		}
 		w.Header().Set("ETag", formatETag(blob.ETag))
 		w.Header().Set("X-Key-Id", blob.KeyID)
+		if scope == "chat" && blob.ProjectIDSet {
+			w.Header().Set("X-Project-Id-Set", "1")
+			if blob.ProjectID != nil {
+				w.Header().Set("X-Project-Id", *blob.ProjectID)
+			}
+		}
 		w.Write(blob.Body)
 	}
 }
@@ -811,6 +819,11 @@ func TestPushAndPullRoundtrip(t *testing.T) {
 	if !pushResp.OK || pushResp.ETag == "" || pushResp.KeyID != f.userKeyID {
 		t.Fatalf("push resp: %+v", pushResp)
 	}
+	projectID := "project-1"
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/chat_1"].ProjectIDSet = true
+	f.cp.blobs["chat/chat_1"].ProjectID = &projectID
+	f.cp.mu.Unlock()
 
 	pullResp, pullBody := f.post("/v1/sync/pull", PullRequest{
 		Scope: "chat",
@@ -831,6 +844,9 @@ func TestPushAndPullRoundtrip(t *testing.T) {
 	}
 	if pull.Items[0].NeedsRewrap {
 		t.Fatalf("v2 should not need rewrap")
+	}
+	if !pull.Items[0].ProjectIDSet || pull.Items[0].ProjectID == nil || *pull.Items[0].ProjectID != projectID {
+		t.Fatalf("project metadata: %+v", pull.Items[0])
 	}
 }
 
