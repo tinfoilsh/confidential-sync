@@ -347,10 +347,12 @@ func pullOne(
 		defer cryptopkg.Zero(dec.Plaintext)
 		return PullItem{
 			ID: id, OK: true,
-			Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
-			KeyID:       dec.KeyIDHex,
-			ETag:        blob.ETag,
-			NeedsRewrap: false,
+			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
+			KeyID:        dec.KeyIDHex,
+			ETag:         blob.ETag,
+			ProjectIDSet: blob.ProjectIDSet,
+			ProjectID:    blob.ProjectID,
+			NeedsRewrap:  false,
 		}
 	case envelope.VersionV0, envelope.VersionV1:
 		deps.logInfo("pull legacy detected: user=%s scope=%s id=%s",
@@ -366,10 +368,12 @@ func pullOne(
 			if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
 				return PullItem{
 					ID: id, OK: true,
-					Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
-					KeyID:       targetKIDHex,
-					ETag:        newETag,
-					NeedsRewrap: false,
+					Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
+					KeyID:        targetKIDHex,
+					ETag:         newETag,
+					ProjectIDSet: blob.ProjectIDSet,
+					ProjectID:    blob.ProjectID,
+					NeedsRewrap:  false,
 				}
 			} else {
 				deps.logError("pull lazy rewrap failed: user=%s scope=%s id=%s err=%v",
@@ -383,10 +387,12 @@ func pullOne(
 		// pass that retries failed rewraps.
 		return PullItem{
 			ID: id, OK: true,
-			Plaintext:   base64.StdEncoding.EncodeToString(dec.Plaintext),
-			KeyID:       dec.KeyIDHex,
-			ETag:        blob.ETag,
-			NeedsRewrap: true,
+			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
+			KeyID:        dec.KeyIDHex,
+			ETag:         blob.ETag,
+			ProjectIDSet: blob.ProjectIDSet,
+			ProjectID:    blob.ProjectID,
+			NeedsRewrap:  true,
 		}
 	default:
 		return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: "unknown_envelope_format"}

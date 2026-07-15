@@ -19,7 +19,7 @@ import (
 // User-driven calls forward the user's JWT verbatim in the
 // Authorization header plus the enclave service credential required
 // by the /api/sync surface. A small set of enclave-internal
-// maintenance calls (currently DeleteOrphanedV2Attachments) skip the
+// maintenance calls (attachment and search-index cleanup) skip the
 // JWT because they have no associated user request; they
 // authenticate to the controlplane with the service credential
 // alone.
@@ -189,9 +189,11 @@ type PutBlobResponse struct {
 }
 
 type GetBlobResponse struct {
-	Ciphertext []byte
-	ETag       string
-	KeyID      string
+	Ciphertext   []byte
+	ETag         string
+	KeyID        string
+	ProjectIDSet bool
+	ProjectID    *string
 }
 
 func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
@@ -411,11 +413,18 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string
 	if resp.StatusCode >= 400 {
 		return nil, parseError(resp.StatusCode, body)
 	}
-	return &GetBlobResponse{
+	out := &GetBlobResponse{
 		Ciphertext: body,
 		ETag:       resp.Header.Get(HeaderETag),
 		KeyID:      resp.Header.Get(HeaderKeyID),
-	}, nil
+	}
+	if scope == "chat" && resp.Header.Get(HeaderProjectIDSet) == "1" {
+		out.ProjectIDSet = true
+		if projectID := resp.Header.Get(HeaderProjectID); projectID != "" {
+			out.ProjectID = &projectID
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) HeadBlob(ctx context.Context, scope, id, jwt, clerkUserID string) (*BlobMeta, error) {
@@ -1236,6 +1245,81 @@ func (c *Client) SweepPendingAttachmentWrites(ctx context.Context, limit int) ([
 type OrphanAttachmentRow struct {
 	AttachmentID string `json:"attachment_id"`
 	ClerkUserID  string `json:"clerk_user_id"`
+}
+
+type SearchIndexDeletion struct {
+	ID          string `json:"id"`
+	ClerkUserID string `json:"clerk_user_id"`
+	ObjectKey   string `json:"object_key"`
+}
+
+type SearchIndexDeletionClaim struct {
+	ClaimToken string                `json:"claim_token"`
+	Deletions  []SearchIndexDeletion `json:"deletions"`
+}
+
+func (c *Client) ClaimSearchIndexDeletions(ctx context.Context, batchSize int) (*SearchIndexDeletionClaim, error) {
+	body, err := json.Marshal(struct {
+		BatchSize int `json:"batch_size"`
+	}{BatchSize: batchSize})
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.baseURL + "/api/sync/search-index-deletions/claim"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, raw)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("controlplane: read search index deletion claim: %w", readErr)
+	}
+	var out SearchIndexDeletionClaim
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode search index deletion claim: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) AckSearchIndexDeletions(ctx context.Context, claimToken string, ids []string) error {
+	body, err := json.Marshal(struct {
+		ClaimToken string   `json:"claim_token"`
+		IDs        []string `json:"ids"`
+	}{
+		ClaimToken: claimToken,
+		IDs:        ids,
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := c.baseURL + "/api/sync/search-index-deletions/ack"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return parseError(resp.StatusCode, raw)
+	}
+	if readErr != nil {
+		return fmt.Errorf("controlplane: read search index deletion ack: %w", readErr)
+	}
+	return nil
 }
 
 func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]OrphanAttachmentRow, error) {
