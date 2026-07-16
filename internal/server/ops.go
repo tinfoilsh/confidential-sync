@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
@@ -86,6 +88,10 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IdempotencyKey == "" {
 		return nil, badRequest("idempotency_key is required")
 	}
+	profileSyncProtocol, err := profileSyncProtocolFromMetadata(req.Scope, req.Metadata)
+	if err != nil {
+		return nil, badRequest(err.Error())
+	}
 
 	key, err := decodeKey(req.Key)
 	if err != nil {
@@ -125,7 +131,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	if req.IfMatch != nil {
 		ifMatch = *req.IfMatch
 	}
-	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, payloadAAD, plaintext)
+	opHash, err := operationHashForBlob(key, http.MethodPut, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, profileSyncProtocol, payloadAAD, plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -137,24 +143,27 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// retries to recompute the hash without changing the threat
 	// model. The same reasoning applies to projectId — it surfaces
 	// in list-status so cross-project moves propagate without
-	// decrypting the row.
+	// decrypting the row. profile_sync_protocol is different because
+	// it controls whether an overwrite is accepted, so it is bound
+	// into the operation hash above.
 	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
 	deps.logInfo("push begin: user=%s scope=%s id=%s kid=%s if_match=%s plaintext_bytes=%d",
 		sess.Claims.Subject, scope, req.ID, kidHex, ifMatch, len(plaintext))
 
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
-		Scope:          req.Scope,
-		ID:             req.ID,
-		JWT:            sess.RawJWT,
-		ClerkUserID:    sess.Claims.Subject,
-		KeyIDHex:       kidHex,
-		IfMatch:        ifMatch,
-		IdempotencyKey: req.IdempotencyKey,
-		OperationHash:  opHash,
-		Ciphertext:     envBlob,
-		MessageCount:   messageCountFromMetadata(req.Scope, req.Metadata),
-		ProjectIDSet:   projectIDSet,
-		ProjectID:      projectID,
+		Scope:               req.Scope,
+		ID:                  req.ID,
+		JWT:                 sess.RawJWT,
+		ClerkUserID:         sess.Claims.Subject,
+		KeyIDHex:            kidHex,
+		IfMatch:             ifMatch,
+		IdempotencyKey:      req.IdempotencyKey,
+		OperationHash:       opHash,
+		ProfileSyncProtocol: profileSyncProtocol,
+		Ciphertext:          envBlob,
+		MessageCount:        messageCountFromMetadata(req.Scope, req.Metadata),
+		ProjectIDSet:        projectIDSet,
+		ProjectID:           projectID,
 	})
 	if err == nil {
 		committedAt := time.Now()
@@ -202,7 +211,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 // plus stable request metadata, not the randomized v2 envelope bytes,
 // so a retry with the same idempotency key can replay after a lost
 // response instead of tripping IDEMPOTENCY_CONFLICT on a fresh nonce.
-func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, aad, plaintext []byte) (string, error) {
+func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, profileSyncProtocol int, aad, plaintext []byte) (string, error) {
 	path, err := controlplane.PathFor(scope, id)
 	if err != nil {
 		return "", err
@@ -212,14 +221,19 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 		return "", err
 	}
 	defer cryptopkg.Zero(opKey)
+	profileSyncProtocolValue := ""
+	if profileSyncProtocol > 0 {
+		profileSyncProtocolValue = strconv.Itoa(profileSyncProtocol)
+	}
 	return cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
-		Method:         method,
-		Path:           path,
-		KeyIDHex:       keyIDHex,
-		IfMatch:        ifMatch,
-		IdempotencyKey: idempotencyKey,
-		Body:           plaintext,
-		AAD:            aad,
+		Method:              method,
+		Path:                path,
+		KeyIDHex:            keyIDHex,
+		IfMatch:             ifMatch,
+		IdempotencyKey:      idempotencyKey,
+		Body:                plaintext,
+		AAD:                 aad,
+		ProfileSyncProtocol: profileSyncProtocolValue,
 	}), nil
 }
 
@@ -566,7 +580,7 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 const deleteMaxRetries = 3
 
 func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest, key []byte, kidHex, ifMatch string) (*OKResponse, *controlplane.DeleteBlobResponse, error) {
-	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, nil, nil)
+	opHash, err := operationHashForBlob(key, http.MethodDelete, req.Scope, req.ID, kidHex, ifMatch, req.IdempotencyKey, 0, nil, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1279,6 +1293,31 @@ func migrateOne(
 }
 
 const migrateRewrapMaxRetries = 3
+
+const profileSyncProtocolMetadataKey = "profile_sync_protocol"
+
+func profileSyncProtocolFromMetadata(scope string, metadata map[string]any) (int, error) {
+	if scope != string(envelope.ScopeProfile) {
+		return 0, nil
+	}
+	raw, ok := metadata[profileSyncProtocolMetadataKey]
+	if !ok {
+		return 0, nil
+	}
+
+	if value, ok := raw.(int); ok {
+		if value <= 0 || value > math.MaxInt32 {
+			return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
+		}
+		return value, nil
+	}
+
+	value, ok := raw.(float64)
+	if !ok || value <= 0 || value > math.MaxInt32 || math.Trunc(value) != value {
+		return 0, fmt.Errorf("%s must be a positive integer", profileSyncProtocolMetadataKey)
+	}
+	return int(value), nil
+}
 
 // projectIDFromMetadata pulls the optional `projectId` field out of
 // a chat push's metadata. Returns (false, nil) for non-chat scopes,

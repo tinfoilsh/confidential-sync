@@ -13,22 +13,23 @@ import (
 // codes so the client sees a consistent vocabulary regardless of which
 // service rejected the request.
 const (
-	CodeStaleKey                  = controlplane.StatusStaleKey
-	CodeStaleBlob                 = controlplane.StatusStaleBlob
-	CodeSyncConflict              = "SYNC_CONFLICT"
-	CodeIdempotencyConflict       = controlplane.StatusIdempotencyConflict
-	CodeExistingDataUnderOtherKey = controlplane.StatusExistingDataUnderOtherKey
-	CodeUnknownKey                = "UNKNOWN_KEY"
-	CodeLegacyBlobNotMigrated     = controlplane.StatusLegacyBlobNotMigrated
-	CodeAttestationFailed         = "ATTESTATION_FAILED"
-	CodeAuth                      = "AUTH"
-	CodeForbidden                 = "FORBIDDEN"
-	CodeBadRequest                = "BAD_REQUEST"
-	CodeNotFound                  = "NOT_FOUND"
-	CodeNetwork                   = "NETWORK"
-	CodeUpstream                  = "UPSTREAM"
-	CodeRateLimited               = "RATE_LIMITED"
-	CodeInternal                  = "INTERNAL"
+	CodeStaleKey                   = controlplane.StatusStaleKey
+	CodeStaleBlob                  = controlplane.StatusStaleBlob
+	CodeSyncConflict               = "SYNC_CONFLICT"
+	CodeIdempotencyConflict        = controlplane.StatusIdempotencyConflict
+	CodeExistingDataUnderOtherKey  = controlplane.StatusExistingDataUnderOtherKey
+	CodeProfileSyncUpgradeRequired = controlplane.StatusProfileSyncUpgradeRequired
+	CodeUnknownKey                 = "UNKNOWN_KEY"
+	CodeLegacyBlobNotMigrated      = controlplane.StatusLegacyBlobNotMigrated
+	CodeAttestationFailed          = "ATTESTATION_FAILED"
+	CodeAuth                       = "AUTH"
+	CodeForbidden                  = "FORBIDDEN"
+	CodeBadRequest                 = "BAD_REQUEST"
+	CodeNotFound                   = "NOT_FOUND"
+	CodeNetwork                    = "NETWORK"
+	CodeUpstream                   = "UPSTREAM"
+	CodeRateLimited                = "RATE_LIMITED"
+	CodeInternal                   = "INTERNAL"
 )
 
 // AppError is the wire representation of a non-2xx response. Extra context
