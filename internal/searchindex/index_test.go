@@ -285,6 +285,28 @@ func TestSearchFusesLexicalAndSemantic(t *testing.T) {
 	}
 }
 
+func TestSearchRanksEveryKeywordHitBeforeSemanticOnlyMatches(t *testing.T) {
+	ix := New("m")
+	const keywordMatches = 64
+	for i := 0; i < keywordMatches; i++ {
+		mustUpsert(t, ix, fmt.Sprintf("dog_%02d", i), Entry{}, []string{"dog"})
+	}
+	mustUpsert(t, ix, "semantic_cat", Entry{Vectors: []Vector{Quantize([]float32{1, 0})}}, []string{"cat"})
+
+	got := ix.Search([]float32{1, 0}, []string{"dog"}, keywordMatches+1)
+	if len(got) != keywordMatches+1 {
+		t.Fatalf("result count = %d, want %d", len(got), keywordMatches+1)
+	}
+	for i := 0; i < keywordMatches; i++ {
+		if got[i].ID == "semantic_cat" {
+			t.Fatalf("semantic-only result ranked above keyword hit at position %d", i)
+		}
+	}
+	if got[keywordMatches].ID != "semantic_cat" {
+		t.Fatalf("semantic-only result did not follow all keyword hits: %v", resultIDs(got))
+	}
+}
+
 func TestSemanticMaxSimOverChunks(t *testing.T) {
 	ix := New("m")
 	// "long" matches on its second chunk; "short" is uniformly mediocre.

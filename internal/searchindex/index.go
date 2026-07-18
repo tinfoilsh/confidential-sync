@@ -500,24 +500,28 @@ type Result struct {
 	Score float64
 }
 
-// Search answers a query with weighted reciprocal-rank fusion of two
-// ranked lists:
+// Search answers a query in two strict tiers:
 //
 //   - Lexical: posting-list lookups scored by summed IDF, so rare
 //     query tokens ("sacha") dominate ubiquitous ones ("com"). This
-//     is the reliable tier; fusion weights it highest.
+//     is the reliable tier and every hit ranks before semantic-only
+//     results.
 //   - Semantic: cosine over per-chat quantized vectors, the bonus
-//     tier that surfaces "animal" -> duck/dog chats.
+//     tier that refines lexical ordering and then surfaces
+//     "animal" -> duck/dog chats without keyword matches.
 //
-// Rank fusion sidesteps the incompatible scales of cosine and IDF
-// scores. Returned scores are the fused values: meaningful for
-// ordering, not calibrated for anything else.
+// Weighted reciprocal-rank fusion orders results within those tiers
+// without comparing incompatible cosine and IDF scales. Returned
+// scores are meaningful for ordering, not calibrated for anything
+// else.
 func (ix *Index) Search(queryVec []float32, queryTokens []string, limit int) []Result {
 	if limit <= 0 || len(ix.Chats) == 0 {
 		return nil
 	}
 	fused := map[int]float64{}
+	lexical := map[int]struct{}{}
 	for rank, slot := range ix.lexicalRanked(queryTokens) {
+		lexical[slot] = struct{}{}
 		fused[slot] += lexicalRRFWeight / float64(rrfK+rank+1)
 	}
 	for rank, slot := range ix.semanticRanked(queryVec) {
@@ -528,6 +532,11 @@ func (ix *Index) Search(queryVec []float32, queryTokens []string, limit int) []R
 		results = append(results, Result{ID: ix.Slots[slot], Score: score})
 	}
 	sort.Slice(results, func(i, j int) bool {
+		_, iLexical := lexical[ix.Chats[results[i].ID].Slot]
+		_, jLexical := lexical[ix.Chats[results[j].ID].Slot]
+		if iLexical != jLexical {
+			return iLexical
+		}
 		if results[i].Score != results[j].Score {
 			return results[i].Score > results[j].Score
 		}
