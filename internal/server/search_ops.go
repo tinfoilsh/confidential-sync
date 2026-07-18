@@ -854,6 +854,7 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 
 	// Embed outside the lock: it is a network round trip and must not
 	// serialize against this user's pushes.
+	var queryVector []float32
 	vecs, err := embedWithSearchInferenceGate(ctx, deps, sess.Claims.Subject, []string{searchQueryPrefix + query}, false)
 	if err != nil {
 		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
@@ -861,7 +862,11 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 		if errors.As(err, &appErr) {
 			return nil, appErr
 		}
-		return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	} else {
+		queryVector = vecs[0]
 	}
 
 	// Reload for the search itself instead of reusing the pointer
@@ -893,7 +898,7 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 			(publication.ObjectKey != "" && state != searchLoadOK) ||
 			(publication.ObjectKey == "" && publication.SourceRevision > 0),
 	}
-	results := ix.Search(vecs[0], searchindex.Tokenize(query), req.Limit)
+	results := ix.Search(queryVector, searchindex.Tokenize(query), req.Limit)
 	runlock()
 	for _, r := range results {
 		resp.Results = append(resp.Results, SearchQueryResult{ID: r.ID, Score: r.Score})
@@ -979,7 +984,10 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		vectors, err = embedChunks(ctx, deps, sess.Claims.Subject, searchDocPrefix, texts, true)
 		if err != nil {
 			deps.logError("search reindex embed failed: user=%s err=%v", sess.Claims.Subject, err)
-			return nil, &AppError{Status: http.StatusBadGateway, Code: CodeUpstream, Message: "embedding service failed"}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			vectors = nil
 		}
 	}
 
@@ -1044,8 +1052,11 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		attemptFailed := failed
 		vecIdx := 0
 		for _, p := range page {
-			vecs := vectors[vecIdx : vecIdx+len(p.chunks)]
-			vecIdx += len(p.chunks)
+			var vecs [][]float32
+			if vectors != nil {
+				vecs = vectors[vecIdx : vecIdx+len(p.chunks)]
+				vecIdx += len(p.chunks)
+			}
 			snapshotState, err := searchChatSnapshotState(ctx, deps, sess, p.id, p.etag)
 			if err != nil {
 				return nil, err

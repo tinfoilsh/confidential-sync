@@ -295,15 +295,22 @@ func TestCorruptedIndexObjectsTriggerReindex(t *testing.T) {
 	}
 }
 
-func TestQueryEmbedFailureReturns502(t *testing.T) {
+func TestQueryEmbedFailureFallsBackToKeywordSearch(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
 
 	f.embedder.setFailEmbed(errors.New("inference down"))
 	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected 502 when embedding fails, got %d %s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("keyword fallback: status %d body %s", resp.StatusCode, body)
+	}
+	var out SearchQueryResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) == 0 || out.Results[0].ID != "chat_duck" {
+		t.Fatalf("keyword fallback did not find chat: %+v", out)
 	}
 }
 
@@ -381,10 +388,13 @@ func TestSearchQueryRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
-func TestReindexJobFailsWhenEmbeddingDown(t *testing.T) {
+func TestReindexBuildsKeywordIndexWhenEmbeddingDown(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
+	searchBuckets := f.handler.deps.SearchBuckets
+	f.handler.deps.SearchBuckets = nil
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	f.handler.deps.SearchBuckets = searchBuckets
 
 	f.embedder.setFailEmbed(errors.New("inference down"))
 	resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}, tok)
@@ -398,8 +408,12 @@ func TestReindexJobFailsWhenEmbeddingDown(t *testing.T) {
 		t.Fatal("job did not finish")
 	}
 	status := job.statusResponse()
-	if status.Status != string(MigrationJobFailed) || status.Error == "" {
-		t.Fatalf("expected failed status with error, got %+v", status)
+	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("keyword-only reindex did not complete: %+v", status)
+	}
+	got := f.query(t, tok, "duck")
+	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
+		t.Fatalf("keyword-only index was not searchable: %+v", got)
 	}
 }
 
