@@ -659,7 +659,7 @@ func TestReindexRestartPolicy(t *testing.T) {
 		t.Fatal("expanded-key repair job did not finish")
 	}
 
-	fp := reindexKeyFingerprint([]PullKey{{Key: f.userKeyB64}})
+	fp := reindexRequestFingerprint(SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}})
 	partial := newSearchReindexJob(f.userSub, fp)
 	partial.markPartial()
 	partial.finish(nil)
@@ -859,7 +859,7 @@ func TestFinalReindexPageReportsNewerPublicationGap(t *testing.T) {
 	f.handler.deps.Controlplane = controlplane.NewClient(srv.URL, nil)
 
 	req := SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}
-	job := newSearchReindexJob(f.userSub, reindexKeyFingerprint(req.Keys))
+	job := newSearchReindexJob(f.userSub, reindexRequestFingerprint(req))
 	err = runSearchReindex(context.Background(), f.handler.deps, f.searchSession(), req, job)
 	job.finish(err)
 	if !errors.Is(err, errSearchReindexIncomplete) {
@@ -1279,6 +1279,67 @@ func TestReindexDifferentKeySetReplacesRunningJob(t *testing.T) {
 	case <-coord.Status(f.userSub).Done():
 	case <-time.After(10 * time.Second):
 		t.Fatal("third job did not finish")
+	}
+}
+
+func TestAutomaticEmbeddingRepairJoinsRunningReindex(t *testing.T) {
+	f := newSearchFixture(t)
+	coord := f.handler.reindexCoordinator
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var calls atomic.Int32
+	var cancelled atomic.Bool
+	coord.runnerHook = func(ctx context.Context, _ Deps, _ Session, _ SearchReindexRequest, _ *SearchReindexJob) error {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			cancelled.Store(true)
+		}
+		return nil
+	}
+
+	req := SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}
+	fullJob, isNew, err := coord.StartOrGet(context.Background(), f.handler.deps, f.searchSession(), req)
+	if err != nil || !isNew {
+		t.Fatalf("full reindex kickoff: new=%t err=%v", isNew, err)
+	}
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("full reindex did not start")
+	}
+
+	repairReq := req
+	repairReq.embeddingRepairOnly = true
+	got, isNew, err := coord.StartOrGet(context.Background(), f.handler.deps, f.searchSession(), repairReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isNew || got != fullJob {
+		t.Fatal("automatic embedding repair did not join the running full reindex")
+	}
+	if cancelled.Load() || calls.Load() != 1 {
+		t.Fatalf("automatic repair interrupted the full reindex: cancelled=%t calls=%d", cancelled.Load(), calls.Load())
+	}
+
+	close(release)
+	select {
+	case <-fullJob.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("full reindex did not finish")
+	}
+	if cancelled.Load() || calls.Load() != 1 {
+		t.Fatalf("automatic repair started or cancelled work: cancelled=%t calls=%d", cancelled.Load(), calls.Load())
 	}
 }
 

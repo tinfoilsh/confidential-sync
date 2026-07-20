@@ -273,6 +273,8 @@ type SearchQueryResponse struct {
 // status is terminal.
 type SearchReindexRequest struct {
 	Keys []PullKey `json:"keys"`
+
+	embeddingRepairOnly bool
 }
 
 // SearchReindexStatusResponse is the wire shape returned by both the

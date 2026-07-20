@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,7 +202,7 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner, objectKey string, in
 	return ix, searchLoadOK, nil
 }
 
-func searchIndexNeedsRepair(ctx context.Context, deps Deps, sess Session, key string) (bool, error) {
+func searchIndexNeedsRepair(ctx context.Context, deps Deps, sess Session, key string, embeddingOnly bool) (bool, error) {
 	cek, err := decodeKey(key)
 	if err != nil {
 		return false, badRequest("invalid key: " + err.Error())
@@ -235,7 +236,11 @@ func searchIndexNeedsRepair(ctx context.Context, deps Deps, sess Session, key st
 	if err != nil {
 		return false, err
 	}
-	return loadState != searchLoadOK || ix.Incomplete || state.Incomplete || ix.NeedsEmbeddingRepair(), nil
+	needsEmbeddingRepair := ix.NeedsEmbeddingRepair()
+	if embeddingOnly {
+		needsEmbeddingRepair = ix.NeedsEmbeddingRepairFor(keyID)
+	}
+	return loadState != searchLoadOK || ix.Incomplete || state.Incomplete || needsEmbeddingRepair, nil
 }
 
 // searchEntryTime parses an entry's UpdatedAt for ordering decisions.
@@ -611,12 +616,14 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 	var embedErr error
 	if len(chunks) > 0 {
 		entry.EmbeddingPending = true
+		entry.EmbeddingKeyID = keyID
 		vecs, err := embedChunks(ctx, deps, owner, searchDocPrefix, chunks, false)
 		if err != nil {
 			embedErr = err
 		} else {
 			entry.Vectors = quantizeAll(vecs)
 			entry.EmbeddingPending = false
+			entry.EmbeddingKeyID = ""
 		}
 	}
 
@@ -892,7 +899,7 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 			(publication.ObjectKey != "" && state != searchLoadOK) ||
 			(publication.ObjectKey == "" && publication.SourceRevision > 0),
 	}
-	resp.repairEmbeddings = len(queryVector) > 0 && !resp.NeedsReindex && ix.NeedsEmbeddingRepair()
+	resp.repairEmbeddings = len(queryVector) > 0 && !resp.NeedsReindex && ix.NeedsEmbeddingRepairFor(keyID)
 	results := ix.Search(queryVector, searchindex.Tokenize(query), req.Limit)
 	runlock()
 	for _, r := range results {
@@ -901,6 +908,243 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	deps.logInfo("search query ok: user=%s indexed=%d results=%d",
 		sess.Claims.Subject, resp.TotalIndexed, len(resp.Results))
 	return resp, nil
+}
+
+type searchEmbeddingRepairCandidate struct {
+	id      string
+	etag    string
+	vectors []searchindex.Vector
+}
+
+type searchEmbeddingRepairBlocked struct {
+	id    string
+	etag  string
+	keyID string
+}
+
+func runSearchEmbeddingRepair(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob) error {
+	cek, err := decodeKey(req.Keys[0].Key)
+	if err != nil {
+		return badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(cek)
+	keyIDBytes, err := cryptopkg.DeriveKeyID(cek)
+	if err != nil {
+		return err
+	}
+	keyID := cryptopkg.KeyIDHex(keyIDBytes)
+	indexKey, err := cryptopkg.DeriveSearchIndexKey(cek)
+	if err != nil {
+		return err
+	}
+	defer cryptopkg.Zero(indexKey)
+
+	publication, err := deps.Controlplane.GetSearchIndexState(ctx, sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		return err
+	}
+	if publication.ObjectKey == "" || publication.KeyID != keyID || publication.Model != deps.Embedder.Model() {
+		job.markPartial()
+		return nil
+	}
+
+	runlock := rlockSearchIndex(sess.Claims.Subject)
+	ix, state, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, publication.ObjectKey, indexKey)
+	if err != nil {
+		runlock()
+		return err
+	}
+	if state != searchLoadOK {
+		runlock()
+		job.markPartial()
+		return nil
+	}
+	ids := make([]string, 0)
+	for id, entry := range ix.Chats {
+		if entry.EmbeddingPending && (entry.EmbeddingKeyID == "" || entry.EmbeddingKeyID == keyID) {
+			ids = append(ids, id)
+		}
+	}
+	runlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	sort.Strings(ids)
+
+	hadFailure := false
+	for start := 0; start < len(ids); start += reindexPageSize {
+		if ctx.Err() != nil {
+			job.markPartial()
+			return nil
+		}
+		end := start + reindexPageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		pull, err := Pull(ctx, deps, sess, PullRequest{
+			Scope: string(envelope.ScopeChat),
+			IDs:   ids[start:end],
+			Keys:  req.Keys,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				job.markPartial()
+				return nil
+			}
+			return err
+		}
+
+		type pending struct {
+			id     string
+			etag   string
+			chunks []string
+		}
+		pendingRepairs := make([]pending, 0, len(pull.Items))
+		blocked := make([]searchEmbeddingRepairBlocked, 0)
+		var texts []string
+		failed := 0
+		for _, item := range pull.Items {
+			if !item.OK {
+				if item.Code == CodeUnknownKey && item.KeyID != "" && item.ETag != "" {
+					blocked = append(blocked, searchEmbeddingRepairBlocked{id: item.ID, etag: item.ETag, keyID: item.KeyID})
+				} else {
+					failed++
+				}
+				continue
+			}
+			plaintext, err := base64.StdEncoding.DecodeString(item.Plaintext)
+			if err != nil {
+				failed++
+				continue
+			}
+			chunks := chatSearchChunks(plaintext)
+			cryptopkg.Zero(plaintext)
+			pendingRepairs = append(pendingRepairs, pending{id: item.ID, etag: item.ETag, chunks: chunks})
+			texts = append(texts, chunks...)
+		}
+
+		var vectors [][]float32
+		if len(texts) > 0 {
+			vectors, err = embedChunks(ctx, deps, sess.Claims.Subject, searchDocPrefix, texts, true)
+			if err != nil {
+				if ctx.Err() != nil {
+					job.markPartial()
+					return nil
+				}
+				if _, total, applyErr := applySearchEmbeddingRepairs(ctx, deps, sess, indexKey, keyID, nil, blocked); applyErr != nil {
+					return applyErr
+				} else {
+					job.reportPage(&searchReindexPageResult{Failed: len(pendingRepairs) + failed, TotalIndexed: total})
+				}
+				job.markPartial()
+				return nil
+			}
+		}
+
+		repairs := make([]searchEmbeddingRepairCandidate, 0, len(pendingRepairs))
+		vectorIndex := 0
+		for _, pending := range pendingRepairs {
+			entryVectors := vectors[vectorIndex : vectorIndex+len(pending.chunks)]
+			vectorIndex += len(pending.chunks)
+			repairs = append(repairs, searchEmbeddingRepairCandidate{
+				id:      pending.id,
+				etag:    pending.etag,
+				vectors: quantizeAll(entryVectors),
+			})
+		}
+		repaired, total, err := applySearchEmbeddingRepairs(ctx, deps, sess, indexKey, keyID, repairs, blocked)
+		if err != nil {
+			return err
+		}
+		job.reportPage(&searchReindexPageResult{
+			Indexed:      repaired,
+			Failed:       failed,
+			TotalIndexed: total,
+		})
+		if failed > 0 {
+			hadFailure = true
+		}
+	}
+	if hadFailure {
+		job.markPartial()
+	}
+	return nil
+}
+
+func applySearchEmbeddingRepairs(
+	ctx context.Context,
+	deps Deps,
+	sess Session,
+	indexKey []byte,
+	keyID string,
+	repairs []searchEmbeddingRepairCandidate,
+	blocked []searchEmbeddingRepairBlocked,
+) (int, int, error) {
+	unlock := lockSearchIndex(sess.Claims.Subject)
+	defer unlock()
+	for attempt := 0; attempt < maxSearchPublishRetries; attempt++ {
+		publication, err := deps.Controlplane.GetSearchIndexState(ctx, sess.RawJWT, sess.Claims.Subject)
+		if err != nil {
+			return 0, 0, err
+		}
+		if publication.ObjectKey == "" || publication.KeyID != keyID || publication.Model != deps.Embedder.Model() {
+			return 0, 0, nil
+		}
+		ix, state, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, publication.ObjectKey, indexKey)
+		if err != nil {
+			return 0, 0, err
+		}
+		if state != searchLoadOK {
+			return 0, 0, nil
+		}
+
+		mutated := false
+		repaired := 0
+		for _, item := range blocked {
+			entry, ok := ix.Chats[item.id]
+			if !ok || !entry.EmbeddingPending || entry.ETag != item.etag {
+				continue
+			}
+			if ix.MarkEmbeddingKey(item.id, item.keyID) {
+				mutated = true
+			}
+		}
+		for _, repair := range repairs {
+			entry, ok := ix.Chats[repair.id]
+			if !ok || !entry.EmbeddingPending || entry.ETag != repair.etag {
+				continue
+			}
+			if err := ix.RepairEmbedding(repair.id, repair.vectors); err != nil {
+				return 0, 0, err
+			}
+			mutated = true
+			repaired++
+		}
+		if !mutated {
+			return 0, len(ix.Chats), nil
+		}
+
+		incomplete := publication.PublicationIncomplete || ix.Incomplete
+		if _, err := publishSearchIndex(
+			ctx,
+			deps,
+			sess,
+			publication,
+			indexKey,
+			keyID,
+			publication.PublishedSourceRevision,
+			incomplete,
+			ix,
+		); err != nil {
+			var conflict *controlplane.SearchIndexConflictError
+			if errors.As(err, &conflict) {
+				continue
+			}
+			return 0, 0, err
+		}
+		return repaired, len(ix.Chats), nil
+	}
+	return 0, 0, errors.New("search embedding repair publication retries exhausted")
 }
 
 // searchReindexPageResult reports one page of a rebuild. NextCursor
@@ -954,6 +1198,7 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 	type pending struct {
 		id     string
 		etag   string
+		keyID  string
 		chunks []string
 	}
 	var page []pending
@@ -971,7 +1216,7 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		}
 		chunks := chatSearchChunks(plaintext)
 		cryptopkg.Zero(plaintext)
-		page = append(page, pending{id: item.ID, etag: item.ETag, chunks: chunks})
+		page = append(page, pending{id: item.ID, etag: item.ETag, keyID: item.KeyID, chunks: chunks})
 		texts = append(texts, chunks...)
 	}
 
@@ -1079,6 +1324,9 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 				UpdatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
 				Vectors:          quantizeAll(vecs),
 				EmbeddingPending: len(p.chunks) > 0 && vectors == nil,
+			}
+			if entry.EmbeddingPending {
+				entry.EmbeddingKeyID = p.keyID
 			}
 			if err := ix.Upsert(p.id, entry, searchindex.Tokenize(strings.Join(p.chunks, "\n"))); err != nil {
 				attemptFailed++

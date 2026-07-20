@@ -78,12 +78,18 @@ func newSearchReindexJob(userID string, keyFP [sha256.Size]byte) *SearchReindexJ
 	}
 }
 
-// reindexKeyFingerprint hashes the normalized key set for job identity.
-// A request with additional legacy keys can decrypt more of the corpus
-// and must replace a running job that lacks them.
-func reindexKeyFingerprint(keys []PullKey) [sha256.Size]byte {
+// reindexRequestFingerprint hashes the normalized key set and job mode.
+// A request with additional legacy keys can decrypt more of the corpus,
+// while a full rebuild must remain distinct from a coverage-preserving
+// embedding repair using the same key.
+func reindexRequestFingerprint(req SearchReindexRequest) [sha256.Size]byte {
 	h := sha256.New()
-	for _, key := range keys {
+	if req.embeddingRepairOnly {
+		_, _ = h.Write([]byte{1})
+	} else {
+		_, _ = h.Write([]byte{0})
+	}
+	for _, key := range req.Keys {
 		_, _ = h.Write([]byte(key.Key))
 		_, _ = h.Write([]byte{0})
 	}
@@ -172,10 +178,9 @@ func (j *SearchReindexJob) statusResponse() SearchReindexStatusResponse {
 // SearchReindexCoordinator owns the per-user reindex jobs. A kickoff
 // while a job is running or while a clean success sits in its
 // retention window with a healthy index returns the existing job, so
-// duplicate kickoffs from multiple tabs cannot stack rebuilds —
-// important here because every rebuild pays for embedding the whole
-// corpus again. Failed, partial, and repair-required runs are
-// re-kickable immediately.
+// duplicate kickoffs from multiple tabs cannot stack rebuilds.
+// Failed, partial, and repair-required runs are re-kickable
+// immediately.
 type SearchReindexCoordinator struct {
 	mu         sync.Mutex
 	jobs       map[string]*SearchReindexJob
@@ -203,12 +208,19 @@ func NewSearchReindexCoordinator() *SearchReindexCoordinator {
 // different key set also never joins: the old job's output is sealed
 // under a key the client did not ask to use, so the old job is
 // cancelled and a fresh rebuild starts once it has wound down.
+// An automatic embedding-only repair is the exception: it joins any
+// running search-index job rather than interrupting broader work. A
+// later query retries if the running job did not repair its entries.
 func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps Deps, sess Session, req SearchReindexRequest) (*SearchReindexJob, bool, error) {
 	userID := sess.Claims.Subject
-	keyFP := reindexKeyFingerprint(req.Keys)
+	keyFP := reindexRequestFingerprint(req)
 	for {
 		c.mu.Lock()
 		existing := c.jobs[userID]
+		if req.embeddingRepairOnly && existing != nil && existing.running() {
+			c.mu.Unlock()
+			return existing, false, nil
+		}
 		if existing != nil && existing.keyFP == keyFP {
 			if existing.running() {
 				c.mu.Unlock()
@@ -216,7 +228,7 @@ func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps De
 			}
 			if existing.blocksRestart() {
 				c.mu.Unlock()
-				needsRepair, err := searchIndexNeedsRepair(parentCtx, deps, sess, req.Keys[0].Key)
+				needsRepair, err := searchIndexNeedsRepair(parentCtx, deps, sess, req.Keys[0].Key, req.embeddingRepairOnly)
 				if err != nil {
 					return nil, false, err
 				}
@@ -308,6 +320,9 @@ func (c *SearchReindexCoordinator) deleteIfSame(job *SearchReindexJob) {
 // present. A budget or cancellation mid-page retries that page on the
 // next kickoff; completed pages survive clean timeouts and restarts.
 func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchReindexRequest, job *SearchReindexJob) error {
+	if req.embeddingRepairOnly {
+		return runSearchEmbeddingRepair(ctx, deps, sess, req, job)
+	}
 	publication, err := deps.Controlplane.GetSearchIndexState(ctx, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -412,5 +427,8 @@ func normalizeSearchReindexRequest(req SearchReindexRequest) (SearchReindexReque
 	sort.Slice(legacy, func(i, j int) bool {
 		return legacy[i].KeyID < legacy[j].KeyID
 	})
-	return SearchReindexRequest{Keys: normalized}, nil
+	return SearchReindexRequest{
+		Keys:                normalized,
+		embeddingRepairOnly: req.embeddingRepairOnly,
+	}, nil
 }

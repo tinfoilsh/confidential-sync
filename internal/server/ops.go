@@ -355,7 +355,7 @@ func pullOne(
 		})
 		if err != nil {
 			if errors.Is(err, envelope.ErrNoMatchingKey) {
-				return PullItem{ID: id, OK: false, Code: CodeUnknownKey, KeyID: dec.KeyIDHex}
+				return PullItem{ID: id, OK: false, Code: CodeUnknownKey, KeyID: dec.KeyIDHex, ETag: blob.ETag}
 			}
 			return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: err.Error()}
 		}

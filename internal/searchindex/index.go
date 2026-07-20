@@ -177,6 +177,7 @@ type Entry struct {
 	// semantic score for the chat is the max similarity over them.
 	Vectors          []Vector `json:"vectors,omitempty"`
 	EmbeddingPending bool     `json:"embedding_pending,omitempty"`
+	EmbeddingKeyID   string   `json:"embedding_key_id,omitempty"`
 }
 
 // ReindexProgress checkpoints a clean page boundary for a partial
@@ -293,6 +294,12 @@ func Decode(data []byte) (*Index, error) {
 		if e.SourceRevision < 0 {
 			return nil, errors.New("searchindex: entry source revision is negative")
 		}
+		if !validEmbeddingKeyID(e.EmbeddingKeyID) {
+			return nil, errors.New("searchindex: entry embedding key id is invalid")
+		}
+		if !e.EmbeddingPending && e.EmbeddingKeyID != "" {
+			return nil, errors.New("searchindex: entry embedding key id requires pending embedding")
+		}
 		if len(e.Vectors) > MaxChunksPerChat {
 			return nil, fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
 		}
@@ -344,6 +351,21 @@ func (ix *Index) Encode() ([]byte, error) {
 	return json.Marshal(ix)
 }
 
+func validEmbeddingKeyID(keyID string) bool {
+	if keyID == "" {
+		return true
+	}
+	if len(keyID) != 32 {
+		return false
+	}
+	for _, c := range keyID {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validPostingToken(tok string) bool {
 	return len(tok) >= minTokenLen && len(tok) <= maxIdentifierLen
 }
@@ -360,19 +382,15 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	if e.SourceRevision < 0 {
 		return errors.New("searchindex: entry source revision is negative")
 	}
-	if len(e.Vectors) > MaxChunksPerChat {
-		return fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(e.Vectors), MaxChunksPerChat)
+	if !validEmbeddingKeyID(e.EmbeddingKeyID) {
+		return errors.New("searchindex: entry embedding key id is invalid")
 	}
-	dims := ix.Dims
-	for _, v := range e.Vectors {
-		if len(v) == 0 {
-			return errors.New("searchindex: empty chunk vector")
-		}
-		if dims == 0 {
-			dims = len(v)
-		} else if len(v) != dims {
-			return fmt.Errorf("searchindex: vector has %d dims, index has %d", len(v), dims)
-		}
+	if !e.EmbeddingPending && e.EmbeddingKeyID != "" {
+		return errors.New("searchindex: embedding key id requires pending embedding")
+	}
+	dims, err := validatedVectorDims(ix.Dims, e.Vectors)
+	if err != nil {
+		return err
 	}
 	if _, exists := ix.Chats[id]; !exists && len(ix.Chats) >= MaxChats {
 		return ErrTooLarge
@@ -404,6 +422,55 @@ func (ix *Index) Upsert(id string, e Entry, tokens []string) error {
 	}
 	ix.maybeCompact()
 	return nil
+}
+
+// RepairEmbedding replaces only an existing entry's semantic vectors,
+// leaving its lexical postings and corpus metadata unchanged.
+func (ix *Index) RepairEmbedding(id string, vectors []Vector) error {
+	entry, ok := ix.Chats[id]
+	if !ok {
+		return errors.New("searchindex: chat does not exist")
+	}
+	dims, err := validatedVectorDims(ix.Dims, vectors)
+	if err != nil {
+		return err
+	}
+	entry.Vectors = vectors
+	entry.EmbeddingPending = false
+	entry.EmbeddingKeyID = ""
+	ix.Chats[id] = entry
+	ix.Dims = dims
+	return nil
+}
+
+// MarkEmbeddingKey records which CEK is required to repair a pending
+// entry without changing its lexical data.
+func (ix *Index) MarkEmbeddingKey(id, keyID string) bool {
+	entry, ok := ix.Chats[id]
+	if !ok || !entry.EmbeddingPending || keyID == "" || !validEmbeddingKeyID(keyID) || entry.EmbeddingKeyID == keyID {
+		return false
+	}
+	entry.EmbeddingKeyID = keyID
+	ix.Chats[id] = entry
+	return true
+}
+
+func validatedVectorDims(indexDims int, vectors []Vector) (int, error) {
+	if len(vectors) > MaxChunksPerChat {
+		return 0, fmt.Errorf("searchindex: %d chunk vectors exceeds limit %d", len(vectors), MaxChunksPerChat)
+	}
+	dims := indexDims
+	for _, v := range vectors {
+		if len(v) == 0 {
+			return 0, errors.New("searchindex: empty chunk vector")
+		}
+		if dims == 0 {
+			dims = len(v)
+		} else if len(v) != dims {
+			return 0, fmt.Errorf("searchindex: vector has %d dims, index has %d", len(v), dims)
+		}
+	}
+	return dims, nil
 }
 
 // Remove drops one chat, leaving a tombstone slot behind.
@@ -467,6 +534,18 @@ func (ix *Index) Compatible(model string) bool {
 func (ix *Index) NeedsEmbeddingRepair() bool {
 	for _, entry := range ix.Chats {
 		if entry.EmbeddingPending {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsEmbeddingRepairFor reports whether the supplied CEK can repair
+// at least one pending entry. An empty recorded key means the index
+// predates key-aware repair and should be tried once.
+func (ix *Index) NeedsEmbeddingRepairFor(keyID string) bool {
+	for _, entry := range ix.Chats {
+		if entry.EmbeddingPending && (entry.EmbeddingKeyID == "" || entry.EmbeddingKeyID == keyID) {
 			return true
 		}
 	}

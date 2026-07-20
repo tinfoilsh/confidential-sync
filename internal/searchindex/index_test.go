@@ -219,6 +219,73 @@ func TestUpsertValidatesVectors(t *testing.T) {
 	if err := ix.Upsert("c", Entry{Vectors: tooMany}, nil); err == nil {
 		t.Fatal("expected chunk-count error")
 	}
+	if err := ix.Upsert("bad-key-id", Entry{
+		EmbeddingPending: true,
+		EmbeddingKeyID:   "not-a-key-id",
+	}, nil); err == nil {
+		t.Fatal("expected embedding key id error")
+	}
+	if err := ix.Upsert("stale-key-id", Entry{
+		EmbeddingKeyID: strings.Repeat("a", 32),
+	}, nil); err == nil {
+		t.Fatal("expected pending embedding invariant error")
+	}
+}
+
+func TestRepairEmbeddingPreservesLexicalEntry(t *testing.T) {
+	ix := New("m")
+	mustUpsert(t, ix, "seed", Entry{Vectors: []Vector{{1, 0}}}, nil)
+	keyID := strings.Repeat("a", 32)
+	mustUpsert(t, ix, "pending", Entry{
+		ETag:             "7",
+		SourceRevision:   42,
+		UpdatedAt:        "2026-07-19T12:00:00Z",
+		EmbeddingPending: true,
+		EmbeddingKeyID:   keyID,
+	}, []string{"duck", "pond"})
+
+	before := ix.Chats["pending"]
+	beforePostings := append([]int(nil), ix.Postings["duck"]...)
+	if !ix.NeedsEmbeddingRepairFor(keyID) {
+		t.Fatal("pending entry did not request repair for its key")
+	}
+	if err := ix.RepairEmbedding("pending", []Vector{{1, 0, 0}}); err == nil {
+		t.Fatal("expected dimension mismatch")
+	}
+	if got := ix.Chats["pending"]; !reflect.DeepEqual(got, before) {
+		t.Fatalf("rejected repair mutated entry: got %+v want %+v", got, before)
+	}
+
+	vectors := []Vector{{127, 0}}
+	if err := ix.RepairEmbedding("pending", vectors); err != nil {
+		t.Fatal(err)
+	}
+	got := ix.Chats["pending"]
+	if got.ETag != before.ETag || got.SourceRevision != before.SourceRevision ||
+		got.UpdatedAt != before.UpdatedAt || got.Slot != before.Slot {
+		t.Fatalf("repair changed corpus metadata: got %+v want %+v", got, before)
+	}
+	if got.EmbeddingPending || got.EmbeddingKeyID != "" || !reflect.DeepEqual(got.Vectors, vectors) {
+		t.Fatalf("repair did not replace semantic state: %+v", got)
+	}
+	if !reflect.DeepEqual(ix.Postings["duck"], beforePostings) {
+		t.Fatal("repair changed lexical postings")
+	}
+	if results := ix.Search(nil, []string{"duck"}, 5); len(results) != 1 || results[0].ID != "pending" {
+		t.Fatalf("repair lost lexical coverage: %+v", results)
+	}
+
+	mustUpsert(t, ix, "unknown-key", Entry{EmbeddingPending: true}, []string{"heron"})
+	legacyKeyID := strings.Repeat("b", 32)
+	if !ix.NeedsEmbeddingRepairFor(keyID) {
+		t.Fatal("key-unaware pending entry should be attempted once")
+	}
+	if !ix.MarkEmbeddingKey("unknown-key", legacyKeyID) {
+		t.Fatal("failed to record pending entry key")
+	}
+	if ix.NeedsEmbeddingRepairFor(keyID) || !ix.NeedsEmbeddingRepairFor(legacyKeyID) {
+		t.Fatal("recorded key did not constrain subsequent repair attempts")
+	}
 }
 
 func TestUpsertReplaceSupersedesOldPostings(t *testing.T) {
