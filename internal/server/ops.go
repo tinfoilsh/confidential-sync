@@ -30,9 +30,10 @@ type Deps struct {
 	Embedder Embedder
 	// SearchCache holds decoded search indices between requests.
 	// Populated by NewHandler; nil disables caching.
-	SearchCache *searchIndexCache
-	searchGate  *searchInferenceGate
-	GitSHA      string
+	SearchCache    *searchIndexCache
+	searchGate     *searchInferenceGate
+	searchTimeouts searchInferenceTimeouts
+	GitSHA         string
 	// SyncEnclaveSecret is the shared secret used to verify the
 	// X-Legacy-Claim header CP stamps on legacy attachment reads.
 	// Empty in test fixtures, where the legacy-claim guard is
@@ -354,7 +355,7 @@ func pullOne(
 		})
 		if err != nil {
 			if errors.Is(err, envelope.ErrNoMatchingKey) {
-				return PullItem{ID: id, OK: false, Code: CodeUnknownKey, KeyID: dec.KeyIDHex}
+				return PullItem{ID: id, OK: false, Code: CodeUnknownKey, KeyID: dec.KeyIDHex, ETag: blob.ETag}
 			}
 			return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: err.Error()}
 		}

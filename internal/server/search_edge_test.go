@@ -295,15 +295,22 @@ func TestCorruptedIndexObjectsTriggerReindex(t *testing.T) {
 	}
 }
 
-func TestQueryEmbedFailureReturns502(t *testing.T) {
+func TestQueryEmbedFailureFallsBackToKeywordSearch(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
 
 	f.embedder.setFailEmbed(errors.New("inference down"))
 	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("expected 502 when embedding fails, got %d %s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("keyword fallback: status %d body %s", resp.StatusCode, body)
+	}
+	var out SearchQueryResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) == 0 || out.Results[0].ID != "chat_duck" {
+		t.Fatalf("keyword fallback did not find chat: %+v", out)
 	}
 }
 
@@ -381,10 +388,13 @@ func TestSearchQueryRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
-func TestReindexJobFailsWhenEmbeddingDown(t *testing.T) {
+func TestReindexBuildsKeywordIndexWhenEmbeddingDown(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
+	searchBuckets := f.handler.deps.SearchBuckets
+	f.handler.deps.SearchBuckets = nil
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	f.handler.deps.SearchBuckets = searchBuckets
 
 	f.embedder.setFailEmbed(errors.New("inference down"))
 	resp, body := f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{{Key: f.userKeyB64}}}, tok)
@@ -398,8 +408,163 @@ func TestReindexJobFailsWhenEmbeddingDown(t *testing.T) {
 		t.Fatal("job did not finish")
 	}
 	status := job.statusResponse()
-	if status.Status != string(MigrationJobFailed) || status.Error == "" {
-		t.Fatalf("expected failed status with error, got %+v", status)
+	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("keyword-only reindex did not complete: %+v", status)
+	}
+	if ix := f.loadIndex(t); !ix.NeedsEmbeddingRepair() || len(ix.Chats["chat_duck"].Vectors) != 0 {
+		t.Fatal("keyword-only reindex did not retain semantic repair state")
+	}
+	got := f.query(t, tok, "duck")
+	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
+		t.Fatalf("keyword-only index was not searchable: %+v", got)
+	}
+
+	f.embedder.setFailEmbed(nil)
+	got = f.query(t, tok, "duck")
+	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
+		t.Fatalf("query during semantic recovery was not searchable: %+v", got)
+	}
+	repairJob := f.handler.reindexCoordinator.Status(f.userSub)
+	if repairJob == nil || repairJob == job {
+		t.Fatal("inference recovery did not start a fresh repair job")
+	}
+	select {
+	case <-repairJob.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("repair job did not finish")
+	}
+	if repaired := repairJob.statusResponse(); repaired.Status != string(MigrationJobCompleted) || repaired.Partial || repaired.Failed != 0 {
+		t.Fatalf("semantic repair did not complete: %+v", repaired)
+	}
+	ix := f.loadIndex(t)
+	if ix.NeedsEmbeddingRepair() || len(ix.Chats["chat_duck"].Vectors) == 0 {
+		t.Fatal("semantic repair did not restore vectors")
+	}
+}
+
+func TestAutomaticEmbeddingRepairPreservesLegacyKeyCoverage(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	legacyKeyBytes := bytes.Repeat([]byte{7}, cryptopkg.KeySize)
+	defer cryptopkg.Zero(legacyKeyBytes)
+	legacyKey := base64.StdEncoding.EncodeToString(legacyKeyBytes)
+	legacyKeyIDBytes, err := cryptopkg.DeriveKeyID(legacyKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyKeyID := cryptopkg.KeyIDHex(legacyKeyIDBytes)
+
+	searchBuckets := f.handler.deps.SearchBuckets
+	f.handler.deps.SearchBuckets = nil
+	defer func() { f.handler.deps.SearchBuckets = searchBuckets }()
+	f.pushChat(t, tok, "chat_current", "Pond", "a duck swam by")
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "chat_legacy",
+		Key:            legacyKey,
+		Plaintext:      base64.StdEncoding.EncodeToString(chatJSON(t, "chat_legacy", "Archive", "a heron flew past")),
+		IdempotencyKey: "idem-chat-legacy",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy push: status %d body %s", resp.StatusCode, body)
+	}
+	f.handler.deps.SearchBuckets = searchBuckets
+
+	f.embedder.setFailEmbed(errors.New("inference down"))
+	resp, body = f.post("/v1/search/reindex", SearchReindexRequest{Keys: []PullKey{
+		{Key: f.userKeyB64},
+		{Key: legacyKey},
+	}}, tok)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("keyword-only reindex kickoff: status %d body %s", resp.StatusCode, body)
+	}
+	fullJob := f.handler.reindexCoordinator.Status(f.userSub)
+	select {
+	case <-fullJob.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("keyword-only reindex did not finish")
+	}
+	if status := fullJob.statusResponse(); status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("keyword-only reindex did not complete cleanly: %+v", status)
+	}
+
+	ix := f.loadIndex(t)
+	if len(ix.Chats) != 2 || !ix.Chats["chat_current"].EmbeddingPending || !ix.Chats["chat_legacy"].EmbeddingPending {
+		t.Fatalf("setup did not produce two pending entries: %+v", ix.Chats)
+	}
+	legacyEntry := ix.Chats["chat_legacy"]
+	legacyEntry.EmbeddingKeyID = ""
+	ix.Chats["chat_legacy"] = legacyEntry
+	if err := saveSearchIndex(
+		context.Background(),
+		f.handler.deps,
+		f.userSub,
+		f.searchObjectKey(t),
+		f.indexKey(t),
+		ix,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	f.embedder.setFailEmbed(nil)
+	got := f.query(t, tok, "duck")
+	if got.NeedsReindex || got.TotalIndexed != 2 || len(got.Results) == 0 || got.Results[0].ID != "chat_current" {
+		t.Fatalf("query during semantic recovery lost search coverage: %+v", got)
+	}
+	repairJob := f.handler.reindexCoordinator.Status(f.userSub)
+	if repairJob == nil || repairJob == fullJob {
+		t.Fatal("semantic recovery did not start a dedicated repair job")
+	}
+	select {
+	case <-repairJob.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("semantic repair did not finish")
+	}
+	if status := repairJob.statusResponse(); status.Status != string(MigrationJobCompleted) || status.Partial ||
+		status.Failed != 0 || status.Indexed != 1 || status.TotalIndexed != 2 {
+		t.Fatalf("semantic repair did not complete cleanly: %+v", status)
+	}
+
+	ix = f.loadIndex(t)
+	current := ix.Chats["chat_current"]
+	legacy := ix.Chats["chat_legacy"]
+	if current.EmbeddingPending || len(current.Vectors) == 0 {
+		t.Fatalf("current-key entry was not repaired: %+v", current)
+	}
+	if !legacy.EmbeddingPending || legacy.EmbeddingKeyID != legacyKeyID || len(legacy.Vectors) != 0 {
+		t.Fatalf("legacy-key entry repair state was not retained: %+v", legacy)
+	}
+	if results := ix.Search(nil, searchindex.Tokenize("heron"), 5); len(results) != 1 || results[0].ID != "chat_legacy" {
+		t.Fatalf("legacy lexical coverage was lost: %+v", results)
+	}
+	got = f.query(t, tok, "heron")
+	if got.NeedsReindex || got.TotalIndexed != 2 || len(got.Results) == 0 || got.Results[0].ID != "chat_legacy" {
+		t.Fatalf("legacy chat was not searchable after automatic repair: %+v", got)
+	}
+	if f.handler.reindexCoordinator.Status(f.userSub) != repairJob {
+		t.Fatal("known legacy-key entry triggered another current-key repair")
+	}
+}
+
+func TestReindexStopsEmbeddingAfterOutageDetected(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	for i := 0; i < reindexPageSize+1; i++ {
+		id := fmt.Sprintf("chat_%d", i)
+		f.pushChat(t, tok, id, "Pond", fmt.Sprintf("duck note %d", i))
+	}
+
+	f.embedder.setFailEmbed(errors.New("inference down"))
+	callsBefore := f.embedder.callCount()
+	status := f.runReindexJob(t, tok)
+	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("keyword-only reindex did not complete: %+v", status)
+	}
+	if calls := f.embedder.callCount() - callsBefore; calls != 1 {
+		t.Fatalf("reindex made %d embedding attempts after outage detection, want 1", calls)
+	}
+	if ix := f.loadIndex(t); !ix.NeedsEmbeddingRepair() || len(ix.Chats) != reindexPageSize+1 {
+		t.Fatal("multi-page keyword reindex did not preserve repair state and coverage")
 	}
 }
 

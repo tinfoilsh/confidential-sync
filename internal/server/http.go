@@ -584,6 +584,19 @@ func (h *Handler) searchQuery(w http.ResponseWriter, r *http.Request, sess Sessi
 		writeError(w, err)
 		return
 	}
+	if resp.repairEmbeddings {
+		repairReq, normalizeErr := normalizeSearchReindexRequest(SearchReindexRequest{
+			Keys: []PullKey{{Key: req.Key}},
+		})
+		if normalizeErr != nil {
+			h.deps.logError("search embedding repair request failed: user=%s err=%v", sess.Claims.Subject, normalizeErr)
+		} else {
+			repairReq.embeddingRepairOnly = true
+			if _, _, startErr := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, repairReq); startErr != nil {
+				h.deps.logError("search embedding repair kickoff failed: user=%s err=%v", sess.Claims.Subject, startErr)
+			}
+		}
+	}
 	encode(w, http.StatusOK, resp)
 }
 
