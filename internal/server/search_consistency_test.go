@@ -75,7 +75,7 @@ func (b *blockingEmbedder) Embed(ctx context.Context, inputs []string) ([][]floa
 	return b.base.Embed(ctx, inputs)
 }
 
-func TestSearchQueryRateLimitReturns429(t *testing.T) {
+func TestSearchQueryRateLimitFallsBackToKeywords(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
@@ -92,19 +92,19 @@ func TestSearchQueryRateLimitReturns429(t *testing.T) {
 		t.Fatal("first query did not use the available inference permit")
 	}
 	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
-	if resp.StatusCode != http.StatusTooManyRequests {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("rate-limited query: status %d body %s", resp.StatusCode, body)
 	}
-	var appErr AppError
-	if err := json.Unmarshal(body, &appErr); err != nil {
+	var out SearchQueryResponse
+	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatal(err)
 	}
-	if appErr.Code != CodeRateLimited {
-		t.Fatalf("rate-limited query returned code %q", appErr.Code)
+	if len(out.Results) == 0 || out.Results[0].ID != "chat_duck" {
+		t.Fatalf("rate-limited query did not use keyword fallback: %+v", out)
 	}
 }
 
-func TestSearchQueryConcurrencyLimitReturns429(t *testing.T) {
+func TestSearchQueryConcurrencyLimitFallsBackToKeywords(t *testing.T) {
 	f := newSearchFixture(t)
 	tok := f.jwt()
 	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
@@ -139,8 +139,15 @@ func TestSearchQueryConcurrencyLimitReturns429(t *testing.T) {
 	}
 
 	resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
-	if resp.StatusCode != http.StatusTooManyRequests {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("concurrency-limited query: status %d body %s", resp.StatusCode, body)
+	}
+	var out SearchQueryResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) == 0 || out.Results[0].ID != "chat_duck" {
+		t.Fatalf("concurrency-limited query did not use keyword fallback: %+v", out)
 	}
 	close(blocker.release)
 	select {
@@ -150,6 +157,46 @@ func TestSearchQueryConcurrencyLimitReturns429(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("first query did not finish")
+	}
+}
+
+func TestSearchQueryEmbeddingTimeoutFallsBackToKeywords(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
+	blocker := &blockingEmbedder{
+		base:    f.embedder,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(blocker.release) })
+	f.handler.deps.Embedder = blocker
+	f.handler.deps.searchTimeouts.foreground = 25 * time.Millisecond
+
+	type queryResult struct {
+		status int
+		body   []byte
+	}
+	done := make(chan queryResult, 1)
+	go func() {
+		resp, body := f.post("/v1/search/query", SearchQueryRequest{Key: f.userKeyB64, Query: "duck"}, tok)
+		done <- queryResult{status: resp.StatusCode, body: body}
+	}()
+
+	select {
+	case got := <-done:
+		if got.status != http.StatusOK {
+			t.Fatalf("timed-out query: status %d body %s", got.status, got.body)
+		}
+		var out SearchQueryResponse
+		if err := json.Unmarshal(got.body, &out); err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Results) == 0 || out.Results[0].ID != "chat_duck" {
+			t.Fatalf("timed-out query did not use keyword fallback: %+v", out)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("query did not fall back after the embedding timeout")
 	}
 }
 
@@ -314,7 +361,7 @@ func TestReindexPreservesEntriesWrittenDuringRebuild(t *testing.T) {
 
 	cursor := ""
 	for {
-		page, err := searchReindexPage(ctx, f.handler.deps, sess, keys, cursor, startedAt, f.sourceRevision(), false)
+		page, err := searchReindexPage(ctx, f.handler.deps, sess, keys, cursor, startedAt, f.sourceRevision(), false, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -401,6 +448,7 @@ func TestReindexResumesFromPersistedCheckpoint(t *testing.T) {
 		startedAt,
 		f.sourceRevision(),
 		false,
+		true,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -764,7 +812,7 @@ func TestFinalReindexPagePreservesEarlierFailure(t *testing.T) {
 	}
 	f.handler.deps.SearchCache.drop(f.userSub)
 
-	page, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), []PullKey{{Key: f.userKeyB64}}, "", time.Now().UTC(), f.sourceRevision(), true)
+	page, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), []PullKey{{Key: f.userKeyB64}}, "", time.Now().UTC(), f.sourceRevision(), true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1094,7 +1142,7 @@ func TestReindexDoesNotResurrectChatDeletedDuringEmbedding(t *testing.T) {
 	targetSourceRevision := f.sourceRevision()
 	go func() {
 		keys := []PullKey{{Key: f.userKeyB64}}
-		_, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), keys, "", time.Now().UTC(), targetSourceRevision, false)
+		_, err := searchReindexPage(context.Background(), f.handler.deps, f.searchSession(), keys, "", time.Now().UTC(), targetSourceRevision, false, true)
 		done <- err
 	}()
 	select {
@@ -1154,7 +1202,7 @@ func TestPushResponseEmitsSearchIndexedFalse(t *testing.T) {
 	if body := pushRaw("chat_ok"); !strings.Contains(body, `"search_indexed":true`) {
 		t.Fatalf(`expected "search_indexed":true in push response, got %s`, body)
 	}
-	f.embedder.setFailEmbed(errors.New("inference down"))
+	f.searchBk.server.Close()
 	if body := pushRaw("chat_fail"); !strings.Contains(body, `"search_indexed":false`) {
 		t.Fatalf(`expected "search_indexed":false in push response, got %s`, body)
 	}

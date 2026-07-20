@@ -201,7 +201,7 @@ func loadSearchIndex(ctx context.Context, deps Deps, owner, objectKey string, in
 	return ix, searchLoadOK, nil
 }
 
-func searchIndexNeedsReindex(ctx context.Context, deps Deps, sess Session, key string) (bool, error) {
+func searchIndexNeedsRepair(ctx context.Context, deps Deps, sess Session, key string) (bool, error) {
 	cek, err := decodeKey(key)
 	if err != nil {
 		return false, badRequest("invalid key: " + err.Error())
@@ -235,7 +235,7 @@ func searchIndexNeedsReindex(ctx context.Context, deps Deps, sess Session, key s
 	if err != nil {
 		return false, err
 	}
-	return loadState != searchLoadOK || ix.Incomplete || state.Incomplete, nil
+	return loadState != searchLoadOK || ix.Incomplete || state.Incomplete || ix.NeedsEmbeddingRepair(), nil
 }
 
 // searchEntryTime parses an entry's UpdatedAt for ordering decisions.
@@ -610,14 +610,13 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 	tokens := searchindex.Tokenize(strings.Join(chunks, "\n"))
 	var embedErr error
 	if len(chunks) > 0 {
+		entry.EmbeddingPending = true
 		vecs, err := embedChunks(ctx, deps, owner, searchDocPrefix, chunks, false)
 		if err != nil {
-			// Keep the lexical entry so the chat is still findable by
-			// keyword; surface the error so the caller logs the
-			// degraded state.
 			embedErr = err
 		} else {
 			entry.Vectors = quantizeAll(vecs)
+			entry.EmbeddingPending = false
 		}
 	}
 
@@ -677,8 +676,7 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 			state == searchLoadOK
 		canAdvance := sourceRevision == publication.PublishedSourceRevision+1 &&
 			!publication.PublicationIncomplete &&
-			publicationReadable &&
-			embedErr == nil
+			publicationReadable
 		coveredSourceRevision := publication.PublishedSourceRevision
 		incomplete := true
 		if canAdvance {
@@ -694,7 +692,7 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 			return err
 		}
 		if embedErr != nil {
-			return fmt.Errorf("indexed lexical-only, embedding failed: %w", embedErr)
+			deps.logError("push search embedding failed: user=%s id=%s err=%v", owner, chatID, embedErr)
 		}
 		return nil
 	}
@@ -858,10 +856,6 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	vecs, err := embedWithSearchInferenceGate(ctx, deps, sess.Claims.Subject, []string{searchQueryPrefix + query}, false)
 	if err != nil {
 		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
-		var appErr *AppError
-		if errors.As(err, &appErr) {
-			return nil, appErr
-		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -898,6 +892,7 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 			(publication.ObjectKey != "" && state != searchLoadOK) ||
 			(publication.ObjectKey == "" && publication.SourceRevision > 0),
 	}
+	resp.repairEmbeddings = len(queryVector) > 0 && !resp.NeedsReindex && ix.NeedsEmbeddingRepair()
 	results := ix.Search(queryVector, searchindex.Tokenize(query), req.Limit)
 	runlock()
 	for _, r := range results {
@@ -913,6 +908,7 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 type searchReindexPageResult struct {
 	Indexed                    int
 	Failed                     int
+	EmbeddingFailed            bool
 	NextCursor                 string
 	Done                       bool
 	Partial                    bool
@@ -927,7 +923,7 @@ type searchReindexPageResult struct {
 // since-deleted chats) while preserving entries that inline pushes
 // wrote after the job began. Every clean non-final page checkpoints
 // its next cursor inside the encrypted index so a later job can resume.
-func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string, startedAt time.Time, targetSourceRevision int64, priorFailure bool) (*searchReindexPageResult, error) {
+func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []PullKey, cursor string, startedAt time.Time, targetSourceRevision int64, priorFailure, embedDocuments bool) (*searchReindexPageResult, error) {
 	cek, err := decodeKey(keys[0].Key)
 	if err != nil {
 		return nil, badRequest("invalid key: " + err.Error())
@@ -980,13 +976,15 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 	}
 
 	var vectors [][]float32
-	if len(texts) > 0 {
+	embeddingFailed := len(texts) > 0 && !embedDocuments
+	if len(texts) > 0 && embedDocuments {
 		vectors, err = embedChunks(ctx, deps, sess.Claims.Subject, searchDocPrefix, texts, true)
 		if err != nil {
 			deps.logError("search reindex embed failed: user=%s err=%v", sess.Claims.Subject, err)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			embeddingFailed = true
 			vectors = nil
 		}
 	}
@@ -1076,10 +1074,11 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 				continue
 			}
 			entry := searchindex.Entry{
-				ETag:           p.etag,
-				SourceRevision: targetSourceRevision,
-				UpdatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
-				Vectors:        quantizeAll(vecs),
+				ETag:             p.etag,
+				SourceRevision:   targetSourceRevision,
+				UpdatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+				Vectors:          quantizeAll(vecs),
+				EmbeddingPending: len(p.chunks) > 0 && vectors == nil,
 			}
 			if err := ix.Upsert(p.id, entry, searchindex.Tokenize(strings.Join(p.chunks, "\n"))); err != nil {
 				attemptFailed++
@@ -1120,6 +1119,7 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 		resp := &searchReindexPageResult{
 			Indexed:                    indexed,
 			Failed:                     attemptFailed,
+			EmbeddingFailed:            embeddingFailed,
 			NextCursor:                 pull.NextCursor,
 			Done:                       pull.NextCursor == "",
 			Partial:                    incomplete,

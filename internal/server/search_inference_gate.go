@@ -19,6 +19,8 @@ const (
 	searchLimiterIdleTTL         = 10 * time.Minute
 	searchLimiterMaxTrackedUsers = 10_000
 	searchLimiterRetryInterval   = 100 * time.Millisecond
+	searchForegroundEmbedTimeout = 3 * time.Second
+	searchBackgroundEmbedTimeout = 10 * time.Second
 )
 
 type searchInferenceLimits struct {
@@ -30,6 +32,11 @@ type searchInferenceLimits struct {
 	userConcurrent   int
 }
 
+type searchInferenceTimeouts struct {
+	foreground time.Duration
+	background time.Duration
+}
+
 var defaultSearchInferenceLimits = searchInferenceLimits{
 	globalRate:       searchGlobalInputsPerSecond,
 	globalBurst:      searchGlobalInputBurst,
@@ -37,6 +44,11 @@ var defaultSearchInferenceLimits = searchInferenceLimits{
 	userRate:         searchUserInputsPerSecond,
 	userBurst:        searchUserInputBurst,
 	userConcurrent:   searchUserConcurrentCalls,
+}
+
+var defaultSearchInferenceTimeouts = searchInferenceTimeouts{
+	foreground: searchForegroundEmbedTimeout,
+	background: searchBackgroundEmbedTimeout,
 }
 
 type searchUserInferenceLimit struct {
@@ -217,13 +229,26 @@ func searchInferenceLimited() *AppError {
 }
 
 func embedWithSearchInferenceGate(ctx context.Context, deps Deps, userID string, inputs []string, wait bool) ([][]float32, error) {
-	if deps.searchGate == nil {
-		return deps.Embedder.Embed(ctx, inputs)
+	timeout := deps.searchTimeouts.foreground
+	if wait {
+		timeout = deps.searchTimeouts.background
 	}
-	release, err := deps.searchGate.acquire(ctx, userID, len(inputs), wait)
+	if timeout <= 0 {
+		timeout = defaultSearchInferenceTimeouts.foreground
+		if wait {
+			timeout = defaultSearchInferenceTimeouts.background
+		}
+	}
+	embedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if deps.searchGate == nil {
+		return deps.Embedder.Embed(embedCtx, inputs)
+	}
+	release, err := deps.searchGate.acquire(embedCtx, userID, len(inputs), wait)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return deps.Embedder.Embed(ctx, inputs)
+	return deps.Embedder.Embed(embedCtx, inputs)
 }

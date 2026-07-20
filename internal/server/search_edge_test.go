@@ -411,9 +411,56 @@ func TestReindexBuildsKeywordIndexWhenEmbeddingDown(t *testing.T) {
 	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
 		t.Fatalf("keyword-only reindex did not complete: %+v", status)
 	}
+	if ix := f.loadIndex(t); !ix.NeedsEmbeddingRepair() || len(ix.Chats["chat_duck"].Vectors) != 0 {
+		t.Fatal("keyword-only reindex did not retain semantic repair state")
+	}
 	got := f.query(t, tok, "duck")
 	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
 		t.Fatalf("keyword-only index was not searchable: %+v", got)
+	}
+
+	f.embedder.setFailEmbed(nil)
+	got = f.query(t, tok, "duck")
+	if got.NeedsReindex || len(got.Results) == 0 || got.Results[0].ID != "chat_duck" {
+		t.Fatalf("query during semantic recovery was not searchable: %+v", got)
+	}
+	repairJob := f.handler.reindexCoordinator.Status(f.userSub)
+	if repairJob == nil || repairJob == job {
+		t.Fatal("inference recovery did not start a fresh repair job")
+	}
+	select {
+	case <-repairJob.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("repair job did not finish")
+	}
+	if repaired := repairJob.statusResponse(); repaired.Status != string(MigrationJobCompleted) || repaired.Partial || repaired.Failed != 0 {
+		t.Fatalf("semantic repair did not complete: %+v", repaired)
+	}
+	ix := f.loadIndex(t)
+	if ix.NeedsEmbeddingRepair() || len(ix.Chats["chat_duck"].Vectors) == 0 {
+		t.Fatal("semantic repair did not restore vectors")
+	}
+}
+
+func TestReindexStopsEmbeddingAfterOutageDetected(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+	for i := 0; i < reindexPageSize+1; i++ {
+		id := fmt.Sprintf("chat_%d", i)
+		f.pushChat(t, tok, id, "Pond", fmt.Sprintf("duck note %d", i))
+	}
+
+	f.embedder.setFailEmbed(errors.New("inference down"))
+	callsBefore := f.embedder.callCount()
+	status := f.runReindexJob(t, tok)
+	if status.Status != string(MigrationJobCompleted) || status.Partial || status.Failed != 0 {
+		t.Fatalf("keyword-only reindex did not complete: %+v", status)
+	}
+	if calls := f.embedder.callCount() - callsBefore; calls != 1 {
+		t.Fatalf("reindex made %d embedding attempts after outage detection, want 1", calls)
+	}
+	if ix := f.loadIndex(t); !ix.NeedsEmbeddingRepair() || len(ix.Chats) != reindexPageSize+1 {
+		t.Fatal("multi-page keyword reindex did not preserve repair state and coverage")
 	}
 }
 

@@ -175,7 +175,8 @@ type Entry struct {
 	UpdatedAt      string `json:"updated_at,omitempty"`
 	// Vectors holds one quantized embedding per text chunk; the
 	// semantic score for the chat is the max similarity over them.
-	Vectors []Vector `json:"vectors,omitempty"`
+	Vectors          []Vector `json:"vectors,omitempty"`
+	EmbeddingPending bool     `json:"embedding_pending,omitempty"`
 }
 
 // ReindexProgress checkpoints a clean page boundary for a partial
@@ -303,6 +304,7 @@ func Decode(data []byte) (*Index, error) {
 	}
 	maxPostings := len(ix.Slots) * MaxTokensPerChat
 	totalPostings := 0
+	postedSlots := make([]bool, len(ix.Slots))
 	for tok, slots := range ix.Postings {
 		if !validPostingToken(tok) {
 			return nil, errors.New("searchindex: posting token is invalid")
@@ -322,10 +324,17 @@ func Decode(data []byte) (*Index, error) {
 				return nil, errors.New("searchindex: posting list is not strictly ordered")
 			}
 			prev = s
+			postedSlots[s] = true
 			totalPostings++
 			if totalPostings > maxPostings {
 				return nil, errors.New("searchindex: postings exceed token limit")
 			}
+		}
+	}
+	for id, entry := range ix.Chats {
+		if len(entry.Vectors) == 0 && postedSlots[entry.Slot] {
+			entry.EmbeddingPending = true
+			ix.Chats[id] = entry
 		}
 	}
 	return &ix, nil
@@ -451,6 +460,17 @@ func (ix *Index) maybeCompact() {
 // with the given model.
 func (ix *Index) Compatible(model string) bool {
 	return ix.Model == model
+}
+
+// NeedsEmbeddingRepair reports whether any lexically indexed entry is
+// still waiting for semantic vectors.
+func (ix *Index) NeedsEmbeddingRepair() bool {
+	for _, entry := range ix.Chats {
+		if entry.EmbeddingPending {
+			return true
+		}
+	}
+	return false
 }
 
 // identifierPattern matches whole emails and URLs in lowercased text.

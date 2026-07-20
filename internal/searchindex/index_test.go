@@ -75,6 +75,27 @@ func TestVectorJSONRoundtripAndQuantize(t *testing.T) {
 	}
 }
 
+func TestDecodeInfersPendingEmbeddingsForLegacyKeywordEntries(t *testing.T) {
+	ix := New("test-model")
+	mustUpsert(t, ix, "keyword", Entry{}, []string{"duck"})
+	mustUpsert(t, ix, "empty", Entry{}, nil)
+	encoded, err := ix.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Chats["keyword"].EmbeddingPending || !decoded.NeedsEmbeddingRepair() {
+		t.Fatal("legacy keyword entry did not request embedding repair")
+	}
+	if decoded.Chats["empty"].EmbeddingPending {
+		t.Fatal("empty legacy entry must not request embedding repair")
+	}
+}
+
 func TestDecodeRejectsBadInput(t *testing.T) {
 	if _, err := Decode([]byte(`{"version":99,"chats":{}}`)); err != ErrFormat {
 		t.Fatalf("expected ErrFormat, got %v", err)

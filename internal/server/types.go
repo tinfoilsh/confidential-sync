@@ -262,6 +262,8 @@ type SearchQueryResponse struct {
 	// caller's current key (never built, wrong key, or embedding model
 	// changed); the client should drive /v1/search/reindex.
 	NeedsReindex bool `json:"needs_reindex,omitempty"`
+
+	repairEmbeddings bool
 }
 
 // SearchReindexRequest kicks off a background job that rebuilds the

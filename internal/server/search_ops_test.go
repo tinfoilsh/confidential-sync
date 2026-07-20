@@ -496,17 +496,20 @@ func TestSearchReindexPreservesChunkMappingAcrossEmbeddingBatches(t *testing.T) 
 	}
 }
 
-func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
+func TestPushIndexesKeywordsWhenEmbeddingFails(t *testing.T) {
 	f := newSearchFixture(t)
 	f.embedder.setFailEmbed(errors.New("embedding backend down"))
 	tok := f.jwt()
 
 	out := f.pushChat(t, tok, "chat_duck", "Pond", "a duck swam by")
-	if out.SearchIndexed == nil || *out.SearchIndexed {
-		t.Fatal("push should report search_indexed=false when embedding fails")
+	if out.SearchIndexed == nil || !*out.SearchIndexed {
+		t.Fatal("lexical indexing should succeed when embedding fails")
 	}
 	if !out.OK {
 		t.Fatal("push should still succeed")
+	}
+	if ix := f.loadIndex(t); !ix.NeedsEmbeddingRepair() {
+		t.Fatal("lexical-only push did not record pending embedding repair")
 	}
 
 	// The lexical-only entry still makes the chat findable by keyword.
@@ -515,8 +518,24 @@ func TestPushSucceedsWhenEmbeddingFails(t *testing.T) {
 	if len(got.Results) != 1 || got.Results[0].ID != "chat_duck" {
 		t.Fatalf("expected lexical hit for 'duck', got %+v", got.Results)
 	}
-	if !got.NeedsReindex {
-		t.Fatal("lexical-only fallback did not request semantic repair")
+	if got.NeedsReindex {
+		t.Fatal("semantic degradation must not report missing keyword coverage")
+	}
+	job := f.handler.reindexCoordinator.Status(f.userSub)
+	if job == nil {
+		t.Fatal("successful semantic query did not start embedding repair")
+	}
+	select {
+	case <-job.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("embedding repair did not finish")
+	}
+	if status := job.statusResponse(); status.Status != string(MigrationJobCompleted) || status.Partial {
+		t.Fatalf("embedding repair did not complete cleanly: %+v", status)
+	}
+	ix := f.loadIndex(t)
+	if ix.NeedsEmbeddingRepair() || len(ix.Chats["chat_duck"].Vectors) == 0 {
+		t.Fatal("embedding repair did not restore semantic vectors")
 	}
 }
 

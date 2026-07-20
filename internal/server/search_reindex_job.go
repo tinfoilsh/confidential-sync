@@ -216,7 +216,7 @@ func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps De
 			}
 			if existing.blocksRestart() {
 				c.mu.Unlock()
-				needsReindex, err := searchIndexNeedsReindex(parentCtx, deps, sess, req.Keys[0].Key)
+				needsRepair, err := searchIndexNeedsRepair(parentCtx, deps, sess, req.Keys[0].Key)
 				if err != nil {
 					return nil, false, err
 				}
@@ -225,7 +225,7 @@ func (c *SearchReindexCoordinator) StartOrGet(parentCtx context.Context, deps De
 					c.mu.Unlock()
 					continue
 				}
-				if !needsReindex {
+				if !needsRepair {
 					c.mu.Unlock()
 					return existing, false, nil
 				}
@@ -319,6 +319,7 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 	targetSourceRevision := publication.SourceRevision
 	cursor := ""
 	startedAt := job.StartedAt
+	embedDocuments := true
 	if resumeCursor, resumeStartedAt, resumeTargetSourceRevision, ok, err := loadSearchReindexCheckpoint(ctx, deps, sess, req.Keys[0].Key, publication); err != nil {
 		if ctx.Err() != nil {
 			job.markPartial()
@@ -341,7 +342,7 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			}
 			return nil
 		}
-		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, startedAt, targetSourceRevision, coverageFailure)
+		page, err := searchReindexPage(ctx, deps, sess, req.Keys, cursor, startedAt, targetSourceRevision, coverageFailure, embedDocuments)
 		if err != nil {
 			// A budget expiry mid-page surfaces as a context error
 			// wrapped in upstream failures; report it as partial
@@ -357,6 +358,9 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 			return err
 		}
 		job.reportPage(page)
+		if page.EmbeddingFailed {
+			embedDocuments = false
+		}
 		if page.Failed > 0 {
 			job.markPartial()
 			coverageFailure = true
