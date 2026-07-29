@@ -90,6 +90,14 @@ func translate(err error) *AppError {
 		}
 		return a
 	}
+	var outcomeUnknown *controlplane.PutBlobOutcomeUnknownError
+	if errors.As(err, &outcomeUnknown) {
+		return &AppError{
+			Status: http.StatusServiceUnavailable,
+			Code:   CodeUpstream,
+			Reason: "outcome_unknown",
+		}
+	}
 	var cpe *controlplane.Error
 	if errors.As(err, &cpe) {
 		return &AppError{

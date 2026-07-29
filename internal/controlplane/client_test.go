@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -119,6 +120,7 @@ func TestPutProfileForwardsSyncProtocol(t *testing.T) {
 		}
 		w.Header().Set(HeaderETag, "1")
 		w.Header().Set(HeaderKeyID, strings.Repeat("a", 32))
+		_, _ = io.WriteString(w, `{"etag":"1"}`)
 	})
 
 	c := NewClient(st.server.URL, nil)
@@ -190,6 +192,233 @@ func TestPutBlobStaleBlob(t *testing.T) {
 	}
 	if !IsCode(err, StatusStaleBlob) {
 		t.Fatalf("expected STALE_BLOB, got %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestPutBlobReplaysExactRequestAfterDroppedCommittedResponse(t *testing.T) {
+	type attempt struct {
+		body   []byte
+		header http.Header
+	}
+	var attempts []attempt
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempts = append(attempts, attempt{body: body, header: req.Header.Clone()})
+		if len(attempts) == 1 {
+			return nil, errors.New("response dropped after commit")
+		}
+		header := make(http.Header)
+		header.Set(HeaderETag, "8")
+		header.Set(HeaderKeyID, strings.Repeat("a", 32))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(`{"etag":"8","key_id":"` + strings.Repeat("a", 32) + `"}`)),
+		}, nil
+	})
+	c := NewClient("https://controlplane.test", &http.Client{Transport: transport})
+	messageCount := 4
+	projectID := "project-1"
+	resp, err := c.PutBlob(context.Background(), PutBlobRequest{
+		Scope:          "chat",
+		ID:             "chat-1",
+		JWT:            "jwt",
+		ClerkUserID:    "user-1",
+		KeyIDHex:       strings.Repeat("a", 32),
+		IfMatch:        "7",
+		IdempotencyKey: "idem-1",
+		OperationHash:  "hash-1",
+		RequestID:      "request-1",
+		Ciphertext:     []byte("exact-ciphertext"),
+		MessageCount:   &messageCount,
+		ProjectIDSet:   true,
+		ProjectID:      &projectID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ETag != "8" || len(attempts) != 2 {
+		t.Fatalf("response=%+v attempts=%d", resp, len(attempts))
+	}
+	if !reflect.DeepEqual(attempts[0], attempts[1]) {
+		t.Fatalf("replay changed request: first=%+v second=%+v", attempts[0], attempts[1])
+	}
+	if got := attempts[1].header.Get(HeaderRequestID); got != "request-1" {
+		t.Fatalf("request id = %q", got)
+	}
+}
+
+func TestPutBlobDoesNotRetryDefinitiveClientError(t *testing.T) {
+	st := newStub(t)
+	calls := 0
+	st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusPreconditionFailed)
+		_, _ = io.WriteString(w, `{"code":"STALE_BLOB","current_etag":"9"}`)
+	})
+	_, err := NewClient(st.server.URL, nil).PutBlob(context.Background(), PutBlobRequest{Scope: "chat", ID: "chat_1"})
+	if !IsCode(err, StatusStaleBlob) || calls != 1 {
+		t.Fatalf("error=%v calls=%d", err, calls)
+	}
+}
+
+func TestPutBlobReturnsOutcomeUnknownAfterAmbiguousReplay(t *testing.T) {
+	const gatewayTimeoutStatus = 524
+
+	st := newStub(t)
+	calls := 0
+	st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(gatewayTimeoutStatus)
+		_, _ = io.WriteString(w, `{"code":"UPSTREAM_UNAVAILABLE"}`)
+	})
+	_, err := NewClient(st.server.URL, nil).PutBlob(context.Background(), PutBlobRequest{Scope: "chat", ID: "chat_1"})
+	var unknown *PutBlobOutcomeUnknownError
+	if !errors.As(err, &unknown) || calls != 2 {
+		t.Fatalf("error=%v calls=%d", err, calls)
+	}
+}
+
+func TestPutBlobStrictSuccessParsing(t *testing.T) {
+	tests := []struct {
+		name        string
+		headerETag  string
+		headerKeyID string
+		body        string
+		kind        PutBlobAmbiguity
+	}{
+		{name: "malformed json", headerETag: "1", body: `{"etag":`, kind: PutBlobResponseDecode},
+		{name: "missing body etag", headerETag: "1", body: `{}`, kind: PutBlobInvalidResponse},
+		{name: "missing header etag", body: `{"etag":"1"}`, kind: PutBlobInvalidResponse},
+		{name: "inconsistent etag", headerETag: "1", body: `{"etag":"2"}`, kind: PutBlobInvalidResponse},
+		{
+			name:        "inconsistent key id",
+			headerETag:  "1",
+			headerKeyID: strings.Repeat("a", 32),
+			body:        `{"etag":"1","key_id":"` + strings.Repeat("b", 32) + `"}`,
+			kind:        PutBlobInvalidResponse,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStub(t)
+			st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+				if tc.headerETag != "" {
+					w.Header().Set(HeaderETag, tc.headerETag)
+				}
+				if tc.headerKeyID != "" {
+					w.Header().Set(HeaderKeyID, tc.headerKeyID)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			_, err := NewClient(st.server.URL, nil).PutBlob(context.Background(), PutBlobRequest{Scope: "chat", ID: "chat_1"})
+			var unknown *PutBlobOutcomeUnknownError
+			var ambiguous *AmbiguousPutBlobError
+			if !errors.As(err, &unknown) || !errors.As(err, &ambiguous) || ambiguous.Kind != tc.kind {
+				t.Fatalf("error=%v ambiguous=%+v", err, ambiguous)
+			}
+		})
+	}
+}
+
+func TestPutBlobDoesNotDispatchWhenParentAlreadyCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return nil, context.Canceled
+	})
+	_, err := NewClient("https://controlplane.test", &http.Client{Transport: transport}).PutBlob(ctx, PutBlobRequest{
+		Scope: "chat",
+		ID:    "chat-1",
+	})
+	if !errors.Is(err, context.Canceled) || calls != 0 {
+		t.Fatalf("error=%v calls=%d", err, calls)
+	}
+}
+
+func TestPutBlobReturnsOutcomeUnknownWhenParentCanceledAfterDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		cancel()
+		return nil, context.Canceled
+	})
+	_, err := NewClient("https://controlplane.test", &http.Client{Transport: transport}).PutBlob(ctx, PutBlobRequest{
+		Scope: "chat",
+		ID:    "chat-1",
+	})
+	var unknown *PutBlobOutcomeUnknownError
+	if !errors.As(err, &unknown) || calls != 1 {
+		t.Fatalf("error=%v calls=%d", err, calls)
+	}
+}
+
+func TestPutBlobAcceptsKeyIDFromEitherSuccessField(t *testing.T) {
+	keyID := strings.Repeat("a", 32)
+	tests := []struct {
+		name        string
+		headerKeyID string
+		body        string
+	}{
+		{name: "header", headerKeyID: keyID, body: `{"etag":"1"}`},
+		{name: "body", body: `{"etag":"1","key_id":"` + keyID + `"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStub(t)
+			st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(HeaderETag, "1")
+				if tc.headerKeyID != "" {
+					w.Header().Set(HeaderKeyID, tc.headerKeyID)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			resp, err := NewClient(st.server.URL, nil).PutBlob(context.Background(), PutBlobRequest{Scope: "chat", ID: "chat_1"})
+			if err != nil || resp.KeyID != keyID {
+				t.Fatalf("response=%+v error=%v", resp, err)
+			}
+		})
+	}
+}
+
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) { return 0, errors.New("response body dropped") }
+func (failingReadCloser) Close() error             { return nil }
+
+func TestPutBlobRetriesSuccessBodyReadFailure(t *testing.T) {
+	calls := 0
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		header := make(http.Header)
+		header.Set(HeaderETag, "1")
+		if calls == 1 {
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: failingReadCloser{}}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       io.NopCloser(strings.NewReader(`{"etag":"1"}`)),
+		}, nil
+	})
+	resp, err := NewClient("https://controlplane.test", &http.Client{Transport: transport}).PutBlob(context.Background(), PutBlobRequest{
+		Scope: "chat",
+		ID:    "chat-1",
+	})
+	if err != nil || resp.ETag != "1" || calls != 2 {
+		t.Fatalf("response=%+v error=%v calls=%d", resp, err, calls)
 	}
 }
 

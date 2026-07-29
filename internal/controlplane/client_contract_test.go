@@ -28,6 +28,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"HeaderProjectID":           {HeaderProjectID, "X-Project-Id"},
 			"HeaderProjectIDSet":        {HeaderProjectIDSet, "X-Project-Id-Set"},
 			"HeaderETag":                {HeaderETag, "ETag"},
+			"HeaderRequestID":           {HeaderRequestID, "X-Request-ID"},
 			"HeaderSearchIndexFenced":   {HeaderSearchIndexFenced, "X-Search-Index-Fenced"},
 			"HeaderLegacyClaim":         {HeaderLegacyClaim, "X-Legacy-Claim"},
 			"HeaderClerkUserID":         {HeaderClerkUserID, "X-Clerk-User-Id"},
