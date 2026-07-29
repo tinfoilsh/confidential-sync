@@ -297,8 +297,7 @@ func TestPutBlobStrictSuccessParsing(t *testing.T) {
 		kind        PutBlobAmbiguity
 	}{
 		{name: "malformed json", headerETag: "1", body: `{"etag":`, kind: PutBlobResponseDecode},
-		{name: "missing body etag", headerETag: "1", body: `{}`, kind: PutBlobInvalidResponse},
-		{name: "missing header etag", body: `{"etag":"1"}`, kind: PutBlobInvalidResponse},
+		{name: "missing etag", body: `{}`, kind: PutBlobInvalidResponse},
 		{name: "inconsistent etag", headerETag: "1", body: `{"etag":"2"}`, kind: PutBlobInvalidResponse},
 		{
 			name:        "inconsistent key id",
@@ -325,6 +324,32 @@ func TestPutBlobStrictSuccessParsing(t *testing.T) {
 			var ambiguous *AmbiguousPutBlobError
 			if !errors.As(err, &unknown) || !errors.As(err, &ambiguous) || ambiguous.Kind != tc.kind {
 				t.Fatalf("error=%v ambiguous=%+v", err, ambiguous)
+			}
+		})
+	}
+}
+
+func TestPutBlobAcceptsETagFromEitherSuccessField(t *testing.T) {
+	tests := []struct {
+		name       string
+		headerETag string
+		body       string
+	}{
+		{name: "header", headerETag: "1", body: `{}`},
+		{name: "body", body: `{"etag":"1"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStub(t)
+			st.handle1("PUT", "/api/sync/blob/chat/chat_1", func(w http.ResponseWriter, r *http.Request) {
+				if tc.headerETag != "" {
+					w.Header().Set(HeaderETag, tc.headerETag)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			resp, err := NewClient(st.server.URL, nil).PutBlob(context.Background(), PutBlobRequest{Scope: "chat", ID: "chat_1"})
+			if err != nil || resp.ETag != "1" {
+				t.Fatalf("response=%+v error=%v", resp, err)
 			}
 		})
 	}
