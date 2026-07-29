@@ -401,11 +401,14 @@ func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobR
 		return nil, &AmbiguousPutBlobError{Kind: PutBlobResponseDecode, Err: errors.New("trailing data in PutBlob response")}
 	}
 	headerETag := resp.Header.Get(HeaderETag)
-	if out.ETag == "" || headerETag == "" {
+	if out.ETag == "" && headerETag == "" {
 		return nil, &AmbiguousPutBlobError{Kind: PutBlobInvalidResponse, Err: errors.New("missing ETag in PutBlob response")}
 	}
-	if out.ETag != headerETag {
+	if out.ETag != "" && headerETag != "" && out.ETag != headerETag {
 		return nil, &AmbiguousPutBlobError{Kind: PutBlobInvalidResponse, Err: errors.New("inconsistent ETag in PutBlob response")}
+	}
+	if out.ETag == "" {
+		out.ETag = headerETag
 	}
 	headerKeyID := resp.Header.Get(HeaderKeyID)
 	if out.KeyID != "" && headerKeyID != "" && out.KeyID != headerKeyID {
