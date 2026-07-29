@@ -75,6 +75,7 @@ const (
 	HeaderProjectID           = "X-Project-Id"
 	HeaderProjectIDSet        = "X-Project-Id-Set"
 	HeaderETag                = "ETag"
+	HeaderRequestID           = "X-Request-ID"
 	HeaderSearchIndexFenced   = "X-Search-Index-Fenced"
 	HeaderContentType         = "Content-Type"
 	HeaderServiceSecret       = "X-Sync-Enclave-Secret"
@@ -107,6 +108,11 @@ const (
 // downloads. var (not const) so package tests can shrink it to keep
 // oversized-body regressions cheap to exercise.
 var maxLegacyAttachmentBytes = 64 << 20
+
+const (
+	PutBlobAttemptTimeout = 20 * time.Second
+	PutBlobMaxAttempts    = 2
+)
 
 // Error is a structured error returned from the controlplane. It contains
 // the parsed error code plus any contextual fields the controlplane sent.
@@ -171,6 +177,7 @@ type PutBlobRequest struct {
 	IfMatch             string
 	IdempotencyKey      string
 	OperationHash       string
+	RequestID           string
 	ProfileSyncProtocol int
 	Rewrap              bool
 	Ciphertext          []byte
@@ -191,6 +198,41 @@ type PutBlobResponse struct {
 	KeyID          string `json:"key_id"`
 	SourceRevision int64  `json:"source_revision,omitempty"`
 }
+
+type PutBlobAmbiguity string
+
+const (
+	PutBlobTransportFailure PutBlobAmbiguity = "transport_failure"
+	PutBlobUpstreamFailure  PutBlobAmbiguity = "upstream_failure"
+	PutBlobResponseRead     PutBlobAmbiguity = "response_read_failure"
+	PutBlobResponseDecode   PutBlobAmbiguity = "response_decode_failure"
+	PutBlobInvalidResponse  PutBlobAmbiguity = "invalid_response"
+)
+
+// AmbiguousPutBlobError identifies an attempt whose write may have committed
+// even though the client could not confirm its outcome.
+type AmbiguousPutBlobError struct {
+	Kind PutBlobAmbiguity
+	Err  error
+}
+
+func (e *AmbiguousPutBlobError) Error() string {
+	return fmt.Sprintf("controlplane: ambiguous PutBlob outcome (%s): %v", e.Kind, e.Err)
+}
+
+func (e *AmbiguousPutBlobError) Unwrap() error { return e.Err }
+
+// PutBlobOutcomeUnknownError means a dispatched write could not be confirmed,
+// so the caller must reconcile before writing again.
+type PutBlobOutcomeUnknownError struct {
+	Err error
+}
+
+func (e *PutBlobOutcomeUnknownError) Error() string {
+	return fmt.Sprintf("controlplane: PutBlob outcome unknown: %v", e.Err)
+}
+
+func (e *PutBlobOutcomeUnknownError) Unwrap() error { return e.Err }
 
 type GetBlobResponse struct {
 	Ciphertext   []byte
@@ -274,14 +316,39 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	if req.Rewrap {
 		return c.rewrapBlob(ctx, req)
 	}
+	for attempt := 0; attempt < PutBlobMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := c.putBlobOnce(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		var ambiguous *AmbiguousPutBlobError
+		if !errors.As(err, &ambiguous) {
+			return nil, err
+		}
+		if ctx.Err() != nil || attempt == PutBlobMaxAttempts-1 {
+			return nil, &PutBlobOutcomeUnknownError{Err: err}
+		}
+	}
+	panic("unreachable")
+}
+
+func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobResponse, error) {
 	endpoint, err := c.urlFor(req.Scope, req.ID)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(req.Ciphertext))
+	attemptCtx, cancel := context.WithTimeout(ctx, PutBlobAttemptTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPut, endpoint, bytes.NewReader(req.Ciphertext))
 	if err != nil {
 		return nil, err
 	}
+	// Disable net/http's transparent body replay so the bounded loop above is
+	// the only layer that can issue a second controlplane write.
+	httpReq.GetBody = nil
 	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
 	httpReq.Header.Set(HeaderContentType, "application/octet-stream")
 	httpReq.Header.Set(HeaderKeyID, req.KeyIDHex)
@@ -293,6 +360,9 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	}
 	if req.OperationHash != "" {
 		httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	}
+	if req.RequestID != "" {
+		httpReq.Header.Set(HeaderRequestID, req.RequestID)
 	}
 	if req.ProfileSyncProtocol > 0 {
 		httpReq.Header.Set(HeaderProfileSyncProtocol, strconv.Itoa(req.ProfileSyncProtocol))
@@ -308,27 +378,50 @@ func (c *Client) PutBlob(ctx context.Context, req PutBlobRequest) (*PutBlobRespo
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobTransportFailure, Err: err}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, parseError(resp.StatusCode, body)
+		cpErr := parseError(resp.StatusCode, body)
+		if isRetryablePutBlobStatus(resp.StatusCode) {
+			return nil, &AmbiguousPutBlobError{Kind: PutBlobUpstreamFailure, Err: cpErr}
+		}
+		return nil, cpErr
 	}
-	out := &PutBlobResponse{
-		ETag:  resp.Header.Get(HeaderETag),
-		KeyID: resp.Header.Get(HeaderKeyID),
+	if readErr != nil {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobResponseRead, Err: readErr}
 	}
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, out)
+	var out PutBlobResponse
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&out); err != nil {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobResponseDecode, Err: err}
 	}
-	if out.ETag == "" {
-		return nil, errors.New("controlplane: missing ETag in PutBlob response")
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobResponseDecode, Err: errors.New("trailing data in PutBlob response")}
+	}
+	headerETag := resp.Header.Get(HeaderETag)
+	if out.ETag == "" || headerETag == "" {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobInvalidResponse, Err: errors.New("missing ETag in PutBlob response")}
+	}
+	if out.ETag != headerETag {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobInvalidResponse, Err: errors.New("inconsistent ETag in PutBlob response")}
+	}
+	headerKeyID := resp.Header.Get(HeaderKeyID)
+	if out.KeyID != "" && headerKeyID != "" && out.KeyID != headerKeyID {
+		return nil, &AmbiguousPutBlobError{Kind: PutBlobInvalidResponse, Err: errors.New("inconsistent KeyID in PutBlob response")}
+	}
+	if out.KeyID == "" {
+		out.KeyID = headerKeyID
 	}
 	if out.KeyID == "" {
 		out.KeyID = req.KeyIDHex
 	}
-	return out, nil
+	return &out, nil
+}
+
+func isRetryablePutBlobStatus(status int) bool {
+	return status >= 500 && status <= 599
 }
 
 // rewrapBlob targets the dedicated /api/sync/rewrap endpoint. Unlike

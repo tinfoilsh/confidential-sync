@@ -160,6 +160,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		IfMatch:             ifMatch,
 		IdempotencyKey:      req.IdempotencyKey,
 		OperationHash:       opHash,
+		RequestID:           requestIDFromContext(ctx),
 		ProfileSyncProtocol: profileSyncProtocol,
 		Ciphertext:          envBlob,
 		MessageCount:        messageCountFromMetadata(req.Scope, req.Metadata),

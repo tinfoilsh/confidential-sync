@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 )
 
 // MaxRequestBytes caps decoded JSON bodies. Plaintext blobs upload via the
@@ -22,6 +25,13 @@ const MaxRequestBytes = 64 << 20
 // network paths; this gives the buckets hop room to breathe while
 // still bounding worst-case latency.
 const AttachmentRequestTimeout = 5 * time.Minute
+
+const (
+	StandardRequestTimeout  = 30 * time.Second
+	SyncPushRequestOverhead = 20 * time.Second
+	SyncPushRequestTimeout  = time.Duration(controlplane.PutBlobMaxAttempts)*controlplane.PutBlobAttemptTimeout + SyncPushRequestOverhead
+	MaxPushRequestIDLength  = 128
+)
 
 type Handler struct {
 	deps               Deps
@@ -66,7 +76,9 @@ type routeSpec struct {
 
 func (h *Handler) routeSpecs() []routeSpec {
 	return []routeSpec{
-		{"POST", "/v1/sync/push", func(h *Handler) http.Handler { return h.authMiddleware(h.push) }},
+		{"POST", "/v1/sync/push", func(h *Handler) http.Handler {
+			return h.pushRequestIDMiddleware(h.authMiddlewareWithTimeout(h.push, SyncPushRequestTimeout))
+		}},
 		{"POST", "/v1/sync/pull", func(h *Handler) http.Handler { return h.authMiddleware(h.pull) }},
 		{"POST", "/v1/sync/list-status", func(h *Handler) http.Handler { return h.authMiddleware(h.listStatus) }},
 		{"POST", "/v1/sync/delete", func(h *Handler) http.Handler { return h.authMiddleware(h.delete) }},
@@ -175,7 +187,7 @@ func (h *Handler) Routes() http.Handler {
 // authMiddleware extracts and verifies the JWT, then attaches a Session to
 // the request context. Unauthenticated requests get a uniform 401.
 func (h *Handler) authMiddleware(fn func(http.ResponseWriter, *http.Request, Session)) http.Handler {
-	return h.authMiddlewareWithTimeout(fn, 30*time.Second)
+	return h.authMiddlewareWithTimeout(fn, StandardRequestTimeout)
 }
 
 func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.Request, Session), timeout time.Duration) http.Handler {
@@ -194,6 +206,49 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 		}
 		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
 	})
+}
+
+type requestIDContextKey struct{}
+
+func (h *Handler) pushRequestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get(controlplane.HeaderRequestID)
+		if !validPushRequestID(requestID) {
+			var id [16]byte
+			if _, err := rand.Read(id[:]); err != nil {
+				writeError(w, err)
+				return
+			}
+			requestID = hex.EncodeToString(id[:])
+		}
+		w.Header().Set(controlplane.HeaderRequestID, requestID)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func validPushRequestID(requestID string) bool {
+	if len(requestID) == 0 || len(requestID) > MaxPushRequestIDLength {
+		return false
+	}
+	for i := 0; i < len(requestID); i++ {
+		c := requestID[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '-', '_', '.', ':':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
+	return requestID
 }
 
 // withRequestTimeout attaches a context deadline to the request so

@@ -863,6 +863,84 @@ func TestPushAndPullRoundtrip(t *testing.T) {
 	}
 }
 
+func TestPushPropagatesRequestIDAndReturnsOutcomeUnknown(t *testing.T) {
+	tests := []struct {
+		name      string
+		requestID string
+		preserve  bool
+	}{
+		{name: "accepts caller request id", requestID: "browser-report-1", preserve: true},
+		{name: "generates request id"},
+		{name: "replaces unsafe request id", requestID: "browser report/1"},
+		{name: "replaces oversized request id", requestID: strings.Repeat("a", MaxPushRequestIDLength+1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var seenRequestIDs []string
+			cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenRequestIDs = append(seenRequestIDs, r.Header.Get(controlplane.HeaderRequestID))
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"code":"UPSTREAM_UNAVAILABLE"}`)
+			}))
+			t.Cleanup(cp.Close)
+			f.handler.deps.Controlplane = controlplane.NewClient(cp.URL, nil)
+
+			body, err := json.Marshal(PushRequest{
+				Scope:          "chat",
+				ID:             "request-id-chat",
+				Key:            f.userKeyB64,
+				Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"messages":[]}`)),
+				IdempotencyKey: "request-id-idem",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, f.server.URL+"/v1/sync/push", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+f.jwt())
+			req.Header.Set("Content-Type", "application/json")
+			if tc.requestID != "" {
+				req.Header.Set(controlplane.HeaderRequestID, tc.requestID)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			respBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s", resp.StatusCode, respBody)
+			}
+			var appErr AppError
+			if err := json.Unmarshal(respBody, &appErr); err != nil {
+				t.Fatal(err)
+			}
+			if appErr.Code != CodeUpstream || appErr.Reason != "outcome_unknown" {
+				t.Fatalf("error=%+v", appErr)
+			}
+			echoed := resp.Header.Get(controlplane.HeaderRequestID)
+			if !validPushRequestID(echoed) {
+				t.Fatalf("echoed request id=%q", echoed)
+			}
+			if tc.preserve && echoed != tc.requestID {
+				t.Fatalf("caller request id changed: got=%q want=%q", echoed, tc.requestID)
+			}
+			if !tc.preserve && tc.requestID != "" && echoed == tc.requestID {
+				t.Fatalf("invalid caller request id was preserved: %q", echoed)
+			}
+			if len(seenRequestIDs) != 2 || seenRequestIDs[0] != echoed || seenRequestIDs[1] != echoed {
+				t.Fatalf("controlplane request ids=%v echoed=%q", seenRequestIDs, echoed)
+			}
+		})
+	}
+}
+
 func TestPullUnknownKey(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
