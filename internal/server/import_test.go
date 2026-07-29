@@ -288,7 +288,8 @@ func TestImportStagingCleanupExpiresStaleJobs(t *testing.T) {
 
 	token := importChunkToken(createResp.UploadID, 0)
 	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) && f.handler.importCoordinator.Get(f.userSub) != nil {
+	for time.Now().Before(deadline) &&
+		(f.handler.importCoordinator.Get(f.userSub) != nil || f.bk.has(token)) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if f.handler.importCoordinator.Get(f.userSub) != nil {
