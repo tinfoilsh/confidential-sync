@@ -68,6 +68,7 @@ type cpStub struct {
 	attachmentIndex            map[string]string // attachmentID → chatID (populated by handler)
 	attachmentOwner            map[string]string // attachmentID → clerkUserID (set by tests)
 	sourceRevision             int64
+	revisions                  []controlplane.RevisionEvent
 	searchState                controlplane.SearchIndexState
 	searchConflict             func(controlplane.SearchIndexState) controlplane.SearchIndexState
 	minimumProfileSyncProtocol int
@@ -92,6 +93,7 @@ type cpBlob struct {
 	Body         []byte
 	ProjectIDSet bool
 	ProjectID    *string
+	UpdatedAt    time.Time
 }
 
 func newCPStub(t *testing.T) *cpStub {
@@ -143,6 +145,9 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
 	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
+	s.mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.handleRevisionSummary)
+	s.mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.handleRevisionEvents)
+	s.mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.handleRevisionSnapshot)
 	s.mux.HandleFunc("GET /api/sync/search-index", s.handleGetSearchIndex)
 	s.mux.HandleFunc("PUT /api/sync/search-index", s.handlePublishSearchIndex)
 	s.mux.HandleFunc("GET /api/sync/needs-migration", s.handleNeedsMigration)
@@ -224,13 +229,23 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 		if blob != nil {
 			nextETag = blob.ETag + 1
 		}
+		updatedAt := time.Now().UTC()
 		s.blobs[key] = &cpBlob{
-			ETag:  nextETag,
-			KeyID: r.Header.Get("X-Key-Id"),
-			Body:  body,
+			ETag:      nextETag,
+			KeyID:     r.Header.Get("X-Key-Id"),
+			Body:      body,
+			UpdatedAt: updatedAt,
 		}
 		if scope == "chat" {
 			s.sourceRevision++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRevision),
+				Kind:      "upsert",
+				ID:        id,
+				ETag:      formatETag(nextETag),
+				KeyID:     r.Header.Get("X-Key-Id"),
+				UpdatedAt: updatedAt.Format(time.RFC3339Nano),
+			})
 		}
 		w.Header().Set("ETag", formatETag(nextETag))
 		w.Header().Set("X-Key-Id", r.Header.Get("X-Key-Id"))
@@ -285,6 +300,12 @@ func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 		delete(s.blobs, key)
 		if scope == "chat" {
 			s.sourceRevision++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRevision),
+				Kind:      "delete",
+				ID:        id,
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
 		}
 		// Mirror the real controlplane's chat-delete cascade: drop
 		// matching attachment-index rows and return their v2 ids so
@@ -318,12 +339,46 @@ func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		updates = append(updates, controlplane.BlobMeta{
-			ID:    parts[1],
-			ETag:  formatETag(blob.ETag),
-			KeyID: blob.KeyID,
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt,
 		})
 	}
 	json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates})
+}
+
+func (s *cpStub) handleRevisionSummary(w http.ResponseWriter, r *http.Request) {
+	_ = json.NewEncoder(w).Encode(controlplane.RevisionSummaryResponse{
+		CurrentRevision:          formatETag(s.sourceRevision),
+		OldestReplayableRevision: "0",
+	})
+}
+
+func (s *cpStub) handleRevisionEvents(w http.ResponseWriter, r *http.Request) {
+	_ = json.NewEncoder(w).Encode(controlplane.RevisionEventsResponse{Events: s.revisions})
+}
+
+func (s *cpStub) handleRevisionSnapshot(w http.ResponseWriter, r *http.Request) {
+	items := make([]controlplane.RevisionSnapshotItem, 0)
+	for key, blob := range s.blobs {
+		parts := strings.SplitN(key, "/", 2)
+		if parts[0] != "chat" {
+			continue
+		}
+		items = append(items, controlplane.RevisionSnapshotItem{
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+		})
+	}
+	_ = json.NewEncoder(w).Encode(controlplane.RevisionSnapshotResponse{
+		Items:            items,
+		SnapshotRevision: formatETag(s.sourceRevision),
+	})
 }
 
 func (s *cpStub) currentSearchState() controlplane.SearchIndexState {
@@ -799,6 +854,7 @@ func (f *fixture) post(path string, body any, token string) (*http.Response, []b
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -901,6 +957,7 @@ func TestPushPropagatesRequestIDAndReturnsOutcomeUnknown(t *testing.T) {
 				t.Fatal(err)
 			}
 			req.Header.Set("Authorization", "Bearer "+f.jwt())
+			req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
 			req.Header.Set("Content-Type", "application/json")
 			if tc.requestID != "" {
 				req.Header.Set(controlplane.HeaderRequestID, tc.requestID)
@@ -1031,6 +1088,192 @@ func TestUnauthenticatedPushDoesNotConsumeIdempotencyKey(t *testing.T) {
 	f.cp.mu.Unlock()
 	if requestsAfterRetry != 1 || !persistedAfterRetry {
 		t.Fatalf("authenticated retry did not persist: requests=%d persisted=%t", requestsAfterRetry, persistedAfterRetry)
+	}
+}
+
+func TestAuthenticationPrecedesProtocolEnforcement(t *testing.T) {
+	f := newFixture(t)
+	for _, authorization := range []string{"", "Bearer garbage"} {
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/v1/key/current", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorization != "" {
+			req.Header.Set(controlplane.HeaderAuth, authorization)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("authorization %q: status=%d body=%s", authorization, resp.StatusCode, body)
+		}
+	}
+}
+
+func TestAuthenticatedRoutesRequireSyncProtocolV2(t *testing.T) {
+	f := newFixture(t)
+	for _, protocols := range [][]string{nil, {"1"}, {"3"}, {"2", "1"}} {
+		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/v1/key/current", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set(controlplane.HeaderAuth, "Bearer "+f.jwt())
+		for _, protocol := range protocols {
+			req.Header.Add(controlplane.HeaderSyncProtocol, protocol)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if resp.StatusCode != http.StatusUpgradeRequired {
+			t.Fatalf("protocols %q: status=%d body=%s", protocols, resp.StatusCode, body)
+		}
+		var appErr AppError
+		if err := json.Unmarshal(body, &appErr); err != nil {
+			t.Fatal(err)
+		}
+		if appErr.Code != CodeSyncProtocolUpgradeRequired {
+			t.Fatalf("protocols %q: error=%+v", protocols, appErr)
+		}
+	}
+}
+
+func TestRevisionSyncRoutesProxyReplayMetadata(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	var revisionRequests int
+	f.cp.captureHeaders = func(r *http.Request) {
+		if r.URL.Path != controlplane.RevisionSummaryPath && r.URL.Path != controlplane.RevisionEventsPath && r.URL.Path != controlplane.RevisionSnapshotPath {
+			return
+		}
+		revisionRequests++
+		if got := r.Header.Get(controlplane.HeaderAuth); got != "Bearer "+tok {
+			t.Errorf("forwarded authorization=%q", got)
+		}
+		if got := r.Header.Get(controlplane.HeaderClerkUserID); got != f.userSub {
+			t.Errorf("forwarded subject=%q", got)
+		}
+		if r.URL.Path == controlplane.RevisionEventsPath {
+			query := r.URL.Query()
+			if query.Get("after_revision") != "0" || query.Get("through_revision") != "1" || query.Get("limit") != "10" {
+				t.Errorf("forwarded revision query=%q", r.URL.RawQuery)
+			}
+		}
+	}
+	pushResponse, pushBody := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "revision-chat",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"revision-chat"}`)),
+		IdempotencyKey: "revision-push",
+	}, tok)
+	if pushResponse.StatusCode != http.StatusOK {
+		t.Fatalf("push: status=%d body=%s", pushResponse.StatusCode, pushBody)
+	}
+
+	summaryResponse, summaryBody := f.post("/v1/sync/revision-summary", RevisionSummaryRequest{}, tok)
+	if summaryResponse.StatusCode != http.StatusOK {
+		t.Fatalf("summary: status=%d body=%s", summaryResponse.StatusCode, summaryBody)
+	}
+	var summary RevisionSummaryResponse
+	if err := json.Unmarshal(summaryBody, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.CurrentRevision != "1" || summary.OldestReplayableRevision != "0" {
+		t.Fatalf("summary=%+v", summary)
+	}
+
+	limit := 10
+	eventsResponse, eventsBody := f.post("/v1/sync/revision-events", RevisionEventsRequest{
+		AfterRevision:   "0",
+		ThroughRevision: summary.CurrentRevision,
+		Limit:           &limit,
+	}, tok)
+	if eventsResponse.StatusCode != http.StatusOK {
+		t.Fatalf("events: status=%d body=%s", eventsResponse.StatusCode, eventsBody)
+	}
+	var events RevisionEventsResponse
+	if err := json.Unmarshal(eventsBody, &events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events.Events) != 1 || events.Events[0].Kind != "upsert" || events.Events[0].ID != "revision-chat" {
+		t.Fatalf("events=%+v", events)
+	}
+
+	snapshotResponse, snapshotBody := f.post("/v1/sync/revision-snapshot", RevisionSnapshotRequest{}, tok)
+	if snapshotResponse.StatusCode != http.StatusOK {
+		t.Fatalf("snapshot: status=%d body=%s", snapshotResponse.StatusCode, snapshotBody)
+	}
+	var snapshot RevisionSnapshotResponse
+	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SnapshotRevision != "1" || len(snapshot.Items) != 1 || snapshot.Items[0].ID != "revision-chat" {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	if revisionRequests != 3 {
+		t.Fatalf("revision requests=%d", revisionRequests)
+	}
+}
+
+func TestListStatusRemainsAvailableWithProtocolV2(t *testing.T) {
+	f := newFixture(t)
+	projectID := "project-1"
+	updatedAt := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/listed-chat"] = &cpBlob{
+		ETag:      7,
+		KeyID:     f.userKeyID,
+		ProjectID: &projectID,
+		UpdatedAt: updatedAt,
+	}
+	f.cp.mu.Unlock()
+
+	tok := f.jwt()
+	var proxied bool
+	f.cp.captureHeaders = func(r *http.Request) {
+		if r.URL.Path != "/api/sync/list-status" {
+			return
+		}
+		proxied = true
+		query := r.URL.Query()
+		if query.Get("scope") != "chat" || query.Get("cursor") != "cursor-1" || query.Get("limit") != "50" || query.Get("project_id") != projectID || query.Get("direction") != "desc" {
+			t.Errorf("forwarded list-status query=%q", r.URL.RawQuery)
+		}
+		if got := r.Header.Get(controlplane.HeaderAuth); got != "Bearer "+tok {
+			t.Errorf("forwarded authorization=%q", got)
+		}
+		if got := r.Header.Get(controlplane.HeaderClerkUserID); got != f.userSub {
+			t.Errorf("forwarded subject=%q", got)
+		}
+	}
+	response, body := f.post("/v1/sync/list-status", ListStatusRequest{
+		Scope:     "chat",
+		Cursor:    "cursor-1",
+		Limit:     50,
+		ProjectID: projectID,
+		Direction: "desc",
+	}, tok)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+	var list ListStatusResponse
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatal(err)
+	}
+	if !proxied || len(list.Updates) != 1 || list.Updates[0].ID != "listed-chat" || list.Updates[0].ProjectID == nil || *list.Updates[0].ProjectID != projectID || list.Updates[0].UpdatedAt != updatedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("proxied=%v response=%+v", proxied, list)
 	}
 }
 

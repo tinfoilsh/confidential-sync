@@ -19,6 +19,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 	t.Run("headers", func(t *testing.T) {
 		t.Parallel()
 		cases := map[string]struct{ have, want string }{
+			"HeaderSyncProtocol":        {HeaderSyncProtocol, "X-Sync-Protocol"},
 			"HeaderKeyID":               {HeaderKeyID, "X-Key-Id"},
 			"HeaderIfMatch":             {HeaderIfMatch, "If-Match"},
 			"HeaderIdempotency":         {HeaderIdempotency, "X-Idempotency-Key"},
@@ -47,6 +48,9 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 		}
 		if IfMatchAnyKey != "*" {
 			t.Errorf("IfMatchAnyKey = %q, want %q", IfMatchAnyKey, "*")
+		}
+		if SyncProtocolV2 != 2 {
+			t.Errorf("SyncProtocolV2 = %d, want 2", SyncProtocolV2)
 		}
 		if ProfileSyncProtocolV2 != 2 {
 			t.Errorf("ProfileSyncProtocolV2 = %d, want 2", ProfileSyncProtocolV2)

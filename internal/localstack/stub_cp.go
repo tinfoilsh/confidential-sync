@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,10 +31,12 @@ import (
 
 // StubBlob is a stored ciphertext envelope on the stub.
 type StubBlob struct {
-	ETag      int64
-	KeyID     string
-	Body      []byte
-	UpdatedAt time.Time
+	ETag         int64
+	KeyID        string
+	Body         []byte
+	ProjectIDSet bool
+	ProjectID    *string
+	UpdatedAt    time.Time
 }
 
 // StubCP is the in-memory controlplane. Its methods are safe for
@@ -49,6 +52,7 @@ type StubCP struct {
 	bundles    map[string]map[string]controlplane.CurrentKeyBundle
 	deletes    map[string]time.Time
 	sourceRev  int64
+	revisions  []controlplane.RevisionEvent
 	search     controlplane.SearchIndexState
 
 	buckets             *bucketstub.Store
@@ -113,6 +117,9 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
+	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
+	mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.revisionEvents)
+	mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.revisionSnapshot)
 	mux.HandleFunc("GET /api/sync/search-index", s.getSearchIndex)
 	mux.HandleFunc("PUT /api/sync/search-index", s.publishSearchIndex)
 	mux.HandleFunc("GET /api/sync/needs-migration", s.needsMigration)
@@ -204,10 +211,12 @@ func (s *StubCP) CopyBlob(srcScope, srcID, dstScope, dstID string) bool {
 		next = existing.ETag + 1
 	}
 	s.blobs[dstKey] = &StubBlob{
-		ETag:      next,
-		KeyID:     src.KeyID,
-		Body:      append([]byte(nil), src.Body...),
-		UpdatedAt: time.Now().UTC(),
+		ETag:         next,
+		KeyID:        src.KeyID,
+		Body:         append([]byte(nil), src.Body...),
+		ProjectIDSet: src.ProjectIDSet,
+		ProjectID:    src.ProjectID,
+		UpdatedAt:    time.Now().UTC(),
 	}
 	return true
 }
@@ -272,14 +281,36 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 		if blob != nil {
 			next = blob.ETag + 1
 		}
-		s.blobs[key] = &StubBlob{
+		updatedAt := time.Now().UTC()
+		nextBlob := &StubBlob{
 			ETag:      next,
 			KeyID:     r.Header.Get("X-Key-Id"),
 			Body:      body,
-			UpdatedAt: time.Now().UTC(),
+			UpdatedAt: updatedAt,
 		}
+		if blob != nil {
+			nextBlob.ProjectIDSet = blob.ProjectIDSet
+			nextBlob.ProjectID = blob.ProjectID
+		}
+		if scope == "chat" && r.Header.Get(controlplane.HeaderProjectIDSet) == "1" {
+			nextBlob.ProjectIDSet = true
+			nextBlob.ProjectID = nil
+			if projectID := r.Header.Get(controlplane.HeaderProjectID); projectID != "" {
+				nextBlob.ProjectID = &projectID
+			}
+		}
+		s.blobs[key] = nextBlob
 		if scope == "chat" {
 			s.sourceRev++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRev),
+				Kind:      "upsert",
+				ID:        id,
+				ETag:      formatETag(next),
+				KeyID:     r.Header.Get("X-Key-Id"),
+				ProjectID: nextBlob.ProjectID,
+				UpdatedAt: updatedAt.Format(time.RFC3339Nano),
+			})
 		}
 		delete(s.deletes, key)
 		w.Header().Set("ETag", formatETag(next))
@@ -303,6 +334,12 @@ func (s *StubCP) getBlob(scope string) http.HandlerFunc {
 		}
 		w.Header().Set("ETag", formatETag(blob.ETag))
 		w.Header().Set("X-Key-Id", blob.KeyID)
+		if scope == "chat" && blob.ProjectIDSet {
+			w.Header().Set(controlplane.HeaderProjectIDSet, "1")
+			if blob.ProjectID != nil {
+				w.Header().Set(controlplane.HeaderProjectID, *blob.ProjectID)
+			}
+		}
 		_, _ = w.Write(blob.Body)
 	}
 }
@@ -337,6 +374,12 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 		delete(s.blobs, key)
 		if scope == "chat" && blob != nil {
 			s.sourceRev++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRev),
+				Kind:      "delete",
+				ID:        id,
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
 		}
 		s.deletes[key] = time.Now().UTC()
 		wipedV2 := []string{}
@@ -387,6 +430,115 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates, Deletes: deletes})
+}
+
+func (s *StubCP) revisionSummary(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.RevisionSummaryResponse{
+		CurrentRevision:          formatETag(s.sourceRev),
+		OldestReplayableRevision: "0",
+	})
+}
+
+func (s *StubCP) revisionEvents(w http.ResponseWriter, r *http.Request) {
+	after, err := strconv.ParseInt(r.URL.Query().Get("after_revision"), 10, 64)
+	if err != nil || after < 0 {
+		http.Error(w, "invalid after_revision", http.StatusBadRequest)
+		return
+	}
+	through, err := strconv.ParseInt(r.URL.Query().Get("through_revision"), 10, 64)
+	if err != nil || through < after {
+		http.Error(w, "invalid through_revision", http.StatusBadRequest)
+		return
+	}
+	offset, limit, ok := revisionPage(r)
+	if !ok {
+		http.Error(w, "invalid pagination", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	filtered := make([]controlplane.RevisionEvent, 0)
+	for _, event := range s.revisions {
+		revision, _ := strconv.ParseInt(event.Revision, 10, 64)
+		if revision > after && revision <= through {
+			filtered = append(filtered, event)
+		}
+	}
+	end := min(offset+limit, len(filtered))
+	if offset > len(filtered) {
+		offset = len(filtered)
+		end = offset
+	}
+	response := controlplane.RevisionEventsResponse{Events: filtered[offset:end]}
+	if end < len(filtered) {
+		response.NextCursor = strconv.Itoa(end)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
+	offset, limit, ok := revisionPage(r)
+	if !ok {
+		http.Error(w, "invalid pagination", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]controlplane.RevisionSnapshotItem, 0)
+	for key, blob := range s.blobs {
+		parts := strings.SplitN(key, "/", 2)
+		if parts[0] != "chat" {
+			continue
+		}
+		items = append(items, controlplane.RevisionSnapshotItem{
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	end := min(offset+limit, len(items))
+	if offset > len(items) {
+		offset = len(items)
+		end = offset
+	}
+	response := controlplane.RevisionSnapshotResponse{
+		Items:            items[offset:end],
+		SnapshotRevision: formatETag(s.sourceRev),
+	}
+	if end < len(items) {
+		response.NextCursor = strconv.Itoa(end)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func revisionPage(r *http.Request) (int, int, bool) {
+	offset := 0
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		parsed, err := strconv.Atoi(cursor)
+		if err != nil || parsed < 0 {
+			return 0, 0, false
+		}
+		offset = parsed
+	}
+	limit := 100
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			return 0, 0, false
+		}
+		limit = parsed
+	}
+	return offset, limit, true
 }
 
 func (s *StubCP) currentSearchIndex() controlplane.SearchIndexState {

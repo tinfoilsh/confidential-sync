@@ -16,9 +16,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/localstack"
 )
@@ -68,6 +70,7 @@ func main() {
 	fmt.Println("  curl -sS $BASE/v1/health")
 	fmt.Println("  curl -sS -X POST $BASE/v1/key/register \\")
 	fmt.Println("    -H \"Authorization: Bearer $TOK\" \\")
+	fmt.Printf("    -H '%s: %s' \\\n", controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
 	fmt.Println("    -H 'Content-Type: application/json' \\")
 	fmt.Println("    -d '{\"key\":\"'$CEK'\",\"if_match\":\"*\",\"created_via\":\"start_fresh\",\"idempotency_key\":\"local-1\"}'")
 	fmt.Println()

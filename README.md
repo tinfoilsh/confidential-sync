@@ -6,7 +6,7 @@ The enclave is stateless: it receives the keys it needs on each request, perform
 
 The enclave exposes an HTTP surface for sync, key management, blob migration, attachment transfer, and chat sharing:
 
-- `POST /v1/sync/*` - push, pull, list, and delete encrypted blobs
+- `POST /v1/sync/*` - push, pull, list/replay metadata, and delete encrypted blobs
 - `POST /v1/key/*` - register and rotate per-account encryption keys
 - `POST /v1/blobs/migrate*` - rewrap legacy blobs into the current envelope format
 - `POST /v1/attachment/*` - store and fetch encrypted attachments via the buckets sidecar
@@ -79,13 +79,16 @@ See [`LOCAL_TESTING.md`](./LOCAL_TESTING.md) for the full runbook, including the
 
 ## Endpoints
 
-All `/v1/sync/*`, `/v1/key/*`, `/v1/blobs/*`, `/v1/attachment/put`, `/v1/attachment/delete`, and `/v1/share/seal` routes require a Clerk-issued Bearer JWT in the `Authorization` header. Request and response bodies are JSON.
+All authenticated `/v1` routes require a Clerk-issued Bearer JWT in the `Authorization` header and `X-Sync-Protocol: 2`. Missing or unsupported sync protocol headers receive HTTP 426 with code `SYNC_PROTOCOL_UPGRADE_REQUIRED`; there is no legacy fallback. Request and response bodies are JSON.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | `POST` | `/v1/sync/push` | yes | Seal a blob and store it via the controlplane, guarded by compare-and-set. |
 | `POST` | `/v1/sync/pull` | yes | Fetch and unseal a stored blob. |
-| `POST` | `/v1/sync/list-status` | yes | List sync metadata (versions, migration status) for a scope. |
+| `POST` | `/v1/sync/list-status` | yes | List scoped sync metadata for profile, project, document, and chat pagination. |
+| `POST` | `/v1/sync/revision-summary` | yes | Report the current and oldest replayable metadata revisions. |
+| `POST` | `/v1/sync/revision-events` | yes | Replay paginated metadata changes across a bounded revision window. |
+| `POST` | `/v1/sync/revision-snapshot` | yes | Read a paginated metadata snapshot at a stable revision. |
 | `POST` | `/v1/sync/delete` | yes | Delete a stored blob, guarded by compare-and-set. |
 | `POST` | `/v1/key/register` | yes | Register the per-account content encryption key. |
 | `POST` | `/v1/key/add-bundle` | yes | Add a passkey-wrapped key bundle to the account. |
@@ -124,6 +127,7 @@ The enclave runs inside a Tinfoil confidential VM, so its memory and execution a
 - **In-enclave encryption only.** Plaintext and key bytes exist solely inside the confidential VM for the lifetime of a request and are never persisted.
 - **Authenticated encryption with bound context.** Blobs are sealed with AES-GCM whose additional authenticated data binds the scope, the verified Clerk user, and the blob id, so ciphertext cannot be replayed across scopes, users, or rows.
 - **Mandatory JWT verification.** Every `/v1/sync` and key-management route verifies a Clerk-issued JWT with a pinned algorithm and a typed key, defeating algorithm-confusion forgeries and expired tokens.
+- **Mandatory protocol cutover.** Every authenticated `/v1` route requires `X-Sync-Protocol: 2`; older clients receive a structured HTTP 426 response and cannot reach legacy sync behavior.
 - **Compare-and-set writes.** Push and delete are guarded by `if_match` to prevent lost updates and concurrent overwrites.
 - **Shim path allowlist.** The CVM shim hard-blocks any path not declared in `tinfoil-config.yml`, keeping the external attack surface to the audited route list.
 

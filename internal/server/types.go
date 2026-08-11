@@ -1,5 +1,7 @@
 package server
 
+import "github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+
 // Wire shapes for /v1/* endpoints. Each request type is decoded from the
 // JSON body; each response type is encoded into the JSON body. Error
 // responses are emitted by writeError and follow the AppError shape.
@@ -97,6 +99,24 @@ type ListStatusDelete struct {
 	DeletedAt string `json:"deleted_at"`
 	Cursor    string `json:"cursor,omitempty"`
 }
+
+type RevisionSummaryRequest struct{}
+
+type RevisionEventsRequest struct {
+	AfterRevision   string `json:"after_revision"`
+	ThroughRevision string `json:"through_revision"`
+	Cursor          string `json:"cursor,omitempty"`
+	Limit           *int   `json:"limit,omitempty"`
+}
+
+type RevisionSnapshotRequest struct {
+	Cursor string `json:"cursor,omitempty"`
+	Limit  *int   `json:"limit,omitempty"`
+}
+
+type RevisionSummaryResponse = controlplane.RevisionSummaryResponse
+type RevisionEventsResponse = controlplane.RevisionEventsResponse
+type RevisionSnapshotResponse = controlplane.RevisionSnapshotResponse
 
 type DeleteRequest struct {
 	Scope          string  `json:"scope"`

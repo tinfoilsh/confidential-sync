@@ -70,6 +70,7 @@ const (
 	HeaderIfMatch             = "If-Match"
 	HeaderIdempotency         = "X-Idempotency-Key"
 	HeaderOperationHash       = "X-Operation-Hash"
+	HeaderSyncProtocol        = "X-Sync-Protocol"
 	HeaderProfileSyncProtocol = "X-Profile-Sync-Protocol"
 	HeaderMessageCount        = "X-Message-Count"
 	HeaderProjectID           = "X-Project-Id"
@@ -90,6 +91,7 @@ const (
 const (
 	IfMatchCreateOnly     = "0"
 	IfMatchAnyKey         = "*"
+	SyncProtocolV2        = 2
 	ProfileSyncProtocolV2 = 2
 )
 
@@ -162,6 +164,46 @@ type ListStatusResponse struct {
 	Updates    []BlobMeta   `json:"updates"`
 	Deletes    []BlobDelete `json:"deletes"`
 	NextCursor string       `json:"next_cursor,omitempty"`
+}
+
+const (
+	RevisionSummaryPath  = "/api/sync/revision-summary"
+	RevisionEventsPath   = "/api/sync/revision-events"
+	RevisionSnapshotPath = "/api/sync/revision-snapshot"
+)
+
+type RevisionSummaryResponse struct {
+	CurrentRevision          string `json:"current_revision"`
+	OldestReplayableRevision string `json:"oldest_replayable_revision"`
+}
+
+type RevisionEvent struct {
+	Revision  string  `json:"revision"`
+	Kind      string  `json:"kind"`
+	ID        string  `json:"id"`
+	ETag      string  `json:"etag,omitempty"`
+	KeyID     string  `json:"key_id,omitempty"`
+	ProjectID *string `json:"project_id"`
+	UpdatedAt string  `json:"updated_at"`
+}
+
+type RevisionEventsResponse struct {
+	Events     []RevisionEvent `json:"events"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+type RevisionSnapshotItem struct {
+	ID        string  `json:"id"`
+	ETag      string  `json:"etag"`
+	KeyID     string  `json:"key_id"`
+	ProjectID *string `json:"project_id"`
+	UpdatedAt string  `json:"updated_at"`
+}
+
+type RevisionSnapshotResponse struct {
+	Items            []RevisionSnapshotItem `json:"items"`
+	SnapshotRevision string                 `json:"snapshot_revision"`
+	NextCursor       string                 `json:"next_cursor,omitempty"`
 }
 
 type PutBlobRequest struct {
@@ -655,6 +697,74 @@ func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int
 		return nil, fmt.Errorf("controlplane: decode list-status: %w", err)
 	}
 	return &out, nil
+}
+
+func (c *Client) RevisionSummary(ctx context.Context, jwt, clerkUserID string) (*RevisionSummaryResponse, error) {
+	var out RevisionSummaryResponse
+	if err := c.getSyncJSON(ctx, RevisionSummaryPath, nil, jwt, clerkUserID, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) RevisionEvents(ctx context.Context, afterRevision, throughRevision, cursor string, limit *int, jwt, clerkUserID string) (*RevisionEventsResponse, error) {
+	query := url.Values{}
+	query.Set("after_revision", afterRevision)
+	query.Set("through_revision", throughRevision)
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	if limit != nil {
+		query.Set("limit", strconv.Itoa(*limit))
+	}
+	var out RevisionEventsResponse
+	if err := c.getSyncJSON(ctx, RevisionEventsPath, query, jwt, clerkUserID, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) RevisionSnapshot(ctx context.Context, cursor string, limit *int, jwt, clerkUserID string) (*RevisionSnapshotResponse, error) {
+	query := url.Values{}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	if limit != nil {
+		query.Set("limit", strconv.Itoa(*limit))
+	}
+	var out RevisionSnapshotResponse
+	if err := c.getSyncJSON(ctx, RevisionSnapshotPath, query, jwt, clerkUserID, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) getSyncJSON(ctx context.Context, path string, query url.Values, jwt, clerkUserID string, out any) error {
+	endpoint := c.baseURL + path
+	if len(query) > 0 {
+		endpoint += "?" + query.Encode()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return parseError(resp.StatusCode, body)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("controlplane: decode %s: %w", path, err)
+	}
+	return nil
 }
 
 const SearchIndexStatePath = "/api/sync/search-index"

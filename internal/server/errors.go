@@ -32,6 +32,8 @@ const (
 	CodeInternal                   = "INTERNAL"
 )
 
+const CodeSyncProtocolUpgradeRequired = "SYNC_PROTOCOL_UPGRADE_REQUIRED"
+
 // AppError is the wire representation of a non-2xx response. Extra context
 // fields (current_etag, current_key_id, reason) are folded in when relevant.
 type AppError struct {

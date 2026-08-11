@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
@@ -81,6 +82,9 @@ func (h *Handler) routeSpecs() []routeSpec {
 		}},
 		{"POST", "/v1/sync/pull", func(h *Handler) http.Handler { return h.authMiddleware(h.pull) }},
 		{"POST", "/v1/sync/list-status", func(h *Handler) http.Handler { return h.authMiddleware(h.listStatus) }},
+		{"POST", "/v1/sync/revision-summary", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionSummary) }},
+		{"POST", "/v1/sync/revision-events", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionEvents) }},
+		{"POST", "/v1/sync/revision-snapshot", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionSnapshot) }},
 		{"POST", "/v1/sync/delete", func(h *Handler) http.Handler { return h.authMiddleware(h.delete) }},
 
 		{"POST", "/v1/key/register", func(h *Handler) http.Handler { return h.authMiddleware(h.registerKey) }},
@@ -202,6 +206,15 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 		claims, err := h.verifier.Verify(ctx, tok)
 		if err != nil {
 			writeError(w, unauthorized("invalid token"))
+			return
+		}
+		protocolHeaders := r.Header.Values(controlplane.HeaderSyncProtocol)
+		if len(protocolHeaders) != 1 || protocolHeaders[0] != strconv.Itoa(controlplane.SyncProtocolV2) {
+			writeError(w, &AppError{
+				Status:  http.StatusUpgradeRequired,
+				Code:    CodeSyncProtocolUpgradeRequired,
+				Message: "sync protocol 2 is required",
+			})
 			return
 		}
 		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
@@ -335,6 +348,48 @@ func (h *Handler) listStatus(w http.ResponseWriter, r *http.Request, sess Sessio
 		return
 	}
 	resp, err := ListStatus(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) revisionSummary(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req RevisionSummaryRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := h.deps.Controlplane.RevisionSummary(r.Context(), sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) revisionEvents(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req RevisionEventsRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := h.deps.Controlplane.RevisionEvents(r.Context(), req.AfterRevision, req.ThroughRevision, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) revisionSnapshot(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req RevisionSnapshotRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := h.deps.Controlplane.RevisionSnapshot(r.Context(), req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		writeError(w, err)
 		return
