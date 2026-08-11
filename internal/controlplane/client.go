@@ -61,9 +61,9 @@ func NewClient(baseURL string, httpClient *http.Client, opts ...Option) *Client 
 //
 // HeaderContentType / HeaderServiceSecret / HeaderAuth are enclave-only
 // (not part of the public /api/sync/* contract) and live here for
-// convenience; the same applies to StatusLegacyBlobNotMigrated, which
-// the enclave returns to its own clients but the controlplane does not
-// emit.
+// convenience; the same applies to StatusAuth and
+// StatusLegacyBlobNotMigrated, which the enclave returns to its own
+// clients but the controlplane does not emit as canonical wire codes.
 const (
 	HeaderAuth                = "Authorization"
 	HeaderKeyID               = "X-Key-Id"
@@ -102,6 +102,7 @@ const (
 	StatusSearchIndexConflict        = "SEARCH_INDEX_CONFLICT"
 	StatusProfileSyncUpgradeRequired = "PROFILE_SYNC_UPGRADE_REQUIRED"
 	StatusLegacyBlobNotMigrated      = "LEGACY_BLOB_NOT_MIGRATED"
+	StatusAuth                       = "AUTH"
 )
 
 // maxLegacyAttachmentBytes caps the body read for legacy attachment
@@ -1059,6 +1060,9 @@ func (c *Client) RemoveBundle(ctx context.Context, req RemoveBundleRequest) erro
 }
 
 func parseError(status int, body []byte) error {
+	if status == http.StatusUnauthorized {
+		return &Error{StatusCode: status, Code: StatusAuth}
+	}
 	if len(body) == 0 {
 		return &Error{StatusCode: status}
 	}

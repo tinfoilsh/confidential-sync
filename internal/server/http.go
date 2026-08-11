@@ -194,18 +194,26 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok, err := auth.BearerToken(r.Header.Get("Authorization"))
 		if err != nil {
-			writeError(w, unauthorized("missing bearer token"))
+			h.logAuthenticationFailure(r, auth.FailureClassOf(err))
+			writeError(w, unauthorized())
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		claims, err := h.verifier.Verify(ctx, tok)
 		if err != nil {
-			writeError(w, unauthorized("invalid token"))
+			h.logAuthenticationFailure(r, auth.FailureClassOf(err))
+			writeError(w, unauthorized())
 			return
 		}
 		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
 	})
+}
+
+func (h *Handler) logAuthenticationFailure(r *http.Request, class auth.FailureClass) {
+	if h.logger != nil {
+		h.logger.Infof("authentication failed: class=%s method=%s path=%s", class, r.Method, r.URL.Path)
+	}
 }
 
 type requestIDContextKey struct{}

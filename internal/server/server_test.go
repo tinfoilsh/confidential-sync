@@ -50,6 +50,31 @@ type fixture struct {
 	userSub    string
 }
 
+type recordingLogger struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *recordingLogger) Errorf(format string, args ...any) {
+	l.record(format, args...)
+}
+
+func (l *recordingLogger) Infof(format string, args ...any) {
+	l.record(format, args...)
+}
+
+func (l *recordingLogger) record(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, fmt.Sprintf(format, args...))
+}
+
+func (l *recordingLogger) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.entries, "\n")
+}
+
 type cpStub struct {
 	t          *testing.T
 	mu         sync.Mutex
@@ -977,19 +1002,103 @@ func TestPullUnknownKey(t *testing.T) {
 	}
 }
 
-func TestAuthMissingBearer(t *testing.T) {
+func TestAuthenticationFailuresUseUniformContract(t *testing.T) {
 	f := newFixture(t)
-	resp, _ := f.post("/v1/sync/push", PushRequest{Scope: "chat"}, "")
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status: %d", resp.StatusCode)
+	expiredClaims := jwt.MapClaims{
+		"sub": "private-user-claim",
+		"iss": f.issuer,
+		"iat": time.Now().Add(-10 * time.Minute).Unix(),
+		"exp": time.Now().Add(-5 * time.Minute).Unix(),
+	}
+	expiredToken := jwt.NewWithClaims(jwt.SigningMethodRS256, expiredClaims)
+	expiredToken.Header["kid"] = f.signKID
+	expired, err := expiredToken.SignedString(f.signKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := &recordingLogger{}
+	f.handler.logger = logger
+	tests := []struct {
+		name  string
+		token string
+		class auth.FailureClass
+	}{
+		{name: "missing", class: auth.FailureMissing},
+		{name: "invalid", token: "private.jwt.material", class: auth.FailureMalformed},
+		{name: "expired", token: expired, class: auth.FailureExpired},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := f.post("/v1/sync/push", PushRequest{Scope: "chat"}, tc.token)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status: %d", resp.StatusCode)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != 3 || payload["ok"] != false || payload["code"] != CodeAuth || payload["message"] != "authentication failed" {
+				t.Fatalf("authentication response = %s", body)
+			}
+			if !strings.Contains(logger.String(), "class="+string(tc.class)) {
+				t.Fatalf("missing authentication diagnostic for %q: %s", tc.class, logger.String())
+			}
+		})
+	}
+	logs := logger.String()
+	for _, sensitive := range []string{"private.jwt.material", expired, "private-user-claim"} {
+		if strings.Contains(logs, sensitive) {
+			t.Fatalf("authentication diagnostics exposed sensitive value: %q", sensitive)
+		}
 	}
 }
 
-func TestAuthInvalidToken(t *testing.T) {
+func TestAuthenticationFailureDoesNotConsumeMutationIdempotencyKey(t *testing.T) {
 	f := newFixture(t)
-	resp, _ := f.post("/v1/sync/push", PushRequest{Scope: "chat"}, "garbage")
+	requests := 0
+	f.cp.mu.Lock()
+	f.cp.captureHeaders = func(r *http.Request) { requests++ }
+	f.cp.mu.Unlock()
+	push := PushRequest{
+		Scope:          "chat",
+		ID:             "auth-retry",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"messages":[]}`)),
+		IdempotencyKey: "auth-retry-key",
+	}
+	resp, body := f.post("/v1/sync/push", push, "invalid")
 	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status: %d", resp.StatusCode)
+		t.Fatalf("unauthenticated push: status=%d body=%s", resp.StatusCode, body)
+	}
+	if requests != 0 {
+		t.Fatalf("unauthenticated push reached controlplane %d time(s)", requests)
+	}
+	resp, body = f.post("/v1/sync/push", push, f.jwt())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated retry: status=%d body=%s", resp.StatusCode, body)
+	}
+	if requests != 1 {
+		t.Fatalf("authenticated retry reached controlplane %d time(s), want 1", requests)
+	}
+}
+
+func TestUpstreamUnauthorizedUsesUniformAuthContract(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeError(recorder, &controlplane.Error{
+		StatusCode: http.StatusUnauthorized,
+		Code:       "TOKEN_EXPIRED",
+		Message:    "sensitive verifier prose",
+	})
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) != 3 || payload["ok"] != false || payload["code"] != CodeAuth || payload["message"] != "authentication failed" {
+		t.Fatalf("upstream authentication response = %s", recorder.Body.Bytes())
 	}
 }
 

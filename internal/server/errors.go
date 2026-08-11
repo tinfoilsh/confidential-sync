@@ -22,7 +22,7 @@ const (
 	CodeUnknownKey                 = "UNKNOWN_KEY"
 	CodeLegacyBlobNotMigrated      = controlplane.StatusLegacyBlobNotMigrated
 	CodeAttestationFailed          = "ATTESTATION_FAILED"
-	CodeAuth                       = "AUTH"
+	CodeAuth                       = controlplane.StatusAuth
 	CodeForbidden                  = "FORBIDDEN"
 	CodeBadRequest                 = "BAD_REQUEST"
 	CodeNotFound                   = "NOT_FOUND"
@@ -100,6 +100,9 @@ func translate(err error) *AppError {
 	}
 	var cpe *controlplane.Error
 	if errors.As(err, &cpe) {
+		if cpe.StatusCode == http.StatusUnauthorized {
+			return unauthorized()
+		}
 		return &AppError{
 			Status:       cpe.StatusCode,
 			Code:         normalizeCode(cpe.Code, cpe.StatusCode),
@@ -136,6 +139,6 @@ func badRequest(message string) *AppError {
 	return &AppError{Status: http.StatusBadRequest, Code: CodeBadRequest, Message: message}
 }
 
-func unauthorized(message string) *AppError {
-	return &AppError{Status: http.StatusUnauthorized, Code: CodeAuth, Message: message}
+func unauthorized() *AppError {
+	return &AppError{Status: http.StatusUnauthorized, Code: CodeAuth, Message: "authentication failed"}
 }
