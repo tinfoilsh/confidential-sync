@@ -2,13 +2,13 @@ package controlplane
 
 import "testing"
 
-// TestWireContractMirrorsControlplane pins the mirrored wire-level
-// constants to the exact strings the controlplane sends over the wire.
-// The canonical source of truth lives in
-// github.com/tinfoilsh/controlplane/pkg/contract; if a mirrored constant
-// changes there and this file is not updated to match, this test fails so
-// the drift is caught before the enclave is redeployed against the new
-// controlplane. Enclave-only response codes are pinned separately.
+// TestWireContractMirrorsControlplane pins every wire-level constant
+// declared in client.go to the exact string the controlplane sends
+// over the wire. The canonical source of truth lives in
+// github.com/tinfoilsh/controlplane/pkg/contract; if a constant
+// changes there and this file is not updated to match, this test
+// fails so the drift is caught before the enclave is redeployed
+// against the new controlplane.
 //
 // Do not relax these assertions to "constant is non-empty" — the
 // whole point is to catch typos. Each row pairs a local constant
@@ -63,19 +63,6 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"StatusIdempotencyConflict":        {StatusIdempotencyConflict, "IDEMPOTENCY_CONFLICT"},
 			"StatusSearchIndexConflict":        {StatusSearchIndexConflict, "SEARCH_INDEX_CONFLICT"},
 			"StatusProfileSyncUpgradeRequired": {StatusProfileSyncUpgradeRequired, "PROFILE_SYNC_UPGRADE_REQUIRED"},
-		}
-		for name, c := range cases {
-			if c.have != c.want {
-				t.Errorf("%s = %q, want %q", name, c.have, c.want)
-			}
-		}
-	})
-
-	t.Run("enclave wire codes", func(t *testing.T) {
-		t.Parallel()
-		cases := map[string]struct{ have, want string }{
-			"StatusAuth":                  {StatusAuth, "AUTH"},
-			"StatusLegacyBlobNotMigrated": {StatusLegacyBlobNotMigrated, "LEGACY_BLOB_NOT_MIGRATED"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {

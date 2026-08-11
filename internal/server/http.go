@@ -12,7 +12,6 @@ import (
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
-	"golang.org/x/time/rate"
 )
 
 // MaxRequestBytes caps decoded JSON bodies. Plaintext blobs upload via the
@@ -32,8 +31,6 @@ const (
 	SyncPushRequestOverhead = 20 * time.Second
 	SyncPushRequestTimeout  = time.Duration(controlplane.PutBlobMaxAttempts)*controlplane.PutBlobAttemptTimeout + SyncPushRequestOverhead
 	MaxPushRequestIDLength  = 128
-	AuthFailureLogInterval  = time.Second
-	AuthFailureLogBurst     = 5
 )
 
 type Handler struct {
@@ -43,7 +40,6 @@ type Handler struct {
 	coordinator        *MigrationCoordinator
 	importCoordinator  *ImportCoordinator
 	reindexCoordinator *SearchReindexCoordinator
-	authFailureLogGate *rate.Limiter
 }
 
 type Logger interface {
@@ -65,7 +61,6 @@ func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 		coordinator:        NewMigrationCoordinator(),
 		importCoordinator:  NewImportCoordinator(),
 		reindexCoordinator: NewSearchReindexCoordinator(),
-		authFailureLogGate: rate.NewLimiter(rate.Every(AuthFailureLogInterval), AuthFailureLogBurst),
 	}
 }
 
@@ -199,26 +194,18 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok, err := auth.BearerToken(r.Header.Get("Authorization"))
 		if err != nil {
-			h.logAuthenticationFailure(r, auth.FailureClassOf(err))
-			writeError(w, unauthorized())
+			writeError(w, unauthorized("missing bearer token"))
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		claims, err := h.verifier.Verify(ctx, tok)
 		if err != nil {
-			h.logAuthenticationFailure(r, auth.FailureClassOf(err))
-			writeError(w, unauthorized())
+			writeError(w, unauthorized("invalid token"))
 			return
 		}
 		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
 	})
-}
-
-func (h *Handler) logAuthenticationFailure(r *http.Request, class auth.FailureClass) {
-	if h.logger != nil && h.authFailureLogGate != nil && h.authFailureLogGate.Allow() {
-		h.logger.Infof("authentication failed: class=%s method=%s path=%s", class, r.Method, r.URL.Path)
-	}
 }
 
 type requestIDContextKey struct{}

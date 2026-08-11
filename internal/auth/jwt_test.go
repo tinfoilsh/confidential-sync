@@ -136,24 +136,6 @@ func TestVerifierRejectsExpiredToken(t *testing.T) {
 	tok := ti.sign(t, c)
 	if _, err := v.Verify(context.Background(), tok); !errors.Is(err, ErrTokenInvalid) {
 		t.Fatalf("expected ErrTokenInvalid, got %v", err)
-	} else if class := FailureClassOf(err); class != FailureExpired {
-		t.Fatalf("failure class = %q, want %q", class, FailureExpired)
-	}
-}
-
-func TestVerifierFailureDoesNotExposeVerifierDetails(t *testing.T) {
-	ti := newTestIssuer(t)
-	v := ti.verifier(t)
-	rawToken := "private.jwt.material"
-	_, err := v.Verify(context.Background(), rawToken)
-	if err == nil {
-		t.Fatal("expected verification error")
-	}
-	if class := FailureClassOf(err); class != FailureMalformed {
-		t.Fatalf("failure class = %q, want %q", class, FailureMalformed)
-	}
-	if got, want := err.Error(), "auth: malformed"; got != want {
-		t.Fatalf("verification error = %q, want sanitized %q", got, want)
 	}
 }
 
@@ -164,8 +146,6 @@ func TestVerifierRejectsWrongIssuer(t *testing.T) {
 	tok := ti.sign(t, c)
 	if _, err := v.Verify(context.Background(), tok); !errors.Is(err, ErrTokenInvalid) {
 		t.Fatalf("expected verification failure, got %v", err)
-	} else if class := FailureClassOf(err); class != FailureIssuerMismatch {
-		t.Fatalf("failure class = %q, want %q", class, FailureIssuerMismatch)
 	}
 }
 
@@ -180,8 +160,6 @@ func TestVerifierRejectsTamperedSignature(t *testing.T) {
 	tampered := parts[0] + "." + parts[1] + ".AAAAAAAA"
 	if _, err := v.Verify(context.Background(), tampered); err == nil {
 		t.Fatalf("expected error")
-	} else if class := FailureClassOf(err); class != FailureSignatureInvalid {
-		t.Fatalf("failure class = %q, want %q", class, FailureSignatureInvalid)
 	}
 }
 
@@ -224,8 +202,6 @@ func TestVerifierEnforcesAudienceWhenConfigured(t *testing.T) {
 	c["aud"] = "wrong"
 	if _, err := v.Verify(ctx, ti.sign(t, c)); !errors.Is(err, ErrAudienceMismatch) {
 		t.Fatalf("expected ErrAudienceMismatch, got %v", err)
-	} else if class := FailureClassOf(err); class != FailureAudienceMismatch {
-		t.Fatalf("failure class = %q, want %q", class, FailureAudienceMismatch)
 	}
 }
 
@@ -236,8 +212,6 @@ func TestVerifierRequiresSubject(t *testing.T) {
 	delete(c, "sub")
 	if _, err := v.Verify(context.Background(), ti.sign(t, c)); !errors.Is(err, ErrSubjectMissing) {
 		t.Fatalf("expected ErrSubjectMissing, got %v", err)
-	} else if class := FailureClassOf(err); class != FailureSubjectMissing {
-		t.Fatalf("failure class = %q, want %q", class, FailureSubjectMissing)
 	}
 }
 
@@ -258,13 +232,13 @@ func TestVerifierRejectsHS256(t *testing.T) {
 
 func TestBearerTokenParsing(t *testing.T) {
 	cases := map[string]bool{
-		"Bearer abc":     true,
-		"Bearer  abc":    true,
-		"Bearer ":        false,
-		"":               false,
-		"Token abc":      false,
-		"bearer abc":     false,
-		"Bearer abc def": true,
+		"Bearer abc":      true,
+		"Bearer  abc":     true,
+		"Bearer ":         false,
+		"":                false,
+		"Token abc":       false,
+		"bearer abc":      false,
+		"Bearer abc def":  true,
 	}
 	for h, want := range cases {
 		tok, err := BearerToken(h)
@@ -272,12 +246,5 @@ func TestBearerTokenParsing(t *testing.T) {
 		if gotOK != want {
 			t.Fatalf("BearerToken(%q): ok=%v, want %v (err=%v, tok=%q)", h, gotOK, want, err, tok)
 		}
-	}
-}
-
-func TestFailureClassOfMissingBearer(t *testing.T) {
-	_, err := BearerToken("")
-	if class := FailureClassOf(err); class != FailureMissing {
-		t.Fatalf("failure class = %q, want %q", class, FailureMissing)
 	}
 }

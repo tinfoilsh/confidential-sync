@@ -36,33 +36,6 @@ type Claims struct {
 	NotBefore time.Time
 }
 
-type FailureClass string
-
-const (
-	FailureMissing          FailureClass = "missing"
-	FailureExpired          FailureClass = "expired"
-	FailureNotYetValid      FailureClass = "not_yet_valid"
-	FailureIssuerMismatch   FailureClass = "issuer_mismatch"
-	FailureAudienceMismatch FailureClass = "audience_mismatch"
-	FailureSubjectMissing   FailureClass = "subject_missing"
-	FailureSignatureInvalid FailureClass = "signature_invalid"
-	FailureMalformed        FailureClass = "malformed"
-	FailureVerification     FailureClass = "verification_failed"
-)
-
-type VerificationError struct {
-	Class FailureClass
-	err   error
-}
-
-func (e *VerificationError) Error() string {
-	return "auth: " + string(e.Class)
-}
-
-func (e *VerificationError) Unwrap() error {
-	return e.err
-}
-
 type Config struct {
 	Issuer string
 	// Audience is enforced if non-empty. Clerk JWTs typically omit the
@@ -176,7 +149,7 @@ func (v *clerkVerifier) Verify(ctx context.Context, rawJWT string) (Claims, erro
 
 	parsed, err := parser.Parse(rawJWT, v.kf.Keyfunc)
 	if err != nil {
-		return Claims{}, classifyVerificationError(err)
+		return Claims{}, fmt.Errorf("%w: %v", ErrTokenInvalid, err)
 	}
 	if !parsed.Valid {
 		return Claims{}, ErrTokenInvalid
@@ -225,42 +198,6 @@ func (v *clerkVerifier) Verify(ctx context.Context, rawJWT string) (Claims, erro
 		out.NotBefore = nbf
 	}
 	return out, nil
-}
-
-func FailureClassOf(err error) FailureClass {
-	var verificationErr *VerificationError
-	if errors.As(err, &verificationErr) {
-		return verificationErr.Class
-	}
-	switch {
-	case errors.Is(err, ErrTokenMissing):
-		return FailureMissing
-	case errors.Is(err, ErrSubjectMissing):
-		return FailureSubjectMissing
-	case errors.Is(err, ErrIssuerMismatch):
-		return FailureIssuerMismatch
-	case errors.Is(err, ErrAudienceMismatch):
-		return FailureAudienceMismatch
-	default:
-		return FailureVerification
-	}
-}
-
-func classifyVerificationError(err error) error {
-	class := FailureVerification
-	switch {
-	case errors.Is(err, jwt.ErrTokenExpired):
-		class = FailureExpired
-	case errors.Is(err, jwt.ErrTokenNotValidYet):
-		class = FailureNotYetValid
-	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
-		class = FailureIssuerMismatch
-	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
-		class = FailureSignatureInvalid
-	case errors.Is(err, jwt.ErrTokenMalformed):
-		class = FailureMalformed
-	}
-	return &VerificationError{Class: class, err: ErrTokenInvalid}
 }
 
 func extractAudiences(v any) []string {
