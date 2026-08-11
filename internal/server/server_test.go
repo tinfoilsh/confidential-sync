@@ -993,6 +993,47 @@ func TestAuthInvalidToken(t *testing.T) {
 	}
 }
 
+func TestUnauthenticatedPushDoesNotConsumeIdempotencyKey(t *testing.T) {
+	f := newFixture(t)
+	controlplaneRequests := 0
+	f.cp.captureHeaders = func(r *http.Request) {
+		f.cp.mu.Lock()
+		defer f.cp.mu.Unlock()
+		controlplaneRequests++
+	}
+	push := PushRequest{
+		Scope:          "chat",
+		ID:             "auth-retry",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"messages":[]}`)),
+		IdempotencyKey: "auth-retry-key",
+	}
+
+	resp, body := f.post("/v1/sync/push", push, "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated push: status=%d body=%s", resp.StatusCode, body)
+	}
+	f.cp.mu.Lock()
+	requestsAfterFailure := controlplaneRequests
+	_, persistedAfterFailure := f.cp.blobs["chat/auth-retry"]
+	f.cp.mu.Unlock()
+	if requestsAfterFailure != 0 || persistedAfterFailure {
+		t.Fatalf("unauthenticated push reached persistence: requests=%d persisted=%t", requestsAfterFailure, persistedAfterFailure)
+	}
+
+	resp, body = f.post("/v1/sync/push", push, f.jwt())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated retry: status=%d body=%s", resp.StatusCode, body)
+	}
+	f.cp.mu.Lock()
+	requestsAfterRetry := controlplaneRequests
+	_, persistedAfterRetry := f.cp.blobs["chat/auth-retry"]
+	f.cp.mu.Unlock()
+	if requestsAfterRetry != 1 || !persistedAfterRetry {
+		t.Fatalf("authenticated retry did not persist: requests=%d persisted=%t", requestsAfterRetry, persistedAfterRetry)
+	}
+}
+
 func TestInvalidScope(t *testing.T) {
 	f := newFixture(t)
 	resp, body := f.post("/v1/sync/push", PushRequest{
