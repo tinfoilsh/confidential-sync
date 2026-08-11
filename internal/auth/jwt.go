@@ -255,8 +255,6 @@ func classifyVerificationError(err error) error {
 		class = FailureNotYetValid
 	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
 		class = FailureIssuerMismatch
-	case errors.Is(err, jwt.ErrTokenInvalidAudience):
-		class = FailureAudienceMismatch
 	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
 		class = FailureSignatureInvalid
 	case errors.Is(err, jwt.ErrTokenMalformed):

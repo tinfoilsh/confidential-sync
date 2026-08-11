@@ -1063,6 +1063,9 @@ func parseError(status int, body []byte) error {
 	if status == http.StatusUnauthorized {
 		return &Error{StatusCode: status, Code: StatusAuth}
 	}
+	if status == http.StatusForbidden {
+		return &Error{StatusCode: status}
+	}
 	if len(body) == 0 {
 		return &Error{StatusCode: status}
 	}

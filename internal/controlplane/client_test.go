@@ -693,6 +693,17 @@ func TestParseErrorNormalizesUnauthorizedResponse(t *testing.T) {
 	}
 }
 
+func TestParseErrorSanitizesForbiddenResponse(t *testing.T) {
+	err := parseError(http.StatusForbidden, []byte(`{"code":"SERVICE_AUTH_FAILED","message":"sensitive verifier prose"}`))
+	var cpErr *Error
+	if !errors.As(err, &cpErr) {
+		t.Fatalf("error type = %T, want *Error", err)
+	}
+	if cpErr.StatusCode != http.StatusForbidden || cpErr.Code != "" || cpErr.Message != "" || len(cpErr.Raw) != 0 {
+		t.Fatalf("forbidden error was not sanitized: %+v", cpErr)
+	}
+}
+
 func TestGetCurrentKeyNotFound(t *testing.T) {
 	st := newStub(t)
 	st.handle1("GET", "/api/sync/keys/current", func(w http.ResponseWriter, r *http.Request) {
