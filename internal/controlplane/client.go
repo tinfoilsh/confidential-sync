@@ -103,6 +103,7 @@ const (
 	StatusIdempotencyConflict        = "IDEMPOTENCY_CONFLICT"
 	StatusSearchIndexConflict        = "SEARCH_INDEX_CONFLICT"
 	StatusProfileSyncUpgradeRequired = "PROFILE_SYNC_UPGRADE_REQUIRED"
+	StatusSyncSnapshotRequired       = "SYNC_SNAPSHOT_REQUIRED"
 	StatusLegacyBlobNotMigrated      = "LEGACY_BLOB_NOT_MIGRATED"
 )
 
@@ -110,6 +111,8 @@ const (
 // downloads. var (not const) so package tests can shrink it to keep
 // oversized-body regressions cheap to exercise.
 var maxLegacyAttachmentBytes = 64 << 20
+
+var maxSyncJSONResponseBytes = 32 << 20
 
 const (
 	PutBlobAttemptTimeout = 20 * time.Second
@@ -754,9 +757,12 @@ func (c *Client) getSyncJSON(ctx context.Context, path string, query url.Values,
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxSyncJSONResponseBytes)+1))
 	if err != nil {
 		return err
+	}
+	if len(body) > maxSyncJSONResponseBytes {
+		return fmt.Errorf("controlplane: response for %s exceeds %d bytes", path, maxSyncJSONResponseBytes)
 	}
 	if resp.StatusCode >= 400 {
 		return parseError(resp.StatusCode, body)

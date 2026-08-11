@@ -67,6 +67,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"StatusIdempotencyConflict":        {StatusIdempotencyConflict, "IDEMPOTENCY_CONFLICT"},
 			"StatusSearchIndexConflict":        {StatusSearchIndexConflict, "SEARCH_INDEX_CONFLICT"},
 			"StatusProfileSyncUpgradeRequired": {StatusProfileSyncUpgradeRequired, "PROFILE_SYNC_UPGRADE_REQUIRED"},
+			"StatusSyncSnapshotRequired":       {StatusSyncSnapshotRequired, "SYNC_SNAPSHOT_REQUIRED"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {

@@ -1,0 +1,145 @@
+package localstack
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+)
+
+func TestListStatusIncludesChatProjectID(t *testing.T) {
+	stub := NewStubCP()
+	projectID := "project-1"
+	putStubBlob(t, stub, "chat", "chat-1", map[string]string{
+		controlplane.HeaderProjectIDSet: "1",
+		controlplane.HeaderProjectID:    projectID,
+	})
+
+	recorder := requestStub(t, stub, http.MethodGet, "/api/sync/list-status?scope=chat", "", nil)
+	var response controlplane.ListStatusResponse
+	decodeStubResponse(t, recorder, &response)
+	if len(response.Updates) != 1 || response.Updates[0].ProjectID == nil || *response.Updates[0].ProjectID != projectID {
+		t.Fatalf("updates = %+v", response.Updates)
+	}
+}
+
+func TestStartFreshWipeRequiresSnapshotBeforeResetFloor(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "chat", "chat-1", nil)
+	putStubBlob(t, stub, "project", "project-1", nil)
+
+	body := `{"key_id":"new-key","created_via":"start_fresh"}`
+	recorder := requestStub(t, stub, http.MethodPost, "/api/sync/keys", body, map[string]string{
+		controlplane.HeaderIfMatch: controlplane.IfMatchAnyKey,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("register status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionSummaryPath, "", nil)
+	var summary controlplane.RevisionSummaryResponse
+	decodeStubResponse(t, recorder, &summary)
+	if summary.CurrentRevision != "2" || summary.OldestReplayableRevision != "2" {
+		t.Fatalf("summary = %+v", summary)
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionEventsPath+"?after_revision=1&through_revision=2", "", nil)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("events status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var snapshotRequired map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshotRequired); err != nil {
+		t.Fatalf("decode snapshot-required response: %v", err)
+	}
+	if snapshotRequired["code"] != controlplane.StatusSyncSnapshotRequired || snapshotRequired["current_revision"] != "2" || snapshotRequired["oldest_replayable_revision"] != "2" {
+		t.Fatalf("snapshot-required response = %+v", snapshotRequired)
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionEventsPath+"?after_revision=2&through_revision=2", "", nil)
+	var events controlplane.RevisionEventsResponse
+	decodeStubResponse(t, recorder, &events)
+	if len(events.Events) != 0 {
+		t.Fatalf("events after reset floor = %+v", events.Events)
+	}
+
+	recorder = requestStub(t, stub, http.MethodPut, "/api/sync/blob/chat/chat-2", "ciphertext", map[string]string{
+		controlplane.HeaderKeyID:   "new-key",
+		controlplane.HeaderIfMatch: controlplane.IfMatchCreateOnly,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("post-reset put status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionEventsPath+"?after_revision=2&through_revision=3", "", nil)
+	decodeStubResponse(t, recorder, &events)
+	if len(events.Events) != 1 || events.Events[0].Revision != "3" || events.Events[0].Kind != "upsert" || events.Events[0].ID != "chat-2" {
+		t.Fatalf("post-reset events = %+v", events.Events)
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, "/api/sync/list-status?scope=project", "", nil)
+	var status controlplane.ListStatusResponse
+	decodeStubResponse(t, recorder, &status)
+	if len(status.Deletes) != 1 || status.Deletes[0].ID != "project-1" {
+		t.Fatalf("deletes = %+v", status.Deletes)
+	}
+}
+
+func TestRevisionSnapshotPinsRevisionAndPagesByID(t *testing.T) {
+	stub := NewStubCP()
+	for _, id := range []string{"chat-a", "chat-b", "chat-c"} {
+		putStubBlob(t, stub, "chat", id, nil)
+	}
+
+	recorder := requestStub(t, stub, http.MethodGet, controlplane.RevisionSnapshotPath+"?limit=2", "", nil)
+	var first controlplane.RevisionSnapshotResponse
+	decodeStubResponse(t, recorder, &first)
+	if first.SnapshotRevision != "3" || len(first.Items) != 2 || first.Items[0].ID != "chat-a" || first.Items[1].ID != "chat-b" || first.NextCursor == "" {
+		t.Fatalf("first page = %+v", first)
+	}
+
+	putStubBlob(t, stub, "chat", "chat-aa", nil)
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionSnapshotPath+"?limit=2&cursor="+url.QueryEscape(first.NextCursor), "", nil)
+	var second controlplane.RevisionSnapshotResponse
+	decodeStubResponse(t, recorder, &second)
+	if second.SnapshotRevision != first.SnapshotRevision || len(second.Items) != 1 || second.Items[0].ID != "chat-c" {
+		t.Fatalf("second page = %+v", second)
+	}
+}
+
+func putStubBlob(t *testing.T, stub *StubCP, scope, id string, headers map[string]string) {
+	t.Helper()
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	headers[controlplane.HeaderKeyID] = "key-1"
+	headers[controlplane.HeaderIfMatch] = controlplane.IfMatchCreateOnly
+	recorder := requestStub(t, stub, http.MethodPut, "/api/sync/blob/"+scope+"/"+id, "ciphertext", headers)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("put %s/%s status = %d, body = %s", scope, id, recorder.Code, recorder.Body.String())
+	}
+}
+
+func requestStub(t *testing.T, stub *StubCP, method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := httptest.NewRequest(method, target, strings.NewReader(body))
+	request.Header.Set(controlplane.HeaderServiceSecret, LocalStackSyncEnclaveSecret)
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	recorder := httptest.NewRecorder()
+	stub.ServeHTTP(recorder, request)
+	return recorder
+}
+
+func decodeStubResponse(t *testing.T, recorder *httptest.ResponseRecorder, out any) {
+	t.Helper()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+}

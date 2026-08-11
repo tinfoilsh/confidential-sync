@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -109,7 +110,7 @@ func (f *fixture) post(path string, payload any, jwtOverride ...string) (int, []
 	if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	req.Header.Set(controlplane.HeaderSyncProtocol, "2")
+	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

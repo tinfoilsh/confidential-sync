@@ -678,6 +678,21 @@ func TestRevisionSnapshotEncodesOptionalPagination(t *testing.T) {
 	}
 }
 
+func TestRevisionResponseTooLarge(t *testing.T) {
+	oldLimit := maxSyncJSONResponseBytes
+	maxSyncJSONResponseBytes = 64
+	t.Cleanup(func() { maxSyncJSONResponseBytes = oldLimit })
+
+	st := newStub(t)
+	st.handle1(http.MethodGet, RevisionSummaryPath, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxSyncJSONResponseBytes+1))
+	})
+	_, err := NewClient(st.server.URL, nil).RevisionSummary(context.Background(), "jwt", "user-1")
+	if err == nil || err.Error() != "controlplane: response for /api/sync/revision-summary exceeds 64 bytes" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestProjectDocumentRouting(t *testing.T) {
 	st := newStub(t)
 	st.handle1("GET", "/api/sync/blob/project_document/proj_1/doc_2", func(w http.ResponseWriter, r *http.Request) {

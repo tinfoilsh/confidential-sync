@@ -44,16 +44,17 @@ type StubBlob struct {
 // InjectLegacyV0 / OnFirstGet directly to drive adversarial
 // scenarios.
 type StubCP struct {
-	mu         sync.Mutex
-	mux        *http.ServeMux
-	blobs      map[string]*StubBlob
-	keys       map[string]struct{}
-	currentKID string
-	bundles    map[string]map[string]controlplane.CurrentKeyBundle
-	deletes    map[string]time.Time
-	sourceRev  int64
-	revisions  []controlplane.RevisionEvent
-	search     controlplane.SearchIndexState
+	mu                       sync.Mutex
+	mux                      *http.ServeMux
+	blobs                    map[string]*StubBlob
+	keys                     map[string]struct{}
+	currentKID               string
+	bundles                  map[string]map[string]controlplane.CurrentKeyBundle
+	deletes                  map[string]time.Time
+	sourceRev                int64
+	oldestReplayableRevision int64
+	revisions                []controlplane.RevisionEvent
+	search                   controlplane.SearchIndexState
 
 	buckets             *bucketstub.Store
 	legacyAttachments   map[string][]byte
@@ -415,6 +416,7 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 			ID:        parts[1],
 			ETag:      formatETag(blob.ETag),
 			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
 			UpdatedAt: blob.UpdatedAt,
 		})
 	}
@@ -438,7 +440,7 @@ func (s *StubCP) revisionSummary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(controlplane.RevisionSummaryResponse{
 		CurrentRevision:          formatETag(s.sourceRev),
-		OldestReplayableRevision: "0",
+		OldestReplayableRevision: formatETag(s.oldestReplayableRevision),
 	})
 }
 
@@ -453,14 +455,24 @@ func (s *StubCP) revisionEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid through_revision", http.StatusBadRequest)
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if after < s.oldestReplayableRevision {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code":                       controlplane.StatusSyncSnapshotRequired,
+			"message":                    "chat sync snapshot required",
+			"current_revision":           formatETag(s.sourceRev),
+			"oldest_replayable_revision": formatETag(s.oldestReplayableRevision),
+		})
+		return
+	}
 	offset, limit, ok := revisionPage(r)
 	if !ok {
 		http.Error(w, "invalid pagination", http.StatusBadRequest)
 		return
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	filtered := make([]controlplane.RevisionEvent, 0)
 	for _, event := range s.revisions {
 		revision, _ := strconv.ParseInt(event.Revision, 10, 64)
@@ -482,7 +494,7 @@ func (s *StubCP) revisionEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
-	offset, limit, ok := revisionPage(r)
+	afterID, snapshotRevision, limit, ok := revisionSnapshotPage(r)
 	if !ok {
 		http.Error(w, "invalid pagination", http.StatusBadRequest)
 		return
@@ -505,20 +517,56 @@ func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	end := min(offset+limit, len(items))
-	if offset > len(items) {
-		offset = len(items)
-		end = offset
+	start := sort.Search(len(items), func(i int) bool { return items[i].ID > afterID })
+	end := min(start+limit, len(items))
+	if snapshotRevision == "" {
+		snapshotRevision = formatETag(s.sourceRev)
 	}
 	response := controlplane.RevisionSnapshotResponse{
-		Items:            items[offset:end],
-		SnapshotRevision: formatETag(s.sourceRev),
+		Items:            items[start:end],
+		SnapshotRevision: snapshotRevision,
 	}
 	if end < len(items) {
-		response.NextCursor = strconv.Itoa(end)
+		response.NextCursor = encodeRevisionSnapshotCursor(items[end-1].ID, snapshotRevision)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+type revisionSnapshotCursor struct {
+	AfterID          string `json:"id"`
+	SnapshotRevision string `json:"revision"`
+}
+
+func revisionSnapshotPage(r *http.Request) (string, string, int, bool) {
+	afterID := ""
+	snapshotRevision := ""
+	if rawCursor := r.URL.Query().Get("cursor"); rawCursor != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(rawCursor)
+		if err != nil {
+			return "", "", 0, false
+		}
+		var cursor revisionSnapshotCursor
+		if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.AfterID == "" {
+			return "", "", 0, false
+		}
+		revision, err := strconv.ParseInt(cursor.SnapshotRevision, 10, 64)
+		if err != nil || revision < 0 {
+			return "", "", 0, false
+		}
+		afterID = cursor.AfterID
+		snapshotRevision = cursor.SnapshotRevision
+	}
+	limit, ok := revisionLimit(r)
+	return afterID, snapshotRevision, limit, ok
+}
+
+func encodeRevisionSnapshotCursor(afterID, snapshotRevision string) string {
+	raw, _ := json.Marshal(revisionSnapshotCursor{
+		AfterID:          afterID,
+		SnapshotRevision: snapshotRevision,
+	})
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func revisionPage(r *http.Request) (int, int, bool) {
@@ -530,15 +578,20 @@ func revisionPage(r *http.Request) (int, int, bool) {
 		}
 		offset = parsed
 	}
+	limit, ok := revisionLimit(r)
+	return offset, limit, ok
+}
+
+func revisionLimit(r *http.Request) (int, bool) {
 	limit := 100
 	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 		parsed, err := strconv.Atoi(rawLimit)
 		if err != nil || parsed <= 0 {
-			return 0, 0, false
+			return 0, false
 		}
 		limit = parsed
 	}
-	return offset, limit, true
+	return limit, true
 }
 
 func (s *StubCP) currentSearchIndex() controlplane.SearchIndexState {
@@ -876,14 +929,22 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		// for the user before swapping the primary key, and
 		// report every bucket-backed attachment id back to the
 		// enclave so its cleanup cascade can drop them too.
-		for k, b := range s.blobs {
-			if b.KeyID != body.KeyID {
-				delete(s.blobs, k)
-				if strings.HasPrefix(k, "chat/") {
-					s.sourceRev++
-				}
+		for k := range s.blobs {
+			deletedAt := time.Now().UTC()
+			delete(s.blobs, k)
+			s.deletes[k] = deletedAt
+			if strings.HasPrefix(k, "chat/") {
+				s.sourceRev++
+				s.revisions = append(s.revisions, controlplane.RevisionEvent{
+					Revision:  formatETag(s.sourceRev),
+					Kind:      "delete",
+					ID:        strings.TrimPrefix(k, "chat/"),
+					UpdatedAt: deletedAt.Format(time.RFC3339Nano),
+				})
 			}
 		}
+		s.revisions = nil
+		s.oldestReplayableRevision = s.sourceRev
 		for aid := range s.attachmentIndex {
 			wipedAttachments = append(wipedAttachments, aid)
 			delete(s.attachmentIndex, aid)
