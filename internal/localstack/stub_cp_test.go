@@ -127,10 +127,10 @@ func seedStubBlob(stub *StubCP, scope, id string, projectID *string, updatedAt t
 	}
 }
 
-func seedStubDelete(stub *StubCP, scope, id string, deletedAt time.Time) {
+func seedStubDelete(stub *StubCP, scope, id string, projectID *string, deletedAt time.Time) {
 	stub.mu.Lock()
 	defer stub.mu.Unlock()
-	stub.deletes[blobKey(scope, id)] = deletedAt
+	stub.deletes[blobKey(scope, id)] = stubDelete{deletedAt: deletedAt, projectID: projectID}
 }
 
 func listStatusPage(t *testing.T, stub *StubCP, rawQuery string) controlplane.ListStatusResponse {
@@ -185,10 +185,38 @@ func TestListStatusFiltersByProjectID(t *testing.T) {
 	seedStubBlob(stub, "chat", "chat-in", &projectID, base.Add(1*time.Minute))
 	seedStubBlob(stub, "chat", "chat-other", &otherProject, base.Add(2*time.Minute))
 	seedStubBlob(stub, "chat", "chat-none", nil, base.Add(3*time.Minute))
-	seedStubDelete(stub, "chat", "chat-deleted", base.Add(4*time.Minute))
+	seedStubDelete(stub, "chat", "chat-deleted-in", &projectID, base.Add(4*time.Minute))
+	seedStubDelete(stub, "chat", "chat-deleted-other", &otherProject, base.Add(5*time.Minute))
+	seedStubDelete(stub, "chat", "chat-deleted-none", nil, base.Add(6*time.Minute))
 
 	response := listStatusPage(t, stub, "scope=chat&project_id="+projectID)
-	if len(response.Updates) != 1 || response.Updates[0].ID != "chat-in" || len(response.Deletes) != 0 {
+	if len(response.Updates) != 1 || response.Updates[0].ID != "chat-in" {
+		t.Fatalf("updates = %+v", response.Updates)
+	}
+	if len(response.Deletes) != 1 || response.Deletes[0].ID != "chat-deleted-in" {
+		t.Fatalf("deletes = %+v", response.Deletes)
+	}
+}
+
+// TestListStatusProjectDeleteTombstoneFromLiveDelete drives a real
+// DELETE through the stub (not a seeded tombstone) and asserts the
+// deleted chat's project_id survives onto the tombstone, mirroring
+// production's tombstone-on-delete trigger.
+func TestListStatusProjectDeleteTombstoneFromLiveDelete(t *testing.T) {
+	stub := NewStubCP()
+	projectID := "project-1"
+	putStubBlob(t, stub, "chat", "chat-1", map[string]string{
+		controlplane.HeaderProjectIDSet: "1",
+		controlplane.HeaderProjectID:    projectID,
+	})
+
+	recorder := requestStub(t, stub, http.MethodDelete, "/api/sync/blob/chat/chat-1", "", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	response := listStatusPage(t, stub, "scope=chat&project_id="+projectID)
+	if len(response.Deletes) != 1 || response.Deletes[0].ID != "chat-1" || len(response.Updates) != 0 {
 		t.Fatalf("response = %+v", response)
 	}
 }
@@ -197,7 +225,7 @@ func TestListStatusInterleavesDeletesInTimeline(t *testing.T) {
 	stub := NewStubCP()
 	base := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
 	seedStubBlob(stub, "chat", "chat-a", nil, base.Add(1*time.Minute))
-	seedStubDelete(stub, "chat", "chat-gone", base.Add(2*time.Minute))
+	seedStubDelete(stub, "chat", "chat-gone", nil, base.Add(2*time.Minute))
 	seedStubBlob(stub, "chat", "chat-b", nil, base.Add(3*time.Minute))
 
 	first := listStatusPage(t, stub, "scope=chat&limit=2")

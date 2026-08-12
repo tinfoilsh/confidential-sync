@@ -50,7 +50,7 @@ type StubCP struct {
 	keys                     map[string]struct{}
 	currentKID               string
 	bundles                  map[string]map[string]controlplane.CurrentKeyBundle
-	deletes                  map[string]time.Time
+	deletes                  map[string]stubDelete
 	sourceRev                int64
 	oldestReplayableRevision int64
 	revisions                []controlplane.RevisionEvent
@@ -71,6 +71,15 @@ type StubCP struct {
 	// if_match is stale and STALE_BLOB is returned. Used by T08
 	// to drive the §16.6 retry loop test.
 	onFirstDelete map[string]func()
+}
+
+// stubDelete mirrors a sync_tombstones row. Production's
+// tombstone-on-delete trigger copies the deleted chat's project_id
+// onto the tombstone so project-scoped list-status queries return
+// the project's deletes as well.
+type stubDelete struct {
+	deletedAt time.Time
+	projectID *string
 }
 
 // pendingAttachment mirrors the pending_attachment_writes ledger so
@@ -96,7 +105,7 @@ func NewStubCP() *StubCP {
 		blobs:               map[string]*StubBlob{},
 		keys:                map[string]struct{}{},
 		bundles:             map[string]map[string]controlplane.CurrentKeyBundle{},
-		deletes:             map[string]time.Time{},
+		deletes:             map[string]stubDelete{},
 		buckets:             bucketstub.NewStore(),
 		legacyAttachments:   map[string][]byte{},
 		attachmentIndex:     map[string]attachmentMeta{},
@@ -391,7 +400,13 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 			})
 		}
-		s.deletes[key] = time.Now().UTC()
+		// Mirror the tombstone-on-delete trigger: the deleted row's
+		// project_id rides along on the tombstone.
+		tombstone := stubDelete{deletedAt: time.Now().UTC()}
+		if blob != nil {
+			tombstone.projectID = blob.ProjectID
+		}
+		s.deletes[key] = tombstone
 		wipedV2 := []string{}
 		if scope == "chat" {
 			for aid, meta := range s.attachmentIndex {
@@ -514,24 +529,26 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
-	// Deletes carry no project column; the project filter narrows to
-	// live rows only, like a SQL join against the blobs table would.
-	if projectID == "" {
-		for k, ts := range s.deletes {
-			parts := strings.SplitN(k, "/", 2)
-			if parts[0] != scope {
-				continue
-			}
-			rows = append(rows, listStatusRow{
-				ts: ts,
-				id: parts[1],
-				del: &controlplane.BlobDelete{
-					ID:        parts[1],
-					Scope:     scope,
-					DeletedAt: ts,
-				},
-			})
+	// Tombstones carry the deleted row's project_id (production's
+	// tombstone-on-delete trigger copies it), so a project-scoped
+	// query returns the project's deletes too.
+	for k, tombstone := range s.deletes {
+		parts := strings.SplitN(k, "/", 2)
+		if parts[0] != scope {
+			continue
 		}
+		if projectID != "" && (tombstone.projectID == nil || *tombstone.projectID != projectID) {
+			continue
+		}
+		rows = append(rows, listStatusRow{
+			ts: tombstone.deletedAt,
+			id: parts[1],
+			del: &controlplane.BlobDelete{
+				ID:        parts[1],
+				Scope:     scope,
+				DeletedAt: tombstone.deletedAt,
+			},
+		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return listStatusRowLess(rows[i], rows[j]) })
 	if direction == "desc" {
@@ -1082,10 +1099,10 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		// for the user before swapping the primary key, and
 		// report every bucket-backed attachment id back to the
 		// enclave so its cleanup cascade can drop them too.
-		for k := range s.blobs {
+		for k, blob := range s.blobs {
 			deletedAt := time.Now().UTC()
 			delete(s.blobs, k)
-			s.deletes[k] = deletedAt
+			s.deletes[k] = stubDelete{deletedAt: deletedAt, projectID: blob.ProjectID}
 			if strings.HasPrefix(k, "chat/") {
 				s.sourceRev++
 				s.revisions = append(s.revisions, controlplane.RevisionEvent{
