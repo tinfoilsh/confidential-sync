@@ -60,12 +60,13 @@ type clerkVerifier struct {
 	clock    func() time.Time
 }
 
-// ClockSkewLeeway is the tolerance applied to exp/nbf/iat validation.
-// Clerk session tokens live ~60 seconds, and the enclave's clock can
-// drift relative to Clerk's; without leeway a freshly minted token
-// (nbf/iat marginally in the future from our perspective) or a token
-// racing its expiry boundary is rejected with a 401 even though the
-// session is perfectly valid.
+// ClockSkewLeeway is the tolerance applied to exp/nbf validation (iat
+// is not verified; RFC 7519 treats it as informational and nbf already
+// bounds tokens dated in the future). Clerk session tokens live ~60
+// seconds, and the enclave's clock can drift relative to Clerk's;
+// without leeway a freshly minted token (nbf marginally in the future
+// from our perspective) or a token racing its expiry boundary is
+// rejected with a 401 even though the session is perfectly valid.
 const ClockSkewLeeway = 30 * time.Second
 
 var (
