@@ -2,9 +2,11 @@ package localstack
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +208,34 @@ func TestListStatusInterleavesDeletesInTimeline(t *testing.T) {
 	second := listStatusPage(t, stub, "scope=chat&limit=2&cursor="+url.QueryEscape(first.NextCursor))
 	if len(second.Updates) != 1 || second.Updates[0].ID != "chat-b" || len(second.Deletes) != 0 || second.NextCursor != "" {
 		t.Fatalf("second page = %+v", second)
+	}
+}
+
+func TestRevisionEventsRejectsOversizedLimit(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "chat", "chat-a", nil)
+
+	oversized := strconv.Itoa(maxRevisionPageLimit + 1)
+	recorder := requestStub(t, stub, http.MethodGet, controlplane.RevisionEventsPath+"?after_revision=0&through_revision=1&limit="+oversized, "", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("events status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.RevisionSnapshotPath+"?limit="+oversized, "", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("snapshot status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRevisionEventsCursorPastEndDoesNotPanic(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "chat", "chat-a", nil)
+
+	target := controlplane.RevisionEventsPath + "?after_revision=0&through_revision=1&limit=" + strconv.Itoa(maxRevisionPageLimit) + "&cursor=" + strconv.Itoa(math.MaxInt-1)
+	recorder := requestStub(t, stub, http.MethodGet, target, "", nil)
+	var events controlplane.RevisionEventsResponse
+	decodeStubResponse(t, recorder, &events)
+	if len(events.Events) != 0 || events.NextCursor != "" {
+		t.Fatalf("events = %+v", events)
 	}
 }
 

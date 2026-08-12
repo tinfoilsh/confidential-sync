@@ -152,6 +152,15 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 const LocalStackSyncEnclaveSecret = "local-stack-sync-enclave-secret"
 
+// Pagination bounds mirroring the production controlplane's
+// constants (SyncRevisionDefaultPageLimit / SyncRevisionMaxPageLimit
+// in controlplane/constants/limits.go). The cap also keeps
+// offset+limit arithmetic far away from integer overflow.
+const (
+	defaultRevisionPageLimit = 100
+	maxRevisionPageLimit     = 500
+)
+
 // LocalStackBucketsBucket is the bucket name the stubbed sidecar
 // serves and the enclave's buckets client is configured with.
 const LocalStackBucketsBucket = "local-stack-bucket"
@@ -623,11 +632,12 @@ func (s *StubCP) revisionEvents(w http.ResponseWriter, r *http.Request) {
 			filtered = append(filtered, event)
 		}
 	}
-	end := min(offset+limit, len(filtered))
+	// Clamp the offset before adding the limit so a huge cursor value
+	// cannot overflow offset+limit into a negative slice bound.
 	if offset > len(filtered) {
 		offset = len(filtered)
-		end = offset
 	}
+	end := min(offset+limit, len(filtered))
 	response := controlplane.RevisionEventsResponse{Events: filtered[offset:end]}
 	if end < len(filtered) {
 		response.NextCursor = strconv.Itoa(end)
@@ -726,10 +736,10 @@ func revisionPage(r *http.Request) (int, int, bool) {
 }
 
 func revisionLimit(r *http.Request) (int, bool) {
-	limit := 100
+	limit := defaultRevisionPageLimit
 	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 		parsed, err := strconv.Atoi(rawLimit)
-		if err != nil || parsed <= 0 {
+		if err != nil || parsed <= 0 || parsed > maxRevisionPageLimit {
 			return 0, false
 		}
 		limit = parsed
