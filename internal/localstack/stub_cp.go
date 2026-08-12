@@ -401,37 +401,180 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 	}
 }
 
+// listStatusRow is one entry in the merged update/delete timeline the
+// stub paginates over, mirroring the production controlplane's
+// keyset pagination on (updated_at, id).
+type listStatusRow struct {
+	ts     time.Time
+	id     string
+	update *controlplane.BlobMeta
+	del    *controlplane.BlobDelete
+}
+
+// listStatusCursor is the opaque page token: the (updated_at, id)
+// position of the last row emitted. Base64 raw-URL JSON like the
+// revision-snapshot cursor so tests treat it as opaque.
+type listStatusCursor struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+func encodeListStatusCursor(ts time.Time, id string) string {
+	raw, _ := json.Marshal(listStatusCursor{
+		UpdatedAt: ts.UTC().Format(time.RFC3339Nano),
+		ID:        id,
+	})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeListStatusCursor(raw string) (time.Time, string, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	var cursor listStatusCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.ID == "" {
+		return time.Time{}, "", false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, cursor.UpdatedAt)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return ts, cursor.ID, true
+}
+
+// listStatusRowLess orders the merged timeline oldest-first with id
+// as the tie-breaker, matching the controlplane's keyset order.
+func listStatusRowLess(a, b listStatusRow) bool {
+	if !a.ts.Equal(b.ts) {
+		return a.ts.Before(b.ts)
+	}
+	return a.id < b.id
+}
+
 func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	scope := query.Get("scope")
+	projectID := query.Get("project_id")
+	direction := query.Get("direction")
+	if direction != "" && direction != "asc" && direction != "desc" {
+		http.Error(w, "invalid direction", http.StatusBadRequest)
+		return
+	}
+	limit := 100
+	if rawLimit := query.Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	var afterTS time.Time
+	afterID := ""
+	hasCursor := false
+	if rawCursor := query.Get("cursor"); rawCursor != "" {
+		ts, id, ok := decodeListStatusCursor(rawCursor)
+		if !ok {
+			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			return
+		}
+		afterTS, afterID, hasCursor = ts, id, true
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	scope := r.URL.Query().Get("scope")
-	updates := []controlplane.BlobMeta{}
-	deletes := []controlplane.BlobDelete{}
+	rows := make([]listStatusRow, 0)
 	for k, blob := range s.blobs {
 		parts := strings.SplitN(k, "/", 2)
 		if parts[0] != scope {
 			continue
 		}
-		updates = append(updates, controlplane.BlobMeta{
-			ID:        parts[1],
-			ETag:      formatETag(blob.ETag),
-			KeyID:     blob.KeyID,
-			ProjectID: blob.ProjectID,
-			UpdatedAt: blob.UpdatedAt,
-		})
-	}
-	for k, ts := range s.deletes {
-		parts := strings.SplitN(k, "/", 2)
-		if parts[0] != scope {
+		if projectID != "" && (blob.ProjectID == nil || *blob.ProjectID != projectID) {
 			continue
 		}
-		deletes = append(deletes, controlplane.BlobDelete{
-			ID:        parts[1],
-			Scope:     scope,
-			DeletedAt: ts,
+		rows = append(rows, listStatusRow{
+			ts: blob.UpdatedAt,
+			id: parts[1],
+			update: &controlplane.BlobMeta{
+				ID:        parts[1],
+				ETag:      formatETag(blob.ETag),
+				KeyID:     blob.KeyID,
+				ProjectID: blob.ProjectID,
+				UpdatedAt: blob.UpdatedAt,
+			},
 		})
 	}
-	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates, Deletes: deletes})
+	// Deletes carry no project column; the project filter narrows to
+	// live rows only, like a SQL join against the blobs table would.
+	if projectID == "" {
+		for k, ts := range s.deletes {
+			parts := strings.SplitN(k, "/", 2)
+			if parts[0] != scope {
+				continue
+			}
+			rows = append(rows, listStatusRow{
+				ts: ts,
+				id: parts[1],
+				del: &controlplane.BlobDelete{
+					ID:        parts[1],
+					Scope:     scope,
+					DeletedAt: ts,
+				},
+			})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return listStatusRowLess(rows[i], rows[j]) })
+	if direction == "desc" {
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+	}
+	if hasCursor {
+		cursorRow := listStatusRow{ts: afterTS, id: afterID}
+		start := 0
+		for start < len(rows) {
+			row := rows[start]
+			// Skip everything at or before the cursor position in
+			// traversal order (strictly-after keyset resume).
+			atOrBefore := row.ts.Equal(cursorRow.ts) && row.id == cursorRow.id
+			if direction == "desc" {
+				atOrBefore = atOrBefore || listStatusRowLess(cursorRow, row)
+			} else {
+				atOrBefore = atOrBefore || listStatusRowLess(row, cursorRow)
+			}
+			if !atOrBefore {
+				break
+			}
+			start++
+		}
+		rows = rows[start:]
+	}
+	nextCursor := ""
+	if len(rows) > limit {
+		last := rows[limit-1]
+		nextCursor = encodeListStatusCursor(last.ts, last.id)
+		rows = rows[:limit]
+	}
+	updates := []controlplane.BlobMeta{}
+	deletes := []controlplane.BlobDelete{}
+	for _, row := range rows {
+		rowCursor := encodeListStatusCursor(row.ts, row.id)
+		if row.update != nil {
+			update := *row.update
+			update.Cursor = rowCursor
+			updates = append(updates, update)
+			continue
+		}
+		del := *row.del
+		del.Cursor = rowCursor
+		deletes = append(deletes, del)
+	}
+	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{
+		Updates:    updates,
+		Deletes:    deletes,
+		NextCursor: nextCursor,
+	})
 }
 
 func (s *StubCP) revisionSummary(w http.ResponseWriter, r *http.Request) {
