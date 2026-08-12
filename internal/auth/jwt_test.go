@@ -139,6 +139,40 @@ func TestVerifierRejectsExpiredToken(t *testing.T) {
 	}
 }
 
+func TestVerifierToleratesClockSkew(t *testing.T) {
+	ti := newTestIssuer(t)
+	v := ti.verifier(t)
+
+	// A token minted by an issuer whose clock is slightly ahead of ours:
+	// nbf/iat are in our future, within the leeway window.
+	now := time.Now()
+	ahead := now.Add(ClockSkewLeeway / 2)
+	c := jwt.MapClaims{
+		"sub": "user_abc",
+		"iss": ti.issuer,
+		"iat": ahead.Unix(),
+		"nbf": ahead.Unix(),
+		"exp": ahead.Add(time.Minute).Unix(),
+	}
+	if _, err := v.Verify(context.Background(), ti.sign(t, c)); err != nil {
+		t.Fatalf("expected token within leeway to verify, got %v", err)
+	}
+
+	// A token that expired within the leeway window is still accepted.
+	c = validClaims(ti.issuer)
+	c["exp"] = now.Add(-ClockSkewLeeway / 2).Unix()
+	if _, err := v.Verify(context.Background(), ti.sign(t, c)); err != nil {
+		t.Fatalf("expected just-expired token within leeway to verify, got %v", err)
+	}
+
+	// Beyond the leeway window the token is rejected.
+	c = validClaims(ti.issuer)
+	c["exp"] = now.Add(-2 * ClockSkewLeeway).Unix()
+	if _, err := v.Verify(context.Background(), ti.sign(t, c)); !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("expected ErrTokenInvalid beyond leeway, got %v", err)
+	}
+}
+
 func TestVerifierRejectsWrongIssuer(t *testing.T) {
 	ti := newTestIssuer(t)
 	v := ti.verifier(t)
@@ -232,13 +266,13 @@ func TestVerifierRejectsHS256(t *testing.T) {
 
 func TestBearerTokenParsing(t *testing.T) {
 	cases := map[string]bool{
-		"Bearer abc":      true,
-		"Bearer  abc":     true,
-		"Bearer ":         false,
-		"":                false,
-		"Token abc":       false,
-		"bearer abc":      false,
-		"Bearer abc def":  true,
+		"Bearer abc":     true,
+		"Bearer  abc":    true,
+		"Bearer ":        false,
+		"":               false,
+		"Token abc":      false,
+		"bearer abc":     false,
+		"Bearer abc def": true,
 	}
 	for h, want := range cases {
 		tok, err := BearerToken(h)
