@@ -122,12 +122,21 @@ const (
 // Error is a structured error returned from the controlplane. It contains
 // the parsed error code plus any contextual fields the controlplane sent.
 type Error struct {
-	StatusCode   int             `json:"-"`
-	Code         string          `json:"code"`
-	Message      string          `json:"message,omitempty"`
-	CurrentKeyID string          `json:"current_key_id,omitempty"`
-	CurrentETag  string          `json:"current_etag,omitempty"`
-	Raw          json.RawMessage `json:"-"`
+	StatusCode   int    `json:"-"`
+	Code         string `json:"code"`
+	Message      string `json:"message,omitempty"`
+	CurrentKeyID string `json:"current_key_id,omitempty"`
+	CurrentETag  string `json:"current_etag,omitempty"`
+	// CurrentRevision and OldestReplayableRevision accompany
+	// SYNC_SNAPSHOT_REQUIRED so a client that fell behind the replay
+	// window can bootstrap a snapshot without an extra summary call.
+	CurrentRevision          string `json:"current_revision,omitempty"`
+	OldestReplayableRevision string `json:"oldest_replayable_revision,omitempty"`
+	// MinimumProtocol accompanies upgrade-required errors (e.g.
+	// PROFILE_SYNC_UPGRADE_REQUIRED) and names the lowest protocol
+	// version the controlplane still accepts.
+	MinimumProtocol int             `json:"minimum_protocol,omitempty"`
+	Raw             json.RawMessage `json:"-"`
 }
 
 func (e *Error) Error() string {

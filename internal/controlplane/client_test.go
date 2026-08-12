@@ -754,6 +754,30 @@ func TestParseErrorNoBody(t *testing.T) {
 	}
 }
 
+func TestParseErrorKeepsSnapshotRequiredContext(t *testing.T) {
+	raw := []byte(`{"code":"SYNC_SNAPSHOT_REQUIRED","message":"chat sync snapshot required","current_revision":"42","oldest_replayable_revision":"7"}`)
+	err := parseError(http.StatusConflict, raw)
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("error type: %T", err)
+	}
+	if e.Code != StatusSyncSnapshotRequired || e.CurrentRevision != "42" || e.OldestReplayableRevision != "7" {
+		t.Fatalf("error = %+v", e)
+	}
+}
+
+func TestParseErrorKeepsMinimumProtocol(t *testing.T) {
+	raw := []byte(`{"code":"PROFILE_SYNC_UPGRADE_REQUIRED","minimum_protocol":2}`)
+	err := parseError(http.StatusUpgradeRequired, raw)
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("error type: %T", err)
+	}
+	if e.Code != StatusProfileSyncUpgradeRequired || e.MinimumProtocol != 2 {
+		t.Fatalf("error = %+v", e)
+	}
+}
+
 func TestGetCurrentKeyNotFound(t *testing.T) {
 	st := newStub(t)
 	st.handle1("GET", "/api/sync/keys/current", func(w http.ResponseWriter, r *http.Request) {
