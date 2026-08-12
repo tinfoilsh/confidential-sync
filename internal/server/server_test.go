@@ -1159,6 +1159,9 @@ func TestAuthenticatedRoutesRequireSyncProtocolV2(t *testing.T) {
 		if appErr.Code != CodeSyncProtocolUpgradeRequired {
 			t.Fatalf("protocols %q: error=%+v", protocols, appErr)
 		}
+		if appErr.MinimumProtocol != controlplane.SyncProtocolV2 {
+			t.Fatalf("protocols %q: minimum_protocol=%d, want %d", protocols, appErr.MinimumProtocol, controlplane.SyncProtocolV2)
+		}
 	}
 }
 
