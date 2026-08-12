@@ -68,6 +68,7 @@ type cpStub struct {
 	attachmentIndex            map[string]string // attachmentID → chatID (populated by handler)
 	attachmentOwner            map[string]string // attachmentID → clerkUserID (set by tests)
 	sourceRevision             int64
+	oldestReplayableRevision   int64
 	revisions                  []controlplane.RevisionEvent
 	searchState                controlplane.SearchIndexState
 	searchConflict             func(controlplane.SearchIndexState) controlplane.SearchIndexState
@@ -352,11 +353,23 @@ func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
 func (s *cpStub) handleRevisionSummary(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(controlplane.RevisionSummaryResponse{
 		CurrentRevision:          formatETag(s.sourceRevision),
-		OldestReplayableRevision: "0",
+		OldestReplayableRevision: formatETag(s.oldestReplayableRevision),
 	})
 }
 
 func (s *cpStub) handleRevisionEvents(w http.ResponseWriter, r *http.Request) {
+	after, _ := strconv.ParseInt(r.URL.Query().Get("after_revision"), 10, 64)
+	if after < s.oldestReplayableRevision {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code":                       controlplane.StatusSyncSnapshotRequired,
+			"message":                    "chat sync snapshot required",
+			"current_revision":           formatETag(s.sourceRevision),
+			"oldest_replayable_revision": formatETag(s.oldestReplayableRevision),
+		})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(controlplane.RevisionEventsResponse{Events: s.revisions})
 }
 
@@ -1227,6 +1240,40 @@ func TestRevisionSyncRoutesProxyReplayMetadata(t *testing.T) {
 	}
 }
 
+// TestRevisionEventsSnapshotRequiredPassesThrough asserts the
+// controlplane's SYNC_SNAPSHOT_REQUIRED 409 reaches the enclave's
+// client with its structure intact: the code plus both revision
+// fields the client needs to bootstrap a snapshot without an extra
+// summary round trip.
+func TestRevisionEventsSnapshotRequiredPassesThrough(t *testing.T) {
+	f := newFixture(t)
+	f.cp.mu.Lock()
+	f.cp.sourceRevision = 9
+	f.cp.oldestReplayableRevision = 5
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/sync/revision-events", RevisionEventsRequest{
+		AfterRevision:   "2",
+		ThroughRevision: "9",
+	}, f.jwt())
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("parse body: %v %s", err, body)
+	}
+	if parsed["code"] != controlplane.StatusSyncSnapshotRequired {
+		t.Fatalf("code=%v body=%s", parsed["code"], body)
+	}
+	if parsed["current_revision"] != "9" {
+		t.Fatalf("current_revision=%v body=%s", parsed["current_revision"], body)
+	}
+	if parsed["oldest_replayable_revision"] != "5" {
+		t.Fatalf("oldest_replayable_revision=%v body=%s", parsed["oldest_replayable_revision"], body)
+	}
+}
+
 func TestListStatusRemainsAvailableWithProtocolV2(t *testing.T) {
 	f := newFixture(t)
 	projectID := "project-1"
@@ -1911,6 +1958,9 @@ func TestProfileSyncProtocolUpgradeRequiredPassesThrough(t *testing.T) {
 	}
 	if appErr.Code != CodeProfileSyncUpgradeRequired {
 		t.Fatalf("code = %q, want %q", appErr.Code, CodeProfileSyncUpgradeRequired)
+	}
+	if appErr.MinimumProtocol != controlplane.ProfileSyncProtocolV2 {
+		t.Fatalf("minimum_protocol = %d, want %d body=%s", appErr.MinimumProtocol, controlplane.ProfileSyncProtocolV2, body)
 	}
 }
 
