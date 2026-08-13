@@ -259,7 +259,10 @@ func TestStageImportChunkDoesNotRecordFailedPut(t *testing.T) {
 
 func TestImportStagingCleanupExpiresStaleJobs(t *testing.T) {
 	f := newFixture(t)
-	f.handler.importCoordinator.stagingRetention = time.Millisecond
+	// Keep the retention long while creating and uploading so the reaper
+	// scheduled by create cannot race the upload request; the reap itself
+	// is invoked directly below to make the test deterministic.
+	f.handler.importCoordinator.stagingRetention = time.Hour
 	tok := f.jwt()
 	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 
@@ -286,12 +289,14 @@ func TestImportStagingCleanupExpiresStaleJobs(t *testing.T) {
 		t.Fatalf("upload: %d %s", resp.StatusCode, body)
 	}
 
-	token := importChunkToken(createResp.UploadID, 0)
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) &&
-		(f.handler.importCoordinator.Get(f.userSub) != nil || f.bk.has(token)) {
-		time.Sleep(5 * time.Millisecond)
+	job := f.handler.importCoordinator.Get(f.userSub)
+	if job == nil {
+		t.Fatal("expected staging job to exist after upload")
 	}
+	f.handler.importCoordinator.stagingRetention = 0
+	f.handler.importCoordinator.reapStaleStaging(context.Background(), f.handler.deps, job)
+
+	token := importChunkToken(createResp.UploadID, 0)
 	if f.handler.importCoordinator.Get(f.userSub) != nil {
 		t.Fatal("expected stale staging job to be reaped")
 	}
