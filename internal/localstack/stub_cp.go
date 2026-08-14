@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,10 +31,12 @@ import (
 
 // StubBlob is a stored ciphertext envelope on the stub.
 type StubBlob struct {
-	ETag      int64
-	KeyID     string
-	Body      []byte
-	UpdatedAt time.Time
+	ETag         int64
+	KeyID        string
+	Body         []byte
+	ProjectIDSet bool
+	ProjectID    *string
+	UpdatedAt    time.Time
 }
 
 // StubCP is the in-memory controlplane. Its methods are safe for
@@ -41,15 +44,17 @@ type StubBlob struct {
 // InjectLegacyV0 / OnFirstGet directly to drive adversarial
 // scenarios.
 type StubCP struct {
-	mu         sync.Mutex
-	mux        *http.ServeMux
-	blobs      map[string]*StubBlob
-	keys       map[string]struct{}
-	currentKID string
-	bundles    map[string]map[string]controlplane.CurrentKeyBundle
-	deletes    map[string]time.Time
-	sourceRev  int64
-	search     controlplane.SearchIndexState
+	mu                       sync.Mutex
+	mux                      *http.ServeMux
+	blobs                    map[string]*StubBlob
+	keys                     map[string]struct{}
+	currentKID               string
+	bundles                  map[string]map[string]controlplane.CurrentKeyBundle
+	deletes                  map[string]stubDelete
+	sourceRev                int64
+	oldestReplayableRevision int64
+	revisions                []controlplane.RevisionEvent
+	search                   controlplane.SearchIndexState
 
 	buckets             *bucketstub.Store
 	legacyAttachments   map[string][]byte
@@ -66,6 +71,15 @@ type StubCP struct {
 	// if_match is stale and STALE_BLOB is returned. Used by T08
 	// to drive the §16.6 retry loop test.
 	onFirstDelete map[string]func()
+}
+
+// stubDelete mirrors a sync_tombstones row. Production's
+// tombstone-on-delete trigger copies the deleted chat's project_id
+// onto the tombstone so project-scoped list-status queries return
+// the project's deletes as well.
+type stubDelete struct {
+	deletedAt time.Time
+	projectID *string
 }
 
 // pendingAttachment mirrors the pending_attachment_writes ledger so
@@ -91,7 +105,7 @@ func NewStubCP() *StubCP {
 		blobs:               map[string]*StubBlob{},
 		keys:                map[string]struct{}{},
 		bundles:             map[string]map[string]controlplane.CurrentKeyBundle{},
-		deletes:             map[string]time.Time{},
+		deletes:             map[string]stubDelete{},
 		buckets:             bucketstub.NewStore(),
 		legacyAttachments:   map[string][]byte{},
 		attachmentIndex:     map[string]attachmentMeta{},
@@ -113,6 +127,9 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
+	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
+	mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.revisionEvents)
+	mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.revisionSnapshot)
 	mux.HandleFunc("GET /api/sync/search-index", s.getSearchIndex)
 	mux.HandleFunc("PUT /api/sync/search-index", s.publishSearchIndex)
 	mux.HandleFunc("GET /api/sync/needs-migration", s.needsMigration)
@@ -143,6 +160,15 @@ func (s *StubCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 const LocalStackSyncEnclaveSecret = "local-stack-sync-enclave-secret"
+
+// Pagination bounds mirroring the production controlplane's
+// constants (SyncRevisionDefaultPageLimit / SyncRevisionMaxPageLimit
+// in controlplane/constants/limits.go). The cap also keeps
+// offset+limit arithmetic far away from integer overflow.
+const (
+	defaultRevisionPageLimit = 100
+	maxRevisionPageLimit     = 500
+)
 
 // LocalStackBucketsBucket is the bucket name the stubbed sidecar
 // serves and the enclave's buckets client is configured with.
@@ -204,10 +230,12 @@ func (s *StubCP) CopyBlob(srcScope, srcID, dstScope, dstID string) bool {
 		next = existing.ETag + 1
 	}
 	s.blobs[dstKey] = &StubBlob{
-		ETag:      next,
-		KeyID:     src.KeyID,
-		Body:      append([]byte(nil), src.Body...),
-		UpdatedAt: time.Now().UTC(),
+		ETag:         next,
+		KeyID:        src.KeyID,
+		Body:         append([]byte(nil), src.Body...),
+		ProjectIDSet: src.ProjectIDSet,
+		ProjectID:    src.ProjectID,
+		UpdatedAt:    time.Now().UTC(),
 	}
 	return true
 }
@@ -272,14 +300,36 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 		if blob != nil {
 			next = blob.ETag + 1
 		}
-		s.blobs[key] = &StubBlob{
+		updatedAt := time.Now().UTC()
+		nextBlob := &StubBlob{
 			ETag:      next,
 			KeyID:     r.Header.Get("X-Key-Id"),
 			Body:      body,
-			UpdatedAt: time.Now().UTC(),
+			UpdatedAt: updatedAt,
 		}
+		if blob != nil {
+			nextBlob.ProjectIDSet = blob.ProjectIDSet
+			nextBlob.ProjectID = blob.ProjectID
+		}
+		if scope == "chat" && r.Header.Get(controlplane.HeaderProjectIDSet) == "1" {
+			nextBlob.ProjectIDSet = true
+			nextBlob.ProjectID = nil
+			if projectID := r.Header.Get(controlplane.HeaderProjectID); projectID != "" {
+				nextBlob.ProjectID = &projectID
+			}
+		}
+		s.blobs[key] = nextBlob
 		if scope == "chat" {
 			s.sourceRev++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRev),
+				Kind:      "upsert",
+				ID:        id,
+				ETag:      formatETag(next),
+				KeyID:     r.Header.Get("X-Key-Id"),
+				ProjectID: nextBlob.ProjectID,
+				UpdatedAt: updatedAt.Format(time.RFC3339Nano),
+			})
 		}
 		delete(s.deletes, key)
 		w.Header().Set("ETag", formatETag(next))
@@ -303,6 +353,12 @@ func (s *StubCP) getBlob(scope string) http.HandlerFunc {
 		}
 		w.Header().Set("ETag", formatETag(blob.ETag))
 		w.Header().Set("X-Key-Id", blob.KeyID)
+		if scope == "chat" && blob.ProjectIDSet {
+			w.Header().Set(controlplane.HeaderProjectIDSet, "1")
+			if blob.ProjectID != nil {
+				w.Header().Set(controlplane.HeaderProjectID, *blob.ProjectID)
+			}
+		}
 		_, _ = w.Write(blob.Body)
 	}
 }
@@ -337,8 +393,20 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 		delete(s.blobs, key)
 		if scope == "chat" && blob != nil {
 			s.sourceRev++
+			s.revisions = append(s.revisions, controlplane.RevisionEvent{
+				Revision:  formatETag(s.sourceRev),
+				Kind:      "delete",
+				ID:        id,
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
 		}
-		s.deletes[key] = time.Now().UTC()
+		// Mirror the tombstone-on-delete trigger: the deleted row's
+		// project_id rides along on the tombstone.
+		tombstone := stubDelete{deletedAt: time.Now().UTC()}
+		if blob != nil {
+			tombstone.projectID = blob.ProjectID
+		}
+		s.deletes[key] = tombstone
 		wipedV2 := []string{}
 		if scope == "chat" {
 			for aid, meta := range s.attachmentIndex {
@@ -357,36 +425,343 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 	}
 }
 
+// listStatusRow is one entry in the merged update/delete timeline the
+// stub paginates over, mirroring the production controlplane's
+// keyset pagination on (updated_at, id).
+type listStatusRow struct {
+	ts     time.Time
+	id     string
+	update *controlplane.BlobMeta
+	del    *controlplane.BlobDelete
+}
+
+// listStatusCursor is the opaque page token: the (updated_at, id)
+// position of the last row emitted. Base64 raw-URL JSON like the
+// revision-snapshot cursor so tests treat it as opaque.
+type listStatusCursor struct {
+	UpdatedAt string `json:"updated_at"`
+	ID        string `json:"id"`
+}
+
+func encodeListStatusCursor(ts time.Time, id string) string {
+	raw, _ := json.Marshal(listStatusCursor{
+		UpdatedAt: ts.UTC().Format(time.RFC3339Nano),
+		ID:        id,
+	})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeListStatusCursor(raw string) (time.Time, string, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	var cursor listStatusCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.ID == "" {
+		return time.Time{}, "", false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, cursor.UpdatedAt)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return ts, cursor.ID, true
+}
+
+// listStatusRowLess orders the merged timeline oldest-first with id
+// as the tie-breaker, matching the controlplane's keyset order.
+func listStatusRowLess(a, b listStatusRow) bool {
+	if !a.ts.Equal(b.ts) {
+		return a.ts.Before(b.ts)
+	}
+	return a.id < b.id
+}
+
 func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	scope := query.Get("scope")
+	projectID := query.Get("project_id")
+	direction := query.Get("direction")
+	if direction != "" && direction != "asc" && direction != "desc" {
+		http.Error(w, "invalid direction", http.StatusBadRequest)
+		return
+	}
+	limit := 100
+	if rawLimit := query.Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	var afterTS time.Time
+	afterID := ""
+	hasCursor := false
+	if rawCursor := query.Get("cursor"); rawCursor != "" {
+		ts, id, ok := decodeListStatusCursor(rawCursor)
+		if !ok {
+			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			return
+		}
+		afterTS, afterID, hasCursor = ts, id, true
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	scope := r.URL.Query().Get("scope")
-	updates := []controlplane.BlobMeta{}
-	deletes := []controlplane.BlobDelete{}
+	rows := make([]listStatusRow, 0)
 	for k, blob := range s.blobs {
 		parts := strings.SplitN(k, "/", 2)
 		if parts[0] != scope {
 			continue
 		}
-		updates = append(updates, controlplane.BlobMeta{
-			ID:        parts[1],
-			ETag:      formatETag(blob.ETag),
-			KeyID:     blob.KeyID,
-			UpdatedAt: blob.UpdatedAt,
+		if projectID != "" && (blob.ProjectID == nil || *blob.ProjectID != projectID) {
+			continue
+		}
+		rows = append(rows, listStatusRow{
+			ts: blob.UpdatedAt,
+			id: parts[1],
+			update: &controlplane.BlobMeta{
+				ID:        parts[1],
+				ETag:      formatETag(blob.ETag),
+				KeyID:     blob.KeyID,
+				ProjectID: blob.ProjectID,
+				UpdatedAt: blob.UpdatedAt,
+			},
 		})
 	}
-	for k, ts := range s.deletes {
+	// Tombstones carry the deleted row's project_id (production's
+	// tombstone-on-delete trigger copies it), so a project-scoped
+	// query returns the project's deletes too.
+	for k, tombstone := range s.deletes {
 		parts := strings.SplitN(k, "/", 2)
 		if parts[0] != scope {
 			continue
 		}
-		deletes = append(deletes, controlplane.BlobDelete{
-			ID:        parts[1],
-			Scope:     scope,
-			DeletedAt: ts,
+		if projectID != "" && (tombstone.projectID == nil || *tombstone.projectID != projectID) {
+			continue
+		}
+		rows = append(rows, listStatusRow{
+			ts: tombstone.deletedAt,
+			id: parts[1],
+			del: &controlplane.BlobDelete{
+				ID:        parts[1],
+				Scope:     scope,
+				DeletedAt: tombstone.deletedAt,
+			},
 		})
 	}
-	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates, Deletes: deletes})
+	sort.Slice(rows, func(i, j int) bool { return listStatusRowLess(rows[i], rows[j]) })
+	if direction == "desc" {
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
+	}
+	if hasCursor {
+		cursorRow := listStatusRow{ts: afterTS, id: afterID}
+		start := 0
+		for start < len(rows) {
+			row := rows[start]
+			// Skip everything at or before the cursor position in
+			// traversal order (strictly-after keyset resume).
+			atOrBefore := row.ts.Equal(cursorRow.ts) && row.id == cursorRow.id
+			if direction == "desc" {
+				atOrBefore = atOrBefore || listStatusRowLess(cursorRow, row)
+			} else {
+				atOrBefore = atOrBefore || listStatusRowLess(row, cursorRow)
+			}
+			if !atOrBefore {
+				break
+			}
+			start++
+		}
+		rows = rows[start:]
+	}
+	nextCursor := ""
+	if len(rows) > limit {
+		last := rows[limit-1]
+		nextCursor = encodeListStatusCursor(last.ts, last.id)
+		rows = rows[:limit]
+	}
+	updates := []controlplane.BlobMeta{}
+	deletes := []controlplane.BlobDelete{}
+	for _, row := range rows {
+		rowCursor := encodeListStatusCursor(row.ts, row.id)
+		if row.update != nil {
+			update := *row.update
+			update.Cursor = rowCursor
+			updates = append(updates, update)
+			continue
+		}
+		del := *row.del
+		del.Cursor = rowCursor
+		deletes = append(deletes, del)
+	}
+	_ = json.NewEncoder(w).Encode(controlplane.ListStatusResponse{
+		Updates:    updates,
+		Deletes:    deletes,
+		NextCursor: nextCursor,
+	})
+}
+
+func (s *StubCP) revisionSummary(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.RevisionSummaryResponse{
+		CurrentRevision:          formatETag(s.sourceRev),
+		OldestReplayableRevision: formatETag(s.oldestReplayableRevision),
+	})
+}
+
+func (s *StubCP) revisionEvents(w http.ResponseWriter, r *http.Request) {
+	after, err := strconv.ParseInt(r.URL.Query().Get("after_revision"), 10, 64)
+	if err != nil || after < 0 {
+		http.Error(w, "invalid after_revision", http.StatusBadRequest)
+		return
+	}
+	through, err := strconv.ParseInt(r.URL.Query().Get("through_revision"), 10, 64)
+	if err != nil || through < after {
+		http.Error(w, "invalid through_revision", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if after < s.oldestReplayableRevision {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code":                       controlplane.StatusSyncSnapshotRequired,
+			"message":                    "chat sync snapshot required",
+			"current_revision":           formatETag(s.sourceRev),
+			"oldest_replayable_revision": formatETag(s.oldestReplayableRevision),
+		})
+		return
+	}
+	offset, limit, ok := revisionPage(r)
+	if !ok {
+		http.Error(w, "invalid pagination", http.StatusBadRequest)
+		return
+	}
+	filtered := make([]controlplane.RevisionEvent, 0)
+	for _, event := range s.revisions {
+		revision, _ := strconv.ParseInt(event.Revision, 10, 64)
+		if revision > after && revision <= through {
+			filtered = append(filtered, event)
+		}
+	}
+	// Clamp the offset before adding the limit so a huge cursor value
+	// cannot overflow offset+limit into a negative slice bound.
+	if offset > len(filtered) {
+		offset = len(filtered)
+	}
+	end := min(offset+limit, len(filtered))
+	response := controlplane.RevisionEventsResponse{Events: filtered[offset:end]}
+	if end < len(filtered) {
+		response.NextCursor = strconv.Itoa(end)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
+	afterID, snapshotRevision, limit, ok := revisionSnapshotPage(r)
+	if !ok {
+		http.Error(w, "invalid pagination", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]controlplane.RevisionSnapshotItem, 0)
+	for key, blob := range s.blobs {
+		parts := strings.SplitN(key, "/", 2)
+		if parts[0] != "chat" {
+			continue
+		}
+		items = append(items, controlplane.RevisionSnapshotItem{
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	start := sort.Search(len(items), func(i int) bool { return items[i].ID > afterID })
+	end := min(start+limit, len(items))
+	if snapshotRevision == "" {
+		snapshotRevision = formatETag(s.sourceRev)
+	}
+	response := controlplane.RevisionSnapshotResponse{
+		Items:            items[start:end],
+		SnapshotRevision: snapshotRevision,
+	}
+	if end < len(items) {
+		response.NextCursor = encodeRevisionSnapshotCursor(items[end-1].ID, snapshotRevision)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+type revisionSnapshotCursor struct {
+	AfterID          string `json:"id"`
+	SnapshotRevision string `json:"revision"`
+}
+
+func revisionSnapshotPage(r *http.Request) (string, string, int, bool) {
+	afterID := ""
+	snapshotRevision := ""
+	if rawCursor := r.URL.Query().Get("cursor"); rawCursor != "" {
+		decoded, err := base64.RawURLEncoding.DecodeString(rawCursor)
+		if err != nil {
+			return "", "", 0, false
+		}
+		var cursor revisionSnapshotCursor
+		if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.AfterID == "" {
+			return "", "", 0, false
+		}
+		revision, err := strconv.ParseInt(cursor.SnapshotRevision, 10, 64)
+		if err != nil || revision < 0 {
+			return "", "", 0, false
+		}
+		afterID = cursor.AfterID
+		snapshotRevision = cursor.SnapshotRevision
+	}
+	limit, ok := revisionLimit(r)
+	return afterID, snapshotRevision, limit, ok
+}
+
+func encodeRevisionSnapshotCursor(afterID, snapshotRevision string) string {
+	raw, _ := json.Marshal(revisionSnapshotCursor{
+		AfterID:          afterID,
+		SnapshotRevision: snapshotRevision,
+	})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func revisionPage(r *http.Request) (int, int, bool) {
+	offset := 0
+	if cursor := r.URL.Query().Get("cursor"); cursor != "" {
+		parsed, err := strconv.Atoi(cursor)
+		if err != nil || parsed < 0 {
+			return 0, 0, false
+		}
+		offset = parsed
+	}
+	limit, ok := revisionLimit(r)
+	return offset, limit, ok
+}
+
+func revisionLimit(r *http.Request) (int, bool) {
+	limit := defaultRevisionPageLimit
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed <= 0 || parsed > maxRevisionPageLimit {
+			return 0, false
+		}
+		limit = parsed
+	}
+	return limit, true
 }
 
 func (s *StubCP) currentSearchIndex() controlplane.SearchIndexState {
@@ -724,14 +1099,22 @@ func (s *StubCP) registerKey(w http.ResponseWriter, r *http.Request) {
 		// for the user before swapping the primary key, and
 		// report every bucket-backed attachment id back to the
 		// enclave so its cleanup cascade can drop them too.
-		for k, b := range s.blobs {
-			if b.KeyID != body.KeyID {
-				delete(s.blobs, k)
-				if strings.HasPrefix(k, "chat/") {
-					s.sourceRev++
-				}
+		for k, blob := range s.blobs {
+			deletedAt := time.Now().UTC()
+			delete(s.blobs, k)
+			s.deletes[k] = stubDelete{deletedAt: deletedAt, projectID: blob.ProjectID}
+			if strings.HasPrefix(k, "chat/") {
+				s.sourceRev++
+				s.revisions = append(s.revisions, controlplane.RevisionEvent{
+					Revision:  formatETag(s.sourceRev),
+					Kind:      "delete",
+					ID:        strings.TrimPrefix(k, "chat/"),
+					UpdatedAt: deletedAt.Format(time.RFC3339Nano),
+				})
 			}
 		}
+		s.revisions = nil
+		s.oldestReplayableRevision = s.sourceRev
 		for aid := range s.attachmentIndex {
 			wipedAttachments = append(wipedAttachments, aid)
 			delete(s.attachmentIndex, aid)

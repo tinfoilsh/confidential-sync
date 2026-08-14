@@ -160,6 +160,7 @@ export BASE='http://127.0.0.1:8089'
   curl -sS $BASE/v1/health
   curl -sS -X POST $BASE/v1/key/register \
     -H "Authorization: Bearer $TOK" \
+    -H 'X-Sync-Protocol: 2' \
     -H 'Content-Type: application/json' \
     -d '{"key":"'$CEK'","if_match":"*","created_via":"start_fresh","idempotency_key":"local-1"}'
 ```

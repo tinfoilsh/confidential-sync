@@ -32,6 +32,8 @@ const (
 	CodeInternal                   = "INTERNAL"
 )
 
+const CodeSyncProtocolUpgradeRequired = "SYNC_PROTOCOL_UPGRADE_REQUIRED"
+
 // AppError is the wire representation of a non-2xx response. Extra context
 // fields (current_etag, current_key_id, reason) are folded in when relevant.
 type AppError struct {
@@ -41,6 +43,14 @@ type AppError struct {
 	CurrentKeyID string `json:"current_key_id,omitempty"`
 	CurrentETag  string `json:"current_etag,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+	// CurrentRevision and OldestReplayableRevision are forwarded from
+	// the controlplane's SYNC_SNAPSHOT_REQUIRED response so the client
+	// can bootstrap a snapshot without a follow-up summary call.
+	CurrentRevision          string `json:"current_revision,omitempty"`
+	OldestReplayableRevision string `json:"oldest_replayable_revision,omitempty"`
+	// MinimumProtocol is forwarded from controlplane upgrade-required
+	// responses that name the lowest accepted protocol version.
+	MinimumProtocol int `json:"minimum_protocol,omitempty"`
 }
 
 func (a *AppError) Error() string {
@@ -76,6 +86,15 @@ func writeError(w http.ResponseWriter, err error) {
 	if a.Reason != "" {
 		payload["reason"] = a.Reason
 	}
+	if a.CurrentRevision != "" {
+		payload["current_revision"] = a.CurrentRevision
+	}
+	if a.OldestReplayableRevision != "" {
+		payload["oldest_replayable_revision"] = a.OldestReplayableRevision
+	}
+	if a.MinimumProtocol > 0 {
+		payload["minimum_protocol"] = a.MinimumProtocol
+	}
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
@@ -101,11 +120,14 @@ func translate(err error) *AppError {
 	var cpe *controlplane.Error
 	if errors.As(err, &cpe) {
 		return &AppError{
-			Status:       cpe.StatusCode,
-			Code:         normalizeCode(cpe.Code, cpe.StatusCode),
-			Message:      cpe.Message,
-			CurrentKeyID: cpe.CurrentKeyID,
-			CurrentETag:  cpe.CurrentETag,
+			Status:                   cpe.StatusCode,
+			Code:                     normalizeCode(cpe.Code, cpe.StatusCode),
+			Message:                  cpe.Message,
+			CurrentKeyID:             cpe.CurrentKeyID,
+			CurrentETag:              cpe.CurrentETag,
+			CurrentRevision:          cpe.CurrentRevision,
+			OldestReplayableRevision: cpe.OldestReplayableRevision,
+			MinimumProtocol:          cpe.MinimumProtocol,
 		}
 	}
 	return &AppError{
