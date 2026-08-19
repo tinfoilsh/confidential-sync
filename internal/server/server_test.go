@@ -77,15 +77,17 @@ type cpStub struct {
 	// exercise the enclave-side buckets cleanup cascade. Real
 	// controlplane returns the ids of the v2 attachments it nulled
 	// during the atomic wipe; tests pre-populate this slice.
-	wipedAttachments []string
-	deleteAllStatus  int
-	deleteAllCode    string
-	mux              *http.ServeMux
-	server           *httptest.Server
-	registerHandler  func(w http.ResponseWriter, r *http.Request)
-	beforePutBlob    func(scope, id string)
-	putBlobFailures  map[string]int
-	captureHeaders   func(r *http.Request)
+	wipedAttachments              []string
+	deleteAllStatus               int
+	deleteAllCode                 string
+	mux                           *http.ServeMux
+	server                        *httptest.Server
+	registerHandler               func(w http.ResponseWriter, r *http.Request)
+	beforePutBlob                 func(scope, id string)
+	putBlobFailures               map[string]int
+	postPutFailures               map[string]int
+	deleteAttachmentIndexFailures map[string]int
+	captureHeaders                func(r *http.Request)
 }
 
 type cpNeedsMigration struct {
@@ -104,13 +106,15 @@ type cpBlob struct {
 func newCPStub(t *testing.T) *cpStub {
 	t.Helper()
 	st := &cpStub{
-		t:                 t,
-		blobs:             map[string]*cpBlob{},
-		keys:              map[string]struct{}{},
-		bundles:           map[string]map[string]controlplane.CurrentKeyBundle{},
-		registeredOps:     map[string]bool{},
-		migrationFailures: map[string]int{},
-		putBlobFailures:   map[string]int{},
+		t:                             t,
+		blobs:                         map[string]*cpBlob{},
+		keys:                          map[string]struct{}{},
+		bundles:                       map[string]map[string]controlplane.CurrentKeyBundle{},
+		registeredOps:                 map[string]bool{},
+		migrationFailures:             map[string]int{},
+		putBlobFailures:               map[string]int{},
+		postPutFailures:               map[string]int{},
+		deleteAttachmentIndexFailures: map[string]int{},
 	}
 	st.mux = http.NewServeMux()
 	st.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +272,11 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 				KeyID:     r.Header.Get("X-Key-Id"),
 				UpdatedAt: updatedAt.Format(time.RFC3339Nano),
 			})
+		}
+		if s.postPutFailures[key] > 0 {
+			s.postPutFailures[key]--
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("ETag", formatETag(nextETag))
 		w.Header().Set("X-Key-Id", r.Header.Get("X-Key-Id"))
@@ -692,6 +701,11 @@ func (s *cpStub) handleRegisterAttachmentIndex(w http.ResponseWriter, r *http.Re
 
 func (s *cpStub) handleDeleteAttachmentIndex(w http.ResponseWriter, r *http.Request) {
 	aid := r.PathValue("aid")
+	if s.deleteAttachmentIndexFailures[aid] > 0 {
+		s.deleteAttachmentIndexFailures[aid]--
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	if s.attachmentIndex == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return

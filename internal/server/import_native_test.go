@@ -229,6 +229,50 @@ func TestNativeBackupCleansAttachmentsAfterChatPushFailure(t *testing.T) {
 	}
 }
 
+func TestNativeBackupKeepsAttachmentsWhenChatPushResponseIsLost(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	backupID := "backup-lost-response"
+	chatID := mappedRestoreID(f.userSub, backupID, "chat", "c1", 0)
+	f.cp.postPutFailures["chat/"+chatID] = 1
+	archive, image := nativeAttachmentTestArchive(t, backupID)
+
+	job := runNativeTestArchive(t, f, archive)
+	chatCounts := job.Snapshot().Counts["chat"]
+	if chatCounts.Imported+chatCounts.Skipped != 1 {
+		t.Fatalf("committed chat was not counted as restored: %+v", job.Snapshot())
+	}
+	attachmentID, _, err := deriveAttachmentMaterials(attachmentIdemKey(chatID, "blobs/image.png", 0), chatID, f.userSub, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.cp.attachmentIndex[attachmentID] != chatID || !f.bk.has(attachmentID) {
+		t.Fatal("lost push response removed attachments referenced by the committed chat")
+	}
+}
+
+func TestNativeBackupRetainsBlobWhenAttachmentIndexCleanupFails(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	backupID := "backup-cleanup-failure"
+	chatID := mappedRestoreID(f.userSub, backupID, "chat", "c1", 0)
+	f.cp.putBlobFailures["chat/"+chatID] = 100
+	archive, image := nativeAttachmentTestArchive(t, backupID)
+	attachmentID, _, err := deriveAttachmentMaterials(attachmentIdemKey(chatID, "blobs/image.png", 0), chatID, f.userSub, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cp.deleteAttachmentIndexFailures[attachmentID] = 1
+
+	job := runNativeTestArchive(t, f, archive)
+	if job.Snapshot().Counts["chat"].Failed != 1 {
+		t.Fatalf("expected failed chat: %+v", job.Snapshot())
+	}
+	if f.cp.attachmentIndex[attachmentID] != chatID || !f.bk.has(attachmentID) {
+		t.Fatal("cleanup failure removed a blob that may still be referenced")
+	}
+}
+
 func TestNativeBackupCleansAttachmentsBeforeCollisionRetry(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
@@ -263,13 +307,14 @@ func TestNativeBackupCleansAttachmentsBeforeCollisionRetry(t *testing.T) {
 	}
 }
 
-func TestNativeProjectMappingsAreBounded(t *testing.T) {
+func TestNativeProjectMappingsIncludeEveryAcceptedProject(t *testing.T) {
 	job := &ImportJobState{}
-	for index := 0; index <= MaxImportProjectMappings; index++ {
+	const projectCount = 10_001
+	for index := 0; index < projectCount; index++ {
 		job.setProjectMapping(fmt.Sprintf("source-%d", index), fmt.Sprintf("destination-%d", index))
 	}
-	if got := len(job.Snapshot().ProjectMappings); got != MaxImportProjectMappings {
-		t.Fatalf("project mapping count = %d, want %d", got, MaxImportProjectMappings)
+	if got := len(job.Snapshot().ProjectMappings); got != projectCount {
+		t.Fatalf("project mapping count = %d, want %d", got, projectCount)
 	}
 }
 

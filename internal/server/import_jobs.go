@@ -204,9 +204,6 @@ func (j *ImportJobState) setProjectMapping(sourceID, destinationID string) {
 	if j.projectMappings == nil {
 		j.projectMappings = make(map[string]string)
 	}
-	if len(j.projectMappings) >= MaxImportProjectMappings {
-		return
-	}
 	j.projectMappings[sourceID] = destinationID
 	j.updatedAt = time.Now().UTC()
 }

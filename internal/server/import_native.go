@@ -520,15 +520,20 @@ func restoreNativeEntity(ctx context.Context, deps Deps, sess Session, cekB64, b
 		if err == nil {
 			return mappedID, restoreImported, nil
 		}
-		if isAlreadyImported(err) {
-			match, _, verifyErr := inspectRestoreCandidate(ctx, deps, sess, cekB64, scope, rowID, marker)
-			if verifyErr == nil && match {
+		match, _, verifyErr := inspectRestoreCandidate(ctx, deps, sess, cekB64, scope, rowID, marker)
+		if verifyErr != nil {
+			return "", restoreImported, err
+		}
+		if match {
+			if isAlreadyImported(err) {
 				return mappedID, restoreSkipped, nil
 			}
-			cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
-			continue
+			return mappedID, restoreImported, nil
 		}
 		cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
+		if isAlreadyImported(err) {
+			continue
+		}
 		return "", restoreImported, err
 	}
 	return "", restoreImported, errors.New("import: restore id generations exhausted")
@@ -656,6 +661,7 @@ func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, atta
 	for _, attachmentID := range attachmentIDs {
 		if err := deps.Controlplane.DeleteAttachmentIndex(cleanupCtx, sess.RawJWT, sess.Claims.Subject, attachmentID); err != nil {
 			deps.logError("native import attachment index cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
+			continue
 		}
 		if deps.Buckets != nil && deps.Buckets.Configured() {
 			if err := deps.Buckets.Delete(cleanupCtx, sess.Claims.Subject, attachmentID); err != nil {

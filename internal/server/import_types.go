@@ -77,8 +77,6 @@ const (
 	MaxImportJSONBytes = 256 << 20 // 256 MiB
 	// MaxImportJobErrors caps how many per-item warnings a job retains.
 	MaxImportJobErrors = 100
-	// MaxImportProjectMappings bounds native restore mappings retained in status.
-	MaxImportProjectMappings = 10_000
 )
 
 var maxImportMessages = MaxImportMessages
