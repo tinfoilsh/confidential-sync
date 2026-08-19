@@ -34,15 +34,16 @@ type ImportStatusRequest struct {
 }
 
 type ImportStatusResponse struct {
-	Status   string                      `json:"status"`
-	Phase    string                      `json:"phase,omitempty"`
-	Imported int                         `json:"imported"`
-	Failed   int                         `json:"failed"`
-	Total    int                         `json:"total"`
-	Counts   map[string]ImportKindCounts `json:"counts,omitempty"`
-	Warnings []string                    `json:"warnings,omitempty"`
-	Errors   []string                    `json:"errors,omitempty"`
-	JobID    string                      `json:"job_id,omitempty"`
+	Status          string                      `json:"status"`
+	Phase           string                      `json:"phase,omitempty"`
+	Imported        int                         `json:"imported"`
+	Failed          int                         `json:"failed"`
+	Total           int                         `json:"total"`
+	Counts          map[string]ImportKindCounts `json:"counts,omitempty"`
+	Warnings        []string                    `json:"warnings,omitempty"`
+	Errors          []string                    `json:"errors,omitempty"`
+	ProjectMappings map[string]string           `json:"project_mappings,omitempty"`
+	JobID           string                      `json:"job_id,omitempty"`
 }
 
 type ImportKindCounts struct {
@@ -76,6 +77,8 @@ const (
 	MaxImportJSONBytes = 256 << 20 // 256 MiB
 	// MaxImportJobErrors caps how many per-item warnings a job retains.
 	MaxImportJobErrors = 100
+	// MaxImportProjectMappings bounds native restore mappings retained in status.
+	MaxImportProjectMappings = 10_000
 )
 
 var maxImportMessages = MaxImportMessages

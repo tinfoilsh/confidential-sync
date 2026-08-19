@@ -56,11 +56,11 @@ type nativeBlobManifest struct {
 }
 
 type nativeProjectPayload struct {
-	Name               string `json:"name"`
-	Description        string `json:"description,omitempty"`
-	SystemInstructions string `json:"systemInstructions,omitempty"`
-	Color              string `json:"color,omitempty"`
-	Memory             string `json:"memory,omitempty"`
+	Name               string            `json:"name"`
+	Description        string            `json:"description,omitempty"`
+	SystemInstructions string            `json:"systemInstructions,omitempty"`
+	Color              string            `json:"color,omitempty"`
+	Memory             []json.RawMessage `json:"memory"`
 }
 
 type nativeDocumentPayload struct {
@@ -134,7 +134,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 	if err := decodeStrictJSON(manifestBytes, &manifest); err != nil {
 		return nil, fmt.Errorf("import: invalid manifest: %w", err)
 	}
-	if !hasJSONFields(manifestBytes, "format", "version", "source_backup_id", "entities", "blobs") || manifest.Entities == nil || manifest.Blobs == nil {
+	if !hasJSONFields(manifestBytes, "format", "version", "source_backup_id", "counts", "entities", "blobs") || manifest.Counts == nil || manifest.Entities == nil || manifest.Blobs == nil {
 		return nil, errors.New("import: manifest is missing required fields")
 	}
 	if manifest.Counts != nil {
@@ -201,7 +201,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 		switch entity.Kind {
 		case "project":
 			var payload nativeProjectPayload
-			if err := decodeStrictJSON(data, &payload); err != nil || payload.Name == "" {
+			if err := decodeStrictJSON(data, &payload); err != nil || !hasJSONFields(data, "name", "memory") || payload.Name == "" || payload.Memory == nil {
 				return nil, errors.New("import: invalid project payload")
 			}
 			out.projects = append(out.projects, validatedNativeProject{meta: entity, payload: payload})
@@ -293,6 +293,15 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 		if chat.meta.ProjectSourceID != "" && !projectIDs[chat.meta.ProjectSourceID] {
 			return nil, errors.New("import: chat references unknown project")
 		}
+		for _, message := range chat.payload.Messages {
+			for _, attachment := range message.Attachments {
+				if attachment.ArchivePath != "" {
+					if _, ok := out.blobs[attachment.ArchivePath]; !ok {
+						return nil, errors.New("import: attachment references unknown blob")
+					}
+				}
+			}
+		}
 	}
 	for name := range arch.files {
 		if !listedPaths[name] {
@@ -375,14 +384,14 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 	job.setKindCount("chat", ImportKindCounts{})
 	job.setPhase("projects")
 	for _, project := range backup.projects {
-		id, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "project", project.meta.SourceID, "", func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, error) {
+		id, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "project", project.meta.SourceID, "", func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, []string, error) {
 			payload := map[string]any{
 				"id": id, "name": project.payload.Name, "description": project.payload.Description,
 				"systemInstructions": project.payload.SystemInstructions, "color": project.payload.Color,
 				"memory": project.payload.Memory, "_restore": marker,
 			}
 			body, err := json.Marshal(payload)
-			return body, nil, err
+			return body, nil, nil, err
 		})
 		if err != nil {
 			projectCounts.Failed++
@@ -390,6 +399,7 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 			job.addError("project failed")
 		} else {
 			projects[project.meta.SourceID] = id
+			job.setProjectMapping(project.meta.SourceID, id)
 			incrementOutcome(&projectCounts, outcome)
 		}
 		job.setKindCount("project", projectCounts)
@@ -404,14 +414,14 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 			job.setKindCount("document", documentCounts)
 			continue
 		}
-		_, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "document", document.meta.SourceID, projectID, func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, error) {
+		_, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "document", document.meta.SourceID, projectID, func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, []string, error) {
 			payload := map[string]any{
 				"id": id, "projectId": projectID, "filename": document.payload.Filename,
 				"contentType": document.payload.ContentType, "sourceSizeBytes": document.payload.SourceSizeBytes,
 				"sizeBytes": document.payload.SizeBytes, "content": document.payload.Content, "_restore": marker,
 			}
 			body, err := json.Marshal(payload)
-			return body, nil, err
+			return body, nil, nil, err
 		})
 		if err != nil {
 			documentCounts.Failed++
@@ -435,13 +445,13 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 				continue
 			}
 		}
-		_, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "chat", chat.meta.SourceID, "", func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, error) {
-			payload, err := buildNativeChatPayload(ctx, deps, sess, arch, backup, job, id, projectID, marker, chat.payload)
+		_, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "chat", chat.meta.SourceID, "", func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, []string, error) {
+			payload, attachmentIDs, err := buildNativeChatPayload(ctx, deps, sess, arch, backup, job, id, projectID, marker, chat.payload)
 			metadata := map[string]any{"messageCount": len(chat.payload.Messages)}
 			if projectID != "" {
 				metadata["projectId"] = projectID
 			}
-			return payload, metadata, err
+			return payload, metadata, attachmentIDs, err
 		})
 		if err != nil {
 			chatCounts.Failed++
@@ -476,7 +486,7 @@ func incrementOutcome(counts *ImportKindCounts, outcome restoreOutcome) {
 	}
 }
 
-func restoreNativeEntity(ctx context.Context, deps Deps, sess Session, cekB64, backupID, kind, sourceID, projectID string, build func(string, importer.RestoreMarker) ([]byte, map[string]any, error)) (string, restoreOutcome, error) {
+func restoreNativeEntity(ctx context.Context, deps Deps, sess Session, cekB64, backupID, kind, sourceID, projectID string, build func(string, importer.RestoreMarker) ([]byte, map[string]any, []string, error)) (string, restoreOutcome, error) {
 	scope := kind
 	if kind == "document" {
 		scope = "project_document"
@@ -498,8 +508,9 @@ func restoreNativeEntity(ctx context.Context, deps Deps, sess Session, cekB64, b
 		if occupied {
 			continue
 		}
-		plaintext, metadata, err := build(mappedID, marker)
+		plaintext, metadata, attachmentIDs, err := build(mappedID, marker)
 		if err != nil {
+			cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
 			return "", restoreImported, err
 		}
 		_, err = Push(ctx, deps, sess, PushRequest{
@@ -514,8 +525,10 @@ func restoreNativeEntity(ctx context.Context, deps Deps, sess Session, cekB64, b
 			if verifyErr == nil && match {
 				return mappedID, restoreSkipped, nil
 			}
+			cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
 			continue
 		}
+		cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
 		return "", restoreImported, err
 	}
 	return "", restoreImported, errors.New("import: restore id generations exhausted")
@@ -563,9 +576,10 @@ func restoreIdemKey(userID, backupID, kind, sourceID string, generation int) str
 	return hex.EncodeToString(sum[:16])
 }
 
-func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *importArchive, backup *validatedNativeBackup, job *ImportJobState, chatID, projectID string, marker importer.RestoreMarker, input nativeChatPayload) ([]byte, error) {
+func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *importArchive, backup *validatedNativeBackup, job *ImportJobState, chatID, projectID string, marker importer.RestoreMarker, input nativeChatPayload) ([]byte, []string, error) {
 	messages := make([]map[string]any, 0, len(input.Messages))
 	attachmentIndex := 0
+	var attachmentIDs []string
 	for _, message := range input.Messages {
 		out := map[string]any{"role": message.Role, "content": message.Content}
 		if len(message.Timestamp) > 0 {
@@ -611,6 +625,7 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 					continue
 				}
 				stored["id"] = putResp.ID
+				attachmentIDs = append(attachmentIDs, putResp.ID)
 				stored["encryptionKey"] = putResp.AttKey
 				stored["mimeType"] = contentType
 			}
@@ -628,7 +643,26 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 	if projectID != "" {
 		payload["projectId"] = projectID
 	}
-	return json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	return body, attachmentIDs, err
+}
+
+func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, attachmentIDs []string) {
+	if len(attachmentIDs) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsRollbackTimeout)
+	defer cancel()
+	for _, attachmentID := range attachmentIDs {
+		if err := deps.Controlplane.DeleteAttachmentIndex(cleanupCtx, sess.RawJWT, sess.Claims.Subject, attachmentID); err != nil {
+			deps.logError("native import attachment index cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
+		}
+		if deps.Buckets != nil && deps.Buckets.Configured() {
+			if err := deps.Buckets.Delete(cleanupCtx, sess.Claims.Subject, attachmentID); err != nil {
+				deps.logError("native import attachment blob cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
+			}
+		}
+	}
 }
 
 func addOptionalString(payload map[string]any, name, value string) {

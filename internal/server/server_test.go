@@ -83,6 +83,8 @@ type cpStub struct {
 	mux              *http.ServeMux
 	server           *httptest.Server
 	registerHandler  func(w http.ResponseWriter, r *http.Request)
+	beforePutBlob    func(scope, id string)
+	putBlobFailures  map[string]int
 	captureHeaders   func(r *http.Request)
 }
 
@@ -108,6 +110,7 @@ func newCPStub(t *testing.T) *cpStub {
 		bundles:           map[string]map[string]controlplane.CurrentKeyBundle{},
 		registeredOps:     map[string]bool{},
 		migrationFailures: map[string]int{},
+		putBlobFailures:   map[string]int{},
 	}
 	st.mux = http.NewServeMux()
 	st.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +207,14 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := s.extractID(scope, r)
 		key := s.putBlobKey(scope, id)
+		if s.beforePutBlob != nil {
+			s.beforePutBlob(scope, id)
+		}
+		if s.putBlobFailures[key] > 0 {
+			s.putBlobFailures[key]--
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		ifMatch := r.Header.Get("If-Match")
 		blob := s.blobs[key]
 		if scope == "profile" && blob != nil && s.minimumProfileSyncProtocol > 0 {

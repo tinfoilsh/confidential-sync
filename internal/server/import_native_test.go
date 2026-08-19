@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"os"
 	"testing"
 )
 
@@ -17,12 +19,26 @@ type nativeTestEntity struct {
 	payload         []byte
 }
 
+type nativeContractFixture struct {
+	SourceBackupID string `json:"source_backup_id"`
+	Entities       []struct {
+		Kind            string          `json:"kind"`
+		SourceID        string          `json:"source_id"`
+		ProjectSourceID string          `json:"project_source_id"`
+		Payload         json.RawMessage `json:"payload"`
+	} `json:"entities"`
+	Blobs []struct {
+		Path   string `json:"path"`
+		Base64 string `json:"base64"`
+	} `json:"blobs"`
+}
+
 func TestNativeBackupRestoresGraphAttachmentsAndSkipsRetry(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 	png := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x42}, 64)...)
 	archive := nativeTestArchive(t, "backup-1", []nativeTestEntity{
-		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Research","description":"notes","systemInstructions":"be exact","color":"blue","memory":"facts"}`)},
+		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Research","description":"notes","systemInstructions":"be exact","color":"blue","memory":[{"id":"fact-1","fact":"facts","date":"2024-01-01T00:00:00.000Z","category":"note","confidence":1}]}`)},
 		{kind: "document", sourceID: "d1", projectSourceID: "p1", path: "entities/document.json", payload: []byte(`{"filename":"brief.txt","contentType":"text/plain","sourceSizeBytes":5,"sizeBytes":5,"content":"hello"}`)},
 		{kind: "chat", sourceID: "c1", projectSourceID: "p1", path: "entities/chat.json", payload: []byte(`{"title":"Plan","messages":[{"role":"user","content":"look","timestamp":"2024-01-01T00:00:00.000Z","attachments":[{"type":"image","fileName":"image.png","mimeType":"image/png","fileSize":72,"archivePath":"blobs/image.png"}]}],"createdAt":"2024-01-01T00:00:00.000Z","isLocalOnly":false}`)},
 	}, map[string][]byte{"blobs/image.png": png}, nil)
@@ -49,6 +65,13 @@ func TestNativeBackupRestoresGraphAttachmentsAndSkipsRetry(t *testing.T) {
 	if chatPayload["projectId"] != projectID || chatPayload["_restore"] == nil {
 		t.Fatalf("restored chat payload is missing mapped metadata: %+v", chatPayload)
 	}
+	projectPayload := decryptNativeTestBlob(t, f, "project", projectID)
+	if memory, ok := projectPayload["memory"].([]any); !ok || len(memory) != 1 {
+		t.Fatalf("project memory was not preserved as an array: %+v", projectPayload["memory"])
+	}
+	if snap.ProjectMappings["p1"] != projectID {
+		t.Fatalf("project mapping missing from status: %+v", snap.ProjectMappings)
+	}
 
 	retry := runNativeTestArchive(t, f, archive)
 	retrySnap := retry.Snapshot()
@@ -60,11 +83,53 @@ func TestNativeBackupRestoresGraphAttachmentsAndSkipsRetry(t *testing.T) {
 	}
 }
 
+func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
+	fixtureBytes, err := os.ReadFile("testdata/native-cloud-import-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture nativeContractFixture
+	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	entities := make([]nativeTestEntity, 0, len(fixture.Entities))
+	for index, entity := range fixture.Entities {
+		entities = append(entities, nativeTestEntity{
+			kind: entity.Kind, sourceID: entity.SourceID, projectSourceID: entity.ProjectSourceID,
+			path: fmt.Sprintf("entities/%s/%d.json", entity.Kind, index), payload: entity.Payload,
+		})
+	}
+	blobs := make(map[string][]byte, len(fixture.Blobs))
+	for _, blob := range fixture.Blobs {
+		data, err := base64.StdEncoding.DecodeString(blob.Base64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blobs[blob.Path] = data
+	}
+	archive := nativeTestArchive(t, fixture.SourceBackupID, entities, blobs, nil)
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
+	if err := arch.validateAndIndex("tinfoil_backup"); err != nil {
+		t.Fatal(err)
+	}
+	validated, err := validateNativeBackup(arch)
+	if err != nil {
+		t.Fatalf("web contract fixture failed validation: %v", err)
+	}
+	if len(validated.projects) != 1 || len(validated.documents) != 1 || len(validated.chats) != 1 || len(validated.blobs) != 1 {
+		t.Fatalf("unexpected validated fixture: %+v", validated)
+	}
+}
+
 func TestNativeBackupValidatesEverythingBeforeWrites(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 	archive := nativeTestArchive(t, "backup-invalid", []nativeTestEntity{
-		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Valid"}`)},
+		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Valid","memory":[]}`)},
 		{kind: "chat", sourceID: "c1", path: "entities/chat.json", payload: []byte(`{"title":"Local","messages":[],"createdAt":"2024-01-01T00:00:00.000Z","isLocalOnly":true}`)},
 	}, nil, nil)
 	job := stageArchive(t, f, "tinfoil_backup", archive)
@@ -78,7 +143,7 @@ func TestNativeBackupValidatesEverythingBeforeWrites(t *testing.T) {
 }
 
 func TestNativeBackupRejectsManifestAndArchiveMismatches(t *testing.T) {
-	entity := nativeTestEntity{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Valid"}`)}
+	entity := nativeTestEntity{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Valid","memory":[]}`)}
 	tests := []struct {
 		name   string
 		mutate func(*nativeManifest)
@@ -122,7 +187,7 @@ func TestNativeBackupAdvancesCollisionsAndBlocksDependents(t *testing.T) {
 		f.cp.blobs["project/"+id] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: []byte("foreign")}
 	}
 	archive := nativeTestArchive(t, "backup-blocked", []nativeTestEntity{
-		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Blocked"}`)},
+		{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Blocked","memory":[]}`)},
 		{kind: "document", sourceID: "d1", projectSourceID: "p1", path: "entities/document.json", payload: []byte(`{"filename":"doc.txt","contentType":"text/plain","sourceSizeBytes":1,"sizeBytes":1,"content":"x"}`)},
 		{kind: "chat", sourceID: "c1", projectSourceID: "p1", path: "entities/chat.json", payload: []byte(`{"title":"Blocked","messages":[],"createdAt":"2024-01-01T00:00:00.000Z","isLocalOnly":false}`)},
 	}, nil, nil)
@@ -141,6 +206,80 @@ func TestMappedRestoreIDsAreUserScoped(t *testing.T) {
 	if first == mappedRestoreID("user-a", "backup", "chat", "source", 1) {
 		t.Fatal("different generations must receive different ids")
 	}
+}
+
+func TestNativeBackupCleansAttachmentsAfterChatPushFailure(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	backupID := "backup-push-failure"
+	chatID := mappedRestoreID(f.userSub, backupID, "chat", "c1", 0)
+	f.cp.putBlobFailures["chat/"+chatID] = 100
+	archive, image := nativeAttachmentTestArchive(t, backupID)
+
+	job := runNativeTestArchive(t, f, archive)
+	if job.Snapshot().Counts["chat"].Failed != 1 {
+		t.Fatalf("expected failed chat: %+v", job.Snapshot())
+	}
+	attachmentID, _, err := deriveAttachmentMaterials(attachmentIdemKey(chatID, "blobs/image.png", 0), chatID, f.userSub, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, indexed := f.cp.attachmentIndex[attachmentID]; indexed || f.bk.has(attachmentID) {
+		t.Fatal("failed chat left a tentative attachment index or blob")
+	}
+}
+
+func TestNativeBackupCleansAttachmentsBeforeCollisionRetry(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	backupID := "backup-collision"
+	firstChatID := mappedRestoreID(f.userSub, backupID, "chat", "c1", 0)
+	secondChatID := mappedRestoreID(f.userSub, backupID, "chat", "c1", 1)
+	f.cp.beforePutBlob = func(scope, id string) {
+		if scope == "chat" && id == firstChatID {
+			f.cp.blobs["chat/"+id] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: []byte("foreign")}
+			f.cp.beforePutBlob = nil
+		}
+	}
+	archive, image := nativeAttachmentTestArchive(t, backupID)
+
+	job := runNativeTestArchive(t, f, archive)
+	if job.Snapshot().Counts["chat"].Imported != 1 || f.cp.blobs["chat/"+secondChatID] == nil {
+		t.Fatalf("collision retry did not commit the next candidate: %+v", job.Snapshot())
+	}
+	firstAttachmentID, _, err := deriveAttachmentMaterials(attachmentIdemKey(firstChatID, "blobs/image.png", 0), firstChatID, f.userSub, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAttachmentID, _, err := deriveAttachmentMaterials(attachmentIdemKey(secondChatID, "blobs/image.png", 0), secondChatID, f.userSub, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, indexed := f.cp.attachmentIndex[firstAttachmentID]; indexed || f.bk.has(firstAttachmentID) {
+		t.Fatal("colliding candidate left a tentative attachment index or blob")
+	}
+	if f.cp.attachmentIndex[secondAttachmentID] != secondChatID || !f.bk.has(secondAttachmentID) {
+		t.Fatal("committed collision retry attachment was not preserved")
+	}
+}
+
+func TestNativeProjectMappingsAreBounded(t *testing.T) {
+	job := &ImportJobState{}
+	for index := 0; index <= MaxImportProjectMappings; index++ {
+		job.setProjectMapping(fmt.Sprintf("source-%d", index), fmt.Sprintf("destination-%d", index))
+	}
+	if got := len(job.Snapshot().ProjectMappings); got != MaxImportProjectMappings {
+		t.Fatalf("project mapping count = %d, want %d", got, MaxImportProjectMappings)
+	}
+}
+
+func nativeAttachmentTestArchive(t *testing.T, backupID string) ([]byte, []byte) {
+	t.Helper()
+	image := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x42}, 64)...)
+	archive := nativeTestArchive(t, backupID, []nativeTestEntity{
+		{kind: "chat", sourceID: "c1", path: "entities/chat.json", payload: []byte(`{"title":"Image","messages":[{"role":"user","content":"look","timestamp":"2024-01-01T00:00:00.000Z","attachments":[{"type":"image","fileName":"image.png","mimeType":"image/png","fileSize":72,"archivePath":"blobs/image.png"}]}],"createdAt":"2024-01-01T00:00:00.000Z","isLocalOnly":false}`)},
+	}, map[string][]byte{"blobs/image.png": image}, nil)
+	return archive, image
 }
 
 func runNativeTestArchive(t *testing.T, f *fixture, archive []byte) *ImportJobState {

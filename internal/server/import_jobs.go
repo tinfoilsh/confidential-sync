@@ -49,34 +49,36 @@ type ImportJobState struct {
 	ArchiveSHA256 string
 	StartedAt     time.Time
 
-	mu         sync.Mutex
-	stagingKey []byte
-	received   map[int]string
-	cek        []byte
-	status     ImportJobStatus
-	imported   int
-	failed     int
-	total      int
-	phase      string
-	counts     map[string]ImportKindCounts
-	warnings   []string
-	errs       []string
-	startedRun bool
-	updatedAt  time.Time
+	mu              sync.Mutex
+	stagingKey      []byte
+	received        map[int]string
+	cek             []byte
+	status          ImportJobStatus
+	imported        int
+	failed          int
+	total           int
+	phase           string
+	counts          map[string]ImportKindCounts
+	projectMappings map[string]string
+	warnings        []string
+	errs            []string
+	startedRun      bool
+	updatedAt       time.Time
 
 	done chan struct{}
 }
 
 type ImportJobSnapshot struct {
-	ID       string
-	Status   ImportJobStatus
-	Imported int
-	Failed   int
-	Total    int
-	Phase    string
-	Counts   map[string]ImportKindCounts
-	Warnings []string
-	Errors   []string
+	ID              string
+	Status          ImportJobStatus
+	Imported        int
+	Failed          int
+	Total           int
+	Phase           string
+	Counts          map[string]ImportKindCounts
+	Warnings        []string
+	Errors          []string
+	ProjectMappings map[string]string
 }
 
 func (j *ImportJobState) Snapshot() ImportJobSnapshot {
@@ -88,16 +90,21 @@ func (j *ImportJobState) Snapshot() ImportJobSnapshot {
 	for kind, count := range j.counts {
 		counts[kind] = count
 	}
+	projectMappings := make(map[string]string, len(j.projectMappings))
+	for sourceID, destinationID := range j.projectMappings {
+		projectMappings[sourceID] = destinationID
+	}
 	return ImportJobSnapshot{
-		ID:       j.ID,
-		Status:   j.status,
-		Imported: j.imported,
-		Failed:   j.failed,
-		Total:    j.total,
-		Phase:    j.phase,
-		Counts:   counts,
-		Warnings: warnings,
-		Errors:   errs,
+		ID:              j.ID,
+		Status:          j.status,
+		Imported:        j.imported,
+		Failed:          j.failed,
+		Total:           j.total,
+		Phase:           j.phase,
+		Counts:          counts,
+		Warnings:        warnings,
+		Errors:          errs,
+		ProjectMappings: projectMappings,
 	}
 }
 
@@ -188,6 +195,19 @@ func (j *ImportJobState) setKindCount(kind string, count ImportKindCounts) {
 		j.counts = make(map[string]ImportKindCounts)
 	}
 	j.counts[kind] = count
+	j.updatedAt = time.Now().UTC()
+}
+
+func (j *ImportJobState) setProjectMapping(sourceID, destinationID string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.projectMappings == nil {
+		j.projectMappings = make(map[string]string)
+	}
+	if len(j.projectMappings) >= MaxImportProjectMappings {
+		return
+	}
+	j.projectMappings[sourceID] = destinationID
 	j.updatedAt = time.Now().UTC()
 }
 
