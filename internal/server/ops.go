@@ -601,6 +601,39 @@ func deleteOnce(ctx context.Context, deps Deps, sess Session, req DeleteRequest,
 	return &OKResponse{OK: true}, cpResp, nil
 }
 
+func DeleteAllProjects(ctx context.Context, deps Deps, sess Session, req DeleteAllProjectsRequest) (*DeleteAllProjectsResponse, error) {
+	if req.IdempotencyKey == "" {
+		return nil, badRequest("idempotency_key is required")
+	}
+	key, err := decodeKey(req.Key)
+	if err != nil {
+		return nil, badRequest("invalid key: " + err.Error())
+	}
+	defer cryptopkg.Zero(key)
+
+	kidBytes, err := cryptopkg.DeriveKeyID(key)
+	if err != nil {
+		return nil, err
+	}
+	kidHex := cryptopkg.KeyIDHex(kidBytes)
+	opHash, err := operationHashForKey(key, http.MethodDelete, controlplane.DeleteAllProjectsPath, kidHex, req.IdempotencyKey, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := deps.Controlplane.DeleteAllProjects(ctx, controlplane.DeleteAllProjectsRequest{
+		JWT:            sess.RawJWT,
+		ClerkUserID:    sess.Claims.Subject,
+		KeyIDHex:       kidHex,
+		IdempotencyKey: req.IdempotencyKey,
+		OperationHash:  opHash,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DeleteAllProjectsResponse{OK: true, Deleted: resp.Deleted}, nil
+}
+
 func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRequest) (*KeyRegisterResponse, error) {
 	switch req.CreatedVia {
 	case "passkey", "manual", "recovery", "start_fresh":

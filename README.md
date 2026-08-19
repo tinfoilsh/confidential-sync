@@ -90,6 +90,7 @@ All authenticated `/v1` routes require a Clerk-issued Bearer JWT in the `Authori
 | `POST` | `/v1/sync/revision-events` | yes | Replay paginated metadata changes across a bounded revision window. |
 | `POST` | `/v1/sync/revision-snapshot` | yes | Read a paginated metadata snapshot at a stable revision. |
 | `POST` | `/v1/sync/delete` | yes | Delete a stored blob, guarded by compare-and-set. |
+| `POST` | `/v1/sync/delete-all-projects` | yes | Atomically delete all projects and their documents. |
 | `POST` | `/v1/key/register` | yes | Register the per-account content encryption key. |
 | `POST` | `/v1/key/add-bundle` | yes | Add a passkey-wrapped key bundle to the account. |
 | `POST` | `/v1/key/remove-bundle` | yes | Remove a key bundle from the account. |

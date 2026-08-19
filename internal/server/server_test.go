@@ -78,6 +78,8 @@ type cpStub struct {
 	// controlplane returns the ids of the v2 attachments it nulled
 	// during the atomic wipe; tests pre-populate this slice.
 	wipedAttachments []string
+	deleteAllStatus  int
+	deleteAllCode    string
 	mux              *http.ServeMux
 	server           *httptest.Server
 	registerHandler  func(w http.ResponseWriter, r *http.Request)
@@ -142,6 +144,7 @@ func (s *cpStub) installHandlers() {
 	// DELETE blobs
 	s.mux.HandleFunc("DELETE /api/sync/blob/chat/{id}", s.handleDeleteBlob("chat"))
 	s.mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.handleDeleteBlob("project"))
+	s.mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.handleDeleteAllProjects)
 	// rewrap (separate JSON endpoint; not the PUT blob path)
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
 	// list-status + migration surface
@@ -336,6 +339,25 @@ func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
 			"source_revision":      s.sourceRevision,
 		})
 	}
+}
+
+func (s *cpStub) handleDeleteAllProjects(w http.ResponseWriter, r *http.Request) {
+	if s.deleteAllStatus != 0 {
+		w.WriteHeader(s.deleteAllStatus)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": s.deleteAllCode})
+		return
+	}
+	deleted := 0
+	for key := range s.blobs {
+		if strings.HasPrefix(key, "project/") {
+			deleted++
+		}
+		if strings.HasPrefix(key, "project/") || strings.HasPrefix(key, "project_document/") {
+			delete(s.blobs, key)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.DeleteAllProjectsResponse{OK: true, Deleted: deleted})
 }
 
 func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
@@ -1589,6 +1611,132 @@ func TestDeleteForwardsHeaders(t *testing.T) {
 	}
 	if _, ok := f.cp.blobs["chat/c"]; ok {
 		t.Fatalf("blob not deleted")
+	}
+}
+
+func TestDeleteAllProjectsRouteAndWireContract(t *testing.T) {
+	f := newFixture(t)
+	f.cp.mu.Lock()
+	f.cp.blobs["project/project-1"] = &cpBlob{}
+	f.cp.blobs["project/project-2"] = &cpBlob{}
+	f.cp.blobs["project_document/project-1/doc-1"] = &cpBlob{}
+	f.cp.blobs["chat/chat-1"] = &cpBlob{}
+	f.cp.mu.Unlock()
+
+	var captured *http.Request
+	f.cp.mu.Lock()
+	f.cp.captureHeaders = func(r *http.Request) { captured = r.Clone(r.Context()) }
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/sync/delete-all-projects", DeleteAllProjectsRequest{
+		Key:            f.userKeyB64,
+		IdempotencyKey: "delete-projects-1",
+	}, f.jwt())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete all projects: %d %s", resp.StatusCode, body)
+	}
+	var result DeleteAllProjectsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || result.Deleted != 2 {
+		t.Fatalf("response = %+v", result)
+	}
+	if captured == nil || captured.Method != http.MethodDelete || captured.URL.Path != controlplane.DeleteAllProjectsPath {
+		t.Fatalf("captured request = %+v", captured)
+	}
+	if captured.Header.Get(controlplane.HeaderAuth) == "" || captured.Header.Get(controlplane.HeaderClerkUserID) != f.userSub {
+		t.Fatalf("auth headers = %v", captured.Header)
+	}
+	if captured.Header.Get(controlplane.HeaderKeyID) != f.userKeyID || captured.Header.Get(controlplane.HeaderIdempotency) != "delete-projects-1" {
+		t.Fatalf("operation headers = %v", captured.Header)
+	}
+	if captured.Header.Get(controlplane.HeaderIfMatch) != "" {
+		t.Fatalf("unexpected If-Match = %q", captured.Header.Get(controlplane.HeaderIfMatch))
+	}
+	opKey, err := cryptopkg.DeriveOpHashKey(f.userKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cryptopkg.Zero(opKey)
+	wantHash := cryptopkg.ComputeOperationHash(opKey, cryptopkg.CanonicalInput{
+		Method:         http.MethodDelete,
+		Path:           controlplane.DeleteAllProjectsPath,
+		KeyIDHex:       f.userKeyID,
+		IdempotencyKey: "delete-projects-1",
+	})
+	if captured.Header.Get(controlplane.HeaderOperationHash) != wantHash {
+		t.Fatalf("operation hash = %q, want %q", captured.Header.Get(controlplane.HeaderOperationHash), wantHash)
+	}
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	if f.cp.blobs["project/project-1"] != nil || f.cp.blobs["project_document/project-1/doc-1"] != nil {
+		t.Fatal("project blobs were not deleted")
+	}
+	if f.cp.blobs["chat/chat-1"] == nil {
+		t.Fatal("non-project blob was deleted")
+	}
+}
+
+func TestDeleteAllProjectsRequiresAuthentication(t *testing.T) {
+	f := newFixture(t)
+	resp, _ := f.post("/v1/sync/delete-all-projects", DeleteAllProjectsRequest{
+		Key:            f.userKeyB64,
+		IdempotencyKey: "delete-projects-1",
+	}, "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestDeleteAllProjectsRejectsInvalidRequests(t *testing.T) {
+	f := newFixture(t)
+	token := f.jwt()
+	for name, req := range map[string]DeleteAllProjectsRequest{
+		"missing key":             {IdempotencyKey: "delete-projects-1"},
+		"malformed key":           {Key: "not-base64", IdempotencyKey: "delete-projects-1"},
+		"missing idempotency key": {Key: f.userKeyB64},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, body := f.post("/v1/sync/delete-all-projects", req, token)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+			}
+		})
+	}
+
+	httpReq, _ := http.NewRequest(http.MethodPost, f.server.URL+"/v1/sync/delete-all-projects", strings.NewReader(`{"key":`))
+	httpReq.Header.Set(controlplane.HeaderAuth, "Bearer "+token)
+	httpReq.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed JSON status = %d", resp.StatusCode)
+	}
+}
+
+func TestDeleteAllProjectsForwardsUpstreamError(t *testing.T) {
+	f := newFixture(t)
+	f.cp.mu.Lock()
+	f.cp.deleteAllStatus = http.StatusConflict
+	f.cp.deleteAllCode = controlplane.StatusIdempotencyConflict
+	f.cp.mu.Unlock()
+	resp, body := f.post("/v1/sync/delete-all-projects", DeleteAllProjectsRequest{
+		Key:            f.userKeyB64,
+		IdempotencyKey: "delete-projects-1",
+	}, f.jwt())
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	var appErr AppError
+	if err := json.Unmarshal(body, &appErr); err != nil {
+		t.Fatal(err)
+	}
+	if appErr.Code != CodeIdempotencyConflict {
+		t.Fatalf("error = %+v", appErr)
 	}
 }
 

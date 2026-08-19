@@ -131,6 +131,16 @@ type DeleteRequest struct {
 	Key string `json:"key"`
 }
 
+type DeleteAllProjectsRequest struct {
+	Key            string `json:"key"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type DeleteAllProjectsResponse struct {
+	OK      bool `json:"ok"`
+	Deleted int  `json:"deleted"`
+}
+
 type OKResponse struct {
 	OK bool `json:"ok"`
 }

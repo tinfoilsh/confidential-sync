@@ -86,6 +86,7 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/sync/revision-events", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionEvents) }},
 		{"POST", "/v1/sync/revision-snapshot", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionSnapshot) }},
 		{"POST", "/v1/sync/delete", func(h *Handler) http.Handler { return h.authMiddleware(h.delete) }},
+		{"POST", "/v1/sync/delete-all-projects", func(h *Handler) http.Handler { return h.authMiddleware(h.deleteAllProjects) }},
 
 		{"POST", "/v1/key/register", func(h *Handler) http.Handler { return h.authMiddleware(h.registerKey) }},
 		{"POST", "/v1/key/add-bundle", func(h *Handler) http.Handler { return h.authMiddleware(h.addBundle) }},
@@ -405,6 +406,20 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request, sess Session) {
 		return
 	}
 	resp, err := Delete(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) deleteAllProjects(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req DeleteAllProjectsRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := DeleteAllProjects(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return
