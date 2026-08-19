@@ -162,6 +162,12 @@
                 ]
               }
             ]
+          },
+          {
+            "role": "assistant",
+            "content": "hello",
+            "timestamp": "2026-08-18T12:00:04.250Z",
+            "thinkingDuration": 4.25
           }
         ],
         "createdAt": "2026-08-18T12:00:00.000Z"

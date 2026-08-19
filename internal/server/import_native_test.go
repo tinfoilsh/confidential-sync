@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
 type nativeTestEntity struct {
@@ -141,7 +143,7 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 		}
 	}
 	messages, ok := payload["messages"].([]any)
-	if !ok || len(messages) != 1 {
+	if !ok || len(messages) != 2 {
 		t.Fatalf("messages were not preserved: %#v", payload["messages"])
 	}
 	message, ok := messages[0].(map[string]any)
@@ -161,6 +163,10 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 			t.Fatalf("message field %s was lost", field)
 		}
 	}
+	fractionalMessage, ok := messages[1].(map[string]any)
+	if !ok || fractionalMessage["thinkingDuration"] != float64(4.25) {
+		t.Fatalf("fractional thinking duration was not preserved: %#v", messages[1])
+	}
 	attachments, ok := message["attachments"].([]any)
 	if !ok || len(attachments) != 2 {
 		t.Fatalf("attachments were not preserved: %#v", message["attachments"])
@@ -175,6 +181,46 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 	}
 	if payload["codeExecutionAccessToken"] != nil || payload["syncUserId"] != nil {
 		t.Fatalf("transient or secret fields reached storage: %#v", payload)
+	}
+}
+
+func TestNativeMessageThinkingDurationRoundTrip(t *testing.T) {
+	for _, value := range []string{"4", "4.25"} {
+		t.Run(value, func(t *testing.T) {
+			input := []byte(fmt.Sprintf(`{"title":"Chat","messages":[{"role":"assistant","content":"done","timestamp":"2026-08-18T12:00:00Z","thinkingDuration":%s}],"createdAt":"2026-08-18T12:00:00Z","isLocalOnly":false}`, value))
+			var chat nativeChatPayload
+			if err := decodeStrictJSON(input, &chat); err != nil {
+				t.Fatal(err)
+			}
+			if got := chat.Messages[0].ThinkingDuration.String(); got != value {
+				t.Fatalf("decoded thinking duration = %q, want %q", got, value)
+			}
+
+			output, _, err := buildNativeChatPayload(context.Background(), Deps{}, Session{}, nil, nil, nil, "chat-1", "", importer.RestoreMarker{}, chat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored struct {
+				Messages []map[string]json.RawMessage `json:"messages"`
+			}
+			if err := json.Unmarshal(output, &restored); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(restored.Messages[0]["thinkingDuration"]); got != value {
+				t.Fatalf("restored thinking duration = %q, want %q", got, value)
+			}
+		})
+	}
+}
+
+func TestNativeMessageRejectsInvalidThinkingDurationTypes(t *testing.T) {
+	for _, value := range []string{`"4"`, `true`, `{}`, `[]`, `null`} {
+		t.Run(value, func(t *testing.T) {
+			var message nativeMessagePayload
+			if err := json.Unmarshal([]byte(fmt.Sprintf(`{"role":"assistant","content":"done","timestamp":"2026-08-18T12:00:00Z","thinkingDuration":%s}`, value)), &message); err == nil {
+				t.Fatalf("expected thinking duration %s to be rejected", value)
+			}
+		})
 	}
 }
 

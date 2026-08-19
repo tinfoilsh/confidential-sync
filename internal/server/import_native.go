@@ -88,7 +88,7 @@ type nativeMessagePayload struct {
 	Attachments      []nativeAttachmentPayload  `json:"attachments,omitempty"`
 	Timestamp        json.RawMessage            `json:"timestamp"`
 	Thoughts         string                     `json:"thoughts,omitempty"`
-	ThinkingDuration int                        `json:"thinkingDuration,omitempty"`
+	ThinkingDuration json.Number                `json:"thinkingDuration,omitempty"`
 	Raw              map[string]json.RawMessage `json:"-"`
 }
 
@@ -125,6 +125,17 @@ func (p *nativeMessagePayload) UnmarshalJSON(data []byte) error {
 	}
 	if err := json.Unmarshal(data, &value.Raw); err != nil {
 		return err
+	}
+	if raw, ok := value.Raw["thinkingDuration"]; ok {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var duration any
+		if err := decoder.Decode(&duration); err != nil {
+			return err
+		}
+		if _, ok := duration.(json.Number); !ok {
+			return errors.New("thinkingDuration must be a JSON number")
+		}
 	}
 	*p = nativeMessagePayload(value)
 	return nil
