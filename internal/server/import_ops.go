@@ -48,14 +48,17 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	}
 	job.setPhase("chats")
 
+	priorIDs := make(map[string]string)
 	opts := importer.Options{
 		Index: arch.entryIndex(),
 		GenerateID: func(stableKey string, createdAt time.Time) string {
-			return deterministicChatID(sess.Claims.Subject, importer.Source(job.Source), stableKey, createdAt)
+			id := deterministicChatID(sess.Claims.Subject, importer.Source(job.Source), stableKey, createdAt)
+			priorIDs[id] = priorDeterministicChatID(importer.Source(job.Source), stableKey, createdAt)
+			return id
 		},
 	}
 
-	var imported, failed, conversations, messages, parsedAttachments, uploadedAttachments int
+	var imported, skipped, failed, conversations, messages, parsedAttachments, uploadedAttachments int
 	emit := func(chat *importer.Chat) error {
 		conversations++
 		if conversations > MaxImportConversations {
@@ -75,6 +78,16 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
 			Kind: "chat", SourceID: chat.StableKey, Generation: 0,
 		}
+		priorImport, err := priorImportedChatExists(ctx, deps, sess, cekB64, priorIDs[chat.ID])
+		if err != nil {
+			return err
+		}
+		if priorImport {
+			skipped++
+			job.setProgress(imported, failed, conversations)
+			job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
+			return nil
+		}
 		if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, &uploadedAttachments); err != nil {
 			failed++
 			job.addError("chat failed")
@@ -82,7 +95,7 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 			imported++
 		}
 		job.setProgress(imported, failed, conversations)
-		job.setKindCount("chat", ImportKindCounts{Imported: imported, Failed: failed})
+		job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
 		return nil
 	}
 
@@ -91,7 +104,7 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	}
 
 	job.setProgress(imported, failed, conversations)
-	job.setKindCount("chat", ImportKindCounts{Imported: imported, Failed: failed})
+	job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
 	job.setPhase("complete")
 	notifyImportComplete(ctx, deps, sess.Claims.Subject, job.ID, job.Source, imported, failed)
 	return nil
@@ -218,6 +231,14 @@ func allowedImageMIME(contentType string) bool {
 }
 
 func deterministicChatID(userID string, source importer.Source, stableKey string, createdAt time.Time) string {
+	return formattedDeterministicChatID("import-id:"+userID+":"+string(source)+":"+stableKey, createdAt)
+}
+
+func priorDeterministicChatID(source importer.Source, stableKey string, createdAt time.Time) string {
+	return formattedDeterministicChatID("import-id:"+string(source)+":"+stableKey, createdAt)
+}
+
+func formattedDeterministicChatID(hashInput string, createdAt time.Time) string {
 	ms := int64(0)
 	if !createdAt.IsZero() {
 		ms = createdAt.UnixMilli()
@@ -226,10 +247,31 @@ func deterministicChatID(userID string, source importer.Source, stableKey string
 	if rev < 0 {
 		rev = 0
 	}
-	sum := sha256.Sum256([]byte("import-id:" + userID + ":" + string(source) + ":" + stableKey))
+	sum := sha256.Sum256([]byte(hashInput))
 	h := hex.EncodeToString(sum[:])
 	uuidish := fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 	return fmt.Sprintf("%013d_%s", rev, uuidish)
+}
+
+func priorImportedChatExists(ctx context.Context, deps Deps, sess Session, cekB64, id string) (bool, error) {
+	resp, err := Pull(ctx, deps, sess, PullRequest{Scope: "chat", IDs: []string{id}, Keys: []PullKey{{Key: cekB64}}})
+	if err != nil {
+		return false, err
+	}
+	if len(resp.Items) != 1 {
+		return false, errors.New("import: invalid prior import probe response")
+	}
+	item := resp.Items[0]
+	if item.OK {
+		return true, nil
+	}
+	if item.Code == "NOT_FOUND" {
+		return false, nil
+	}
+	if item.Code == CodeNetwork {
+		return false, errors.New("import: prior import probe failed")
+	}
+	return true, nil
 }
 
 func chatIdemKey(chatID string) string {
