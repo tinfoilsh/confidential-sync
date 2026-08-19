@@ -152,7 +152,7 @@ func TestImportJobSkipsUnsupportedBinaryDocument(t *testing.T) {
 	if len(f.cp.attachmentIndex) != 0 {
 		t.Fatalf("expected unsupported binary document to skip attachment upload, got %d", len(f.cp.attachmentIndex))
 	}
-	if len(snap.Errors) == 0 {
+	if len(snap.Warnings) == 0 {
 		t.Fatal("expected warning for skipped binary document")
 	}
 }
@@ -179,7 +179,7 @@ func TestImportJobSkipsUnresolvedTinfoilImages(t *testing.T) {
 	if len(f.cp.attachmentIndex) != 0 {
 		t.Fatalf("expected unresolved image to skip attachment upload, got %d", len(f.cp.attachmentIndex))
 	}
-	if len(snap.Errors) == 0 {
+	if len(snap.Warnings) == 0 {
 		t.Fatal("expected warning for skipped unresolved image")
 	}
 }

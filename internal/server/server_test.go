@@ -231,12 +231,19 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 			nextETag = blob.ETag + 1
 		}
 		updatedAt := time.Now().UTC()
-		s.blobs[key] = &cpBlob{
+		stored := &cpBlob{
 			ETag:      nextETag,
 			KeyID:     r.Header.Get("X-Key-Id"),
 			Body:      body,
 			UpdatedAt: updatedAt,
 		}
+		if scope == "chat" && r.Header.Get(controlplane.HeaderProjectIDSet) == "1" {
+			stored.ProjectIDSet = true
+			if projectID := r.Header.Get(controlplane.HeaderProjectID); projectID != "" {
+				stored.ProjectID = &projectID
+			}
+		}
+		s.blobs[key] = stored
 		if scope == "chat" {
 			s.sourceRevision++
 			s.revisions = append(s.revisions, controlplane.RevisionEvent{

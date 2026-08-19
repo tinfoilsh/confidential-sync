@@ -15,9 +15,10 @@ import (
 type Source string
 
 const (
-	SourceChatGPT Source = "chatgpt"
-	SourceClaude  Source = "claude"
-	SourceTinfoil Source = "tinfoil"
+	SourceChatGPT       Source = "chatgpt"
+	SourceClaude        Source = "claude"
+	SourceTinfoil       Source = "tinfoil"
+	SourceTinfoilBackup Source = "tinfoil_backup"
 )
 
 // jsTime marshals to the same ISO-8601 string the browser produces for
@@ -75,15 +76,24 @@ type Message struct {
 
 // Chat mirrors the webapp StoredChat shape the cloud seal expects.
 type Chat struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Messages    []Message `json:"messages"`
-	CreatedAt   jsTime    `json:"createdAt"`
-	IsLocalOnly bool      `json:"isLocalOnly"`
-	ProjectID   string    `json:"projectId,omitempty"`
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Messages    []Message      `json:"messages"`
+	CreatedAt   jsTime         `json:"createdAt"`
+	IsLocalOnly bool           `json:"isLocalOnly"`
+	ProjectID   string         `json:"projectId,omitempty"`
+	Restore     *RestoreMarker `json:"_restore,omitempty"`
 
 	// StableKey is a source-stable identifier (conversation id/uuid)
 	// used by the caller to derive deterministic, idempotent chat ids.
 	// Never serialized into the sealed chat JSON.
 	StableKey string `json:"-"`
+}
+
+type RestoreMarker struct {
+	Format         string `json:"format"`
+	SourceBackupID string `json:"sourceBackupId"`
+	Kind           string `json:"kind"`
+	SourceID       string `json:"sourceId"`
+	Generation     int    `json:"generation"`
 }

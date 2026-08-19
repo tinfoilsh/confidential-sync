@@ -57,6 +57,9 @@ type ImportJobState struct {
 	imported   int
 	failed     int
 	total      int
+	phase      string
+	counts     map[string]ImportKindCounts
+	warnings   []string
 	errs       []string
 	startedRun bool
 	updatedAt  time.Time
@@ -70,6 +73,9 @@ type ImportJobSnapshot struct {
 	Imported int
 	Failed   int
 	Total    int
+	Phase    string
+	Counts   map[string]ImportKindCounts
+	Warnings []string
 	Errors   []string
 }
 
@@ -77,12 +83,20 @@ func (j *ImportJobState) Snapshot() ImportJobSnapshot {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	errs := append([]string(nil), j.errs...)
+	warnings := append([]string(nil), j.warnings...)
+	counts := make(map[string]ImportKindCounts, len(j.counts))
+	for kind, count := range j.counts {
+		counts[kind] = count
+	}
 	return ImportJobSnapshot{
 		ID:       j.ID,
 		Status:   j.status,
 		Imported: j.imported,
 		Failed:   j.failed,
 		Total:    j.total,
+		Phase:    j.phase,
+		Counts:   counts,
+		Warnings: warnings,
 		Errors:   errs,
 	}
 }
@@ -148,6 +162,32 @@ func (j *ImportJobState) addError(msg string) {
 	if len(j.errs) < MaxImportJobErrors {
 		j.errs = append(j.errs, msg)
 	}
+	j.updatedAt = time.Now().UTC()
+}
+
+func (j *ImportJobState) addWarning(msg string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.warnings) < MaxImportJobErrors {
+		j.warnings = append(j.warnings, msg)
+	}
+	j.updatedAt = time.Now().UTC()
+}
+
+func (j *ImportJobState) setPhase(phase string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.phase = phase
+	j.updatedAt = time.Now().UTC()
+}
+
+func (j *ImportJobState) setKindCount(kind string, count ImportKindCounts) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.counts == nil {
+		j.counts = make(map[string]ImportKindCounts)
+	}
+	j.counts[kind] = count
 	j.updatedAt = time.Now().UTC()
 }
 
@@ -378,7 +418,7 @@ func newImportID() string {
 
 func validateImportCreate(req ImportCreateRequest) error {
 	switch req.Source {
-	case "chatgpt", "claude", "tinfoil":
+	case "chatgpt", "claude", "tinfoil", "tinfoil_backup":
 	default:
 		return badRequest("invalid source")
 	}

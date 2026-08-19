@@ -676,9 +676,12 @@ func (h *Handler) importStatus(w http.ResponseWriter, r *http.Request, sess Sess
 func importStatusResponse(snap ImportJobSnapshot) ImportStatusResponse {
 	return ImportStatusResponse{
 		Status:   string(snap.Status),
+		Phase:    snap.Phase,
 		Imported: snap.Imported,
 		Failed:   snap.Failed,
 		Total:    snap.Total,
+		Counts:   snap.Counts,
+		Warnings: snap.Warnings,
 		Errors:   snap.Errors,
 		JobID:    snap.ID,
 	}

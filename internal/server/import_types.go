@@ -34,12 +34,22 @@ type ImportStatusRequest struct {
 }
 
 type ImportStatusResponse struct {
-	Status   string   `json:"status"`
-	Imported int      `json:"imported"`
-	Failed   int      `json:"failed"`
-	Total    int      `json:"total"`
-	Errors   []string `json:"errors,omitempty"`
-	JobID    string   `json:"job_id,omitempty"`
+	Status   string                      `json:"status"`
+	Phase    string                      `json:"phase,omitempty"`
+	Imported int                         `json:"imported"`
+	Failed   int                         `json:"failed"`
+	Total    int                         `json:"total"`
+	Counts   map[string]ImportKindCounts `json:"counts,omitempty"`
+	Warnings []string                    `json:"warnings,omitempty"`
+	Errors   []string                    `json:"errors,omitempty"`
+	JobID    string                      `json:"job_id,omitempty"`
+}
+
+type ImportKindCounts struct {
+	Imported int `json:"imported"`
+	Skipped  int `json:"skipped"`
+	Failed   int `json:"failed"`
+	Blocked  int `json:"blocked"`
 }
 
 // Import safety limits. These are v1 caps; raising them is a deliberate

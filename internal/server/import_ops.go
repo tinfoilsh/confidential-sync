@@ -26,6 +26,7 @@ const maxReverseTimestamp int64 = 9999999999999
 // its attachments under the CEK, and notify the controlplane on finish.
 func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error {
 	cekB64 := base64.StdEncoding.EncodeToString(job.cek)
+	job.setPhase("validating")
 
 	// The CEK must already be the user's registered current key; sealing
 	// chats under an unregistered key would strand them.
@@ -37,16 +38,20 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	if err != nil {
 		return err
 	}
+	if job.Source == string(importer.SourceTinfoilBackup) {
+		return runNativeBackupImport(ctx, deps, sess, job, arch, cekB64)
+	}
 
 	conversationsJSON, err := arch.readConversations()
 	if err != nil {
 		return err
 	}
+	job.setPhase("chats")
 
 	opts := importer.Options{
 		Index: arch.entryIndex(),
 		GenerateID: func(stableKey string, createdAt time.Time) string {
-			return deterministicChatID(importer.Source(job.Source), stableKey, createdAt)
+			return deterministicChatID(sess.Claims.Subject, importer.Source(job.Source), stableKey, createdAt)
 		},
 	}
 
@@ -66,17 +71,18 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 		if parsedAttachments > MaxImportAttachments {
 			return errors.New("import: attachment limit exceeded")
 		}
+		chat.Restore = &importer.RestoreMarker{
+			Format: "legacy-import-v1", SourceBackupID: job.Source,
+			Kind: "chat", SourceID: chat.StableKey, Generation: 0,
+		}
 		if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, &uploadedAttachments); err != nil {
-			if isAlreadyImported(err) {
-				imported++
-			} else {
-				failed++
-				job.addError("chat failed")
-			}
+			failed++
+			job.addError("chat failed")
 		} else {
 			imported++
 		}
 		job.setProgress(imported, failed, conversations)
+		job.setKindCount("chat", ImportKindCounts{Imported: imported, Failed: failed})
 		return nil
 	}
 
@@ -85,6 +91,8 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	}
 
 	job.setProgress(imported, failed, conversations)
+	job.setKindCount("chat", ImportKindCounts{Imported: imported, Failed: failed})
+	job.setPhase("complete")
 	notifyImportComplete(ctx, deps, sess.Claims.Subject, job.ID, job.Source, imported, failed)
 	return nil
 }
@@ -109,14 +117,14 @@ func sealImportedChat(
 		for _, att := range msg.Attachments {
 			if att.BinaryRef == "" {
 				if att.Type == importer.AttachmentImage && (att.ID == "" || att.EncryptionKey == "") {
-					job.addError("image attachment skipped")
+					job.addWarning("image attachment skipped")
 					continue
 				}
 				kept = append(kept, att)
 				continue
 			}
 			if att.Type != importer.AttachmentImage {
-				job.addError("binary document skipped")
+				job.addWarning("binary document skipped")
 				continue
 			}
 			idx := attIndex
@@ -124,12 +132,12 @@ func sealImportedChat(
 
 			data, err := arch.openBinary(att.BinaryRef)
 			if err != nil {
-				job.addError("attachment skipped")
+				job.addWarning("attachment skipped")
 				continue
 			}
 			contentType := http.DetectContentType(data)
 			if !allowedImageMIME(contentType) {
-				job.addError("attachment type rejected")
+				job.addWarning("attachment type rejected")
 				continue
 			}
 			if *attachments >= MaxImportAttachments {
@@ -143,7 +151,7 @@ func sealImportedChat(
 				IdempotencyKey: idem,
 			})
 			if err != nil {
-				job.addError("attachment upload failed")
+				job.addWarning("attachment upload failed")
 				continue
 			}
 			att.ID = putResp.ID
@@ -175,6 +183,12 @@ func sealImportedChat(
 		IdempotencyKey: chatIdemKey(chat.ID),
 		Metadata:       metadata,
 	})
+	if err != nil && isAlreadyImported(err) && chat.Restore != nil {
+		match, _, verifyErr := inspectRestoreCandidate(ctx, deps, sess, cekB64, "chat", chat.ID, *chat.Restore)
+		if verifyErr == nil && match {
+			return nil
+		}
+	}
 	return err
 }
 
@@ -203,7 +217,7 @@ func allowedImageMIME(contentType string) bool {
 	}
 }
 
-func deterministicChatID(source importer.Source, stableKey string, createdAt time.Time) string {
+func deterministicChatID(userID string, source importer.Source, stableKey string, createdAt time.Time) string {
 	ms := int64(0)
 	if !createdAt.IsZero() {
 		ms = createdAt.UnixMilli()
@@ -212,7 +226,7 @@ func deterministicChatID(source importer.Source, stableKey string, createdAt tim
 	if rev < 0 {
 		rev = 0
 	}
-	sum := sha256.Sum256([]byte("import-id:" + string(source) + ":" + stableKey))
+	sum := sha256.Sum256([]byte("import-id:" + userID + ":" + string(source) + ":" + stableKey))
 	h := hex.EncodeToString(sum[:])
 	uuidish := fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 	return fmt.Sprintf("%013d_%s", rev, uuidish)
