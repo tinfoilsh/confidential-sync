@@ -118,6 +118,17 @@ func TestImportJobSkipsPreReleaseDeterministicChat(t *testing.T) {
 	}
 }
 
+func TestPriorImportedChatProbeRejectsAmbiguousResult(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	f.cp.blobs["chat/prior-id"] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: []byte("invalid")}
+
+	exists, err := priorImportedChatExists(context.Background(), f.handler.deps, importSession(f), f.userKeyB64, "prior-id")
+	if err == nil || exists {
+		t.Fatalf("ambiguous probe result = (%v, %v), want false and error", exists, err)
+	}
+}
+
 func TestImportJobZipWithImage(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID

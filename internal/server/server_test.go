@@ -80,6 +80,7 @@ type cpStub struct {
 	wipedAttachments              []string
 	deleteAllStatus               int
 	deleteAllCode                 string
+	deleteAllUnconfirmed          bool
 	mux                           *http.ServeMux
 	server                        *httptest.Server
 	registerHandler               func(w http.ResponseWriter, r *http.Request)
@@ -365,6 +366,10 @@ func (s *cpStub) handleDeleteAllProjects(w http.ResponseWriter, r *http.Request)
 	if s.deleteAllStatus != 0 {
 		w.WriteHeader(s.deleteAllStatus)
 		_ = json.NewEncoder(w).Encode(map[string]string{"code": s.deleteAllCode})
+		return
+	}
+	if s.deleteAllUnconfirmed {
+		_ = json.NewEncoder(w).Encode(controlplane.DeleteAllProjectsResponse{OK: false})
 		return
 	}
 	deleted := 0
@@ -1762,6 +1767,18 @@ func TestDeleteAllProjectsForwardsUpstreamError(t *testing.T) {
 	}
 	if appErr.Code != CodeIdempotencyConflict {
 		t.Fatalf("error = %+v", appErr)
+	}
+}
+
+func TestDeleteAllProjectsRequiresUpstreamConfirmation(t *testing.T) {
+	f := newFixture(t)
+	f.cp.deleteAllUnconfirmed = true
+	_, err := DeleteAllProjects(context.Background(), f.handler.deps, importSession(f), DeleteAllProjectsRequest{
+		Key:            f.userKeyB64,
+		IdempotencyKey: "delete-projects-1",
+	})
+	if err == nil {
+		t.Fatal("expected unconfirmed controlplane response to fail")
 	}
 }
 

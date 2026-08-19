@@ -142,6 +142,43 @@ func TestNativeBackupValidatesEverythingBeforeWrites(t *testing.T) {
 	}
 }
 
+func TestValidJSONTimeRequiresRFC3339(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  json.RawMessage
+		want bool
+	}{
+		{name: "null", raw: json.RawMessage(`null`), want: true},
+		{name: "RFC3339", raw: json.RawMessage(`"2024-01-01T00:00:00Z"`), want: true},
+		{name: "RFC3339Nano", raw: json.RawMessage(`"2024-01-01T00:00:00.123456789Z"`), want: true},
+		{name: "malformed", raw: json.RawMessage(`"yesterday"`), want: false},
+		{name: "empty", raw: json.RawMessage(`""`), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validJSONTime(tc.raw); got != tc.want {
+				t.Fatalf("validJSONTime(%s) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNativeBackupRejectsBinaryDocumentAttachment(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	archive := nativeTestArchive(t, "backup-document", []nativeTestEntity{
+		{kind: "chat", sourceID: "c1", path: "entities/chat.json", payload: []byte(`{"title":"Document","messages":[{"role":"user","content":"read","timestamp":"2024-01-01T00:00:00Z","attachments":[{"type":"document","fileName":"brief.pdf","archivePath":"blobs/brief.pdf"}]}],"createdAt":"2024-01-01T00:00:00Z","isLocalOnly":false}`)},
+	}, map[string][]byte{"blobs/brief.pdf": []byte("pdf")}, nil)
+	job := stageArchive(t, f, "tinfoil_backup", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err == nil {
+		t.Fatal("expected binary document attachment validation failure")
+	}
+	if len(f.cp.blobs) != 0 {
+		t.Fatal("invalid archive must not write blobs")
+	}
+}
+
 func TestNativeBackupRejectsManifestAndArchiveMismatches(t *testing.T) {
 	entity := nativeTestEntity{kind: "project", sourceID: "p1", path: "entities/project.json", payload: []byte(`{"name":"Valid","memory":[]}`)}
 	tests := []struct {

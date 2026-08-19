@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
@@ -241,6 +242,9 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 					if attachment.FileName == "" || attachment.FileSize < 0 {
 						return nil, errors.New("import: invalid attachment payload")
 					}
+					if attachment.Type == importer.AttachmentDocument && attachment.ArchivePath != "" {
+						return nil, errors.New("import: binary document attachments are not supported")
+					}
 					if attachment.ArchivePath != "" {
 						blobPath, ok := safeZipName(attachment.ArchivePath)
 						if !ok || blobPath != attachment.ArchivePath {
@@ -366,7 +370,11 @@ func validJSONTime(raw json.RawMessage) bool {
 		return true
 	}
 	var value string
-	return json.Unmarshal(raw, &value) == nil && value != ""
+	if json.Unmarshal(raw, &value) != nil || value == "" {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil
 }
 
 func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *ImportJobState, arch *importArchive, cekB64 string) error {

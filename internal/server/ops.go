@@ -631,6 +631,9 @@ func DeleteAllProjects(ctx context.Context, deps Deps, sess Session, req DeleteA
 	if err != nil {
 		return nil, err
 	}
+	if resp == nil || !resp.OK {
+		return nil, errors.New("controlplane: delete-all-projects did not confirm ok")
+	}
 	return &DeleteAllProjectsResponse{OK: true, Deleted: resp.Deleted}, nil
 }
 

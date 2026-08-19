@@ -271,7 +271,7 @@ func priorImportedChatExists(ctx context.Context, deps Deps, sess Session, cekB6
 	if item.Code == CodeNetwork {
 		return false, errors.New("import: prior import probe failed")
 	}
-	return true, nil
+	return false, fmt.Errorf("import: prior import probe returned %s", item.Code)
 }
 
 func chatIdemKey(chatID string) string {
