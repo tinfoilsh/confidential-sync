@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -73,31 +74,73 @@ type nativeDocumentPayload struct {
 }
 
 type nativeChatPayload struct {
-	Title       string                 `json:"title"`
-	Messages    []nativeMessagePayload `json:"messages"`
-	CreatedAt   json.RawMessage        `json:"createdAt"`
-	IsLocalOnly *bool                  `json:"isLocalOnly"`
-	ProjectID   string                 `json:"projectId,omitempty"`
+	Title       string                     `json:"title"`
+	Messages    []nativeMessagePayload     `json:"messages"`
+	CreatedAt   json.RawMessage            `json:"createdAt"`
+	IsLocalOnly *bool                      `json:"isLocalOnly"`
+	ProjectID   string                     `json:"projectId,omitempty"`
+	Raw         map[string]json.RawMessage `json:"-"`
 }
 
 type nativeMessagePayload struct {
-	Role             string                    `json:"role"`
-	Content          string                    `json:"content"`
-	Attachments      []nativeAttachmentPayload `json:"attachments,omitempty"`
-	Timestamp        json.RawMessage           `json:"timestamp"`
-	Thoughts         string                    `json:"thoughts,omitempty"`
-	ThinkingDuration int                       `json:"thinkingDuration,omitempty"`
+	Role             string                     `json:"role"`
+	Content          string                     `json:"content"`
+	Attachments      []nativeAttachmentPayload  `json:"attachments,omitempty"`
+	Timestamp        json.RawMessage            `json:"timestamp"`
+	Thoughts         string                     `json:"thoughts,omitempty"`
+	ThinkingDuration int                        `json:"thinkingDuration,omitempty"`
+	Raw              map[string]json.RawMessage `json:"-"`
 }
 
 type nativeAttachmentPayload struct {
-	ID          string                  `json:"id,omitempty"`
-	Type        importer.AttachmentType `json:"type"`
-	FileName    string                  `json:"fileName"`
-	MimeType    string                  `json:"mimeType,omitempty"`
-	TextContent string                  `json:"textContent,omitempty"`
-	Description string                  `json:"description,omitempty"`
-	FileSize    int64                   `json:"fileSize,omitempty"`
-	ArchivePath string                  `json:"archivePath,omitempty"`
+	ID          string                     `json:"id,omitempty"`
+	Type        importer.AttachmentType    `json:"type"`
+	FileName    string                     `json:"fileName"`
+	MimeType    string                     `json:"mimeType,omitempty"`
+	TextContent string                     `json:"textContent,omitempty"`
+	Description string                     `json:"description,omitempty"`
+	FileSize    int64                      `json:"fileSize,omitempty"`
+	ArchivePath string                     `json:"archivePath,omitempty"`
+	Raw         map[string]json.RawMessage `json:"-"`
+}
+
+func (p *nativeChatPayload) UnmarshalJSON(data []byte) error {
+	type known nativeChatPayload
+	var value known
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &value.Raw); err != nil {
+		return err
+	}
+	*p = nativeChatPayload(value)
+	return nil
+}
+
+func (p *nativeMessagePayload) UnmarshalJSON(data []byte) error {
+	type known nativeMessagePayload
+	var value known
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &value.Raw); err != nil {
+		return err
+	}
+	*p = nativeMessagePayload(value)
+	return nil
+}
+
+func (p *nativeAttachmentPayload) UnmarshalJSON(data []byte) error {
+	type known nativeAttachmentPayload
+	var value known
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &value.Raw); err != nil {
+		return err
+	}
+	*p = nativeAttachmentPayload(value)
+	return nil
 }
 
 type validatedNativeBackup struct {
@@ -217,7 +260,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 			out.documents = append(out.documents, validatedNativeDocument{meta: entity, payload: payload})
 		case "chat":
 			var payload nativeChatPayload
-			if err := decodeStrictJSON(data, &payload); err != nil || payload.Title == "" || payload.IsLocalOnly == nil {
+			if err := decodeStrictJSON(data, &payload); err != nil || !hasJSONFields(data, "title", "messages", "createdAt", "isLocalOnly") || payload.Messages == nil || payload.IsLocalOnly == nil {
 				return nil, errors.New("import: invalid chat payload")
 			}
 			if *payload.IsLocalOnly {
@@ -590,28 +633,19 @@ func restoreIdemKey(userID, backupID, kind, sourceID string, generation int) str
 }
 
 func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *importArchive, backup *validatedNativeBackup, job *ImportJobState, chatID, projectID string, marker importer.RestoreMarker, input nativeChatPayload) ([]byte, []string, error) {
-	messages := make([]map[string]any, 0, len(input.Messages))
+	messages := make([]map[string]json.RawMessage, 0, len(input.Messages))
 	attachmentIndex := 0
 	var attachmentIDs []string
 	for _, message := range input.Messages {
-		out := map[string]any{"role": message.Role, "content": message.Content}
-		if len(message.Timestamp) > 0 {
-			out["timestamp"] = message.Timestamp
-		}
-		addOptionalString(out, "thoughts", message.Thoughts)
-		if message.ThinkingDuration != 0 {
-			out["thinkingDuration"] = message.ThinkingDuration
-		}
-		attachments := make([]map[string]any, 0, len(message.Attachments))
+		out := cloneRawMap(message.Raw)
+		attachments := make([]map[string]json.RawMessage, 0, len(message.Attachments))
 		for _, attachment := range message.Attachments {
-			stored := map[string]any{"type": attachment.Type, "fileName": attachment.FileName}
-			addOptionalString(stored, "id", attachment.ID)
-			addOptionalString(stored, "mimeType", attachment.MimeType)
-			addOptionalString(stored, "textContent", attachment.TextContent)
-			addOptionalString(stored, "description", attachment.Description)
-			if attachment.FileSize != 0 {
-				stored["fileSize"] = attachment.FileSize
-			}
+			stored := cloneRawMap(attachment.Raw)
+			delete(stored, "archivePath")
+			delete(stored, "backup_path")
+			delete(stored, "base64")
+			delete(stored, "thumbnailBase64")
+			delete(stored, "encryptionKey")
 			if attachment.Type == importer.AttachmentImage {
 				blob, listed := backup.blobs[attachment.ArchivePath]
 				if attachment.ArchivePath == "" || !listed {
@@ -637,27 +671,67 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 					job.addWarning("image attachment upload failed")
 					continue
 				}
-				stored["id"] = putResp.ID
+				setRawString(stored, "id", putResp.ID)
 				attachmentIDs = append(attachmentIDs, putResp.ID)
-				stored["encryptionKey"] = putResp.AttKey
-				stored["mimeType"] = contentType
+				setRawString(stored, "encryptionKey", putResp.AttKey)
+				setRawString(stored, "mimeType", contentType)
 			}
 			attachments = append(attachments, stored)
 		}
 		if len(attachments) > 0 {
-			out["attachments"] = attachments
+			if err := setRawJSON(out, "attachments", attachments); err != nil {
+				return nil, attachmentIDs, err
+			}
+		} else {
+			delete(out, "attachments")
 		}
 		messages = append(messages, out)
 	}
-	payload := map[string]any{
-		"id": chatID, "title": input.Title, "messages": messages, "createdAt": input.CreatedAt,
-		"isLocalOnly": false, "_restore": marker,
+	payload := cloneRawMap(input.Raw)
+	for _, field := range []string{
+		"clock", "clockVersion", "codeExecutionAccessToken", "dataCorrupted", "decryptionFailed",
+		"formatVersion", "isBlankChat", "isMetadataOnly", "isTemporary", "lastAccessedAt", "loadedAt",
+		"locallyModified", "messageCount", "pendingRecoveries", "pendingSave", "pendingUpload",
+		"projectLocallyModified", "syncPending", "syncUserId", "syncedAt", "syncVersion", "version", "writer",
+	} {
+		delete(payload, field)
+	}
+	setRawString(payload, "id", chatID)
+	if err := setRawJSON(payload, "messages", messages); err != nil {
+		return nil, attachmentIDs, err
+	}
+	payload["isLocalOnly"] = json.RawMessage("false")
+	if err := setRawJSON(payload, "_restore", marker); err != nil {
+		return nil, attachmentIDs, err
 	}
 	if projectID != "" {
-		payload["projectId"] = projectID
+		setRawString(payload, "projectId", projectID)
+	} else {
+		delete(payload, "projectId")
 	}
 	body, err := json.Marshal(payload)
 	return body, attachmentIDs, err
+}
+
+func cloneRawMap(input map[string]json.RawMessage) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+func setRawJSON(payload map[string]json.RawMessage, name string, value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	payload[name] = encoded
+	return nil
+}
+
+func setRawString(payload map[string]json.RawMessage, name, value string) {
+	payload[name] = json.RawMessage(strconv.Quote(value))
 }
 
 func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, attachmentIDs []string) {
@@ -676,11 +750,5 @@ func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, atta
 				deps.logError("native import attachment blob cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
 			}
 		}
-	}
-}
-
-func addOptionalString(payload map[string]any, name, value string) {
-	if value != "" {
-		payload[name] = value
 	}
 }

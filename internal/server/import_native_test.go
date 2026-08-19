@@ -123,6 +123,59 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 	if len(validated.projects) != 1 || len(validated.documents) != 1 || len(validated.chats) != 1 || len(validated.blobs) != 1 {
 		t.Fatalf("unexpected validated fixture: %+v", validated)
 	}
+
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	job := runNativeTestArchive(t, f, archive)
+	if job.Snapshot().Counts["chat"].Imported != 1 {
+		t.Fatalf("fixture chat was not imported: %+v", job.Snapshot())
+	}
+	chatID := mappedRestoreID(f.userSub, fixture.SourceBackupID, "chat", "cloud-1", 0)
+	payload := decryptNativeTestBlob(t, f, "chat", chatID)
+	for field, want := range map[string]any{
+		"titleState": "manual", "model": "gpt-oss-120b", "reasoningEffort": "high",
+		"thinkingEnabled": true, "webSearchEnabled": true,
+	} {
+		if got := payload[field]; got != want {
+			t.Fatalf("chat field %s = %#v, want %#v", field, got, want)
+		}
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("messages were not preserved: %#v", payload["messages"])
+	}
+	message, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message has unexpected shape: %#v", messages[0])
+	}
+	for field, want := range map[string]any{
+		"thoughts": "Reasoning text", "quote": "Quoted text", "searchReasoning": "Search rationale",
+		"modelDisplayName": "GPT OSS 120B", "thinkingDuration": float64(4),
+	} {
+		if got := message[field]; got != want {
+			t.Fatalf("message field %s = %#v, want %#v", field, got, want)
+		}
+	}
+	for _, field := range []string{"timeline", "toolCalls", "codeExecCalls", "annotations", "webSearch", "urlFetches"} {
+		if message[field] == nil {
+			t.Fatalf("message field %s was lost", field)
+		}
+	}
+	attachments, ok := message["attachments"].([]any)
+	if !ok || len(attachments) != 2 {
+		t.Fatalf("attachments were not preserved: %#v", message["attachments"])
+	}
+	document := attachments[1].(map[string]any)
+	if document["textContent"] != "Document text" || document["pages"] == nil {
+		t.Fatalf("document text/pages were not preserved: %#v", document)
+	}
+	image := attachments[0].(map[string]any)
+	if image["archivePath"] != nil || image["encryptionKey"] == nil {
+		t.Fatalf("image reference was not replaced safely: %#v", image)
+	}
+	if payload["codeExecutionAccessToken"] != nil || payload["syncUserId"] != nil {
+		t.Fatalf("transient or secret fields reached storage: %#v", payload)
+	}
 }
 
 func TestNativeBackupValidatesEverythingBeforeWrites(t *testing.T) {
