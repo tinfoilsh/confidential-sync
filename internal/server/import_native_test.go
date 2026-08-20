@@ -224,6 +224,50 @@ func TestNativeMessageRejectsInvalidThinkingDurationTypes(t *testing.T) {
 	}
 }
 
+func TestNativeBackupValidatesChatTitle(t *testing.T) {
+	tests := []struct {
+		name      string
+		titleJSON string
+		wantTitle string
+		wantValid bool
+	}{
+		{name: "null", titleJSON: `"title":null,`},
+		{name: "missing"},
+		{name: "wrong type", titleJSON: `"title":true,`},
+		{name: "empty", titleJSON: `"title":"",`, wantValid: true},
+		{name: "nonempty", titleJSON: `"title":"Chat",`, wantTitle: "Chat", wantValid: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(fmt.Sprintf(`{%s"messages":[],"createdAt":"2026-08-18T12:00:00Z","isLocalOnly":false}`, tc.titleJSON))
+			archive := nativeTestArchive(t, "backup-title", []nativeTestEntity{
+				{kind: "chat", sourceID: "c1", path: "entities/chat.json", payload: payload},
+			}, nil, nil)
+			zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
+			if err := arch.validateAndIndex("tinfoil_backup"); err != nil {
+				t.Fatal(err)
+			}
+			validated, err := validateNativeBackup(arch)
+			if !tc.wantValid {
+				if err == nil {
+					t.Fatal("expected chat title validation failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("valid chat title was rejected: %v", err)
+			}
+			if got := validated.chats[0].payload.Title; got != tc.wantTitle {
+				t.Fatalf("validated title = %q, want %q", got, tc.wantTitle)
+			}
+		})
+	}
+}
+
 func TestNativeBackupValidatesEverythingBeforeWrites(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID

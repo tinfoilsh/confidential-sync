@@ -113,6 +113,15 @@ func (p *nativeChatPayload) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &value.Raw); err != nil {
 		return err
 	}
+	if raw, ok := value.Raw["title"]; ok {
+		var title any
+		if err := json.Unmarshal(raw, &title); err != nil {
+			return err
+		}
+		if _, ok := title.(string); !ok {
+			return errors.New("title must be a JSON string")
+		}
+	}
 	*p = nativeChatPayload(value)
 	return nil
 }
