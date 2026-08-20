@@ -126,6 +126,7 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/profile", s.delBlob("profile"))
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
+	mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.deleteAllProjects)
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
 	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
 	mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.revisionEvents)
@@ -423,6 +424,24 @@ func (s *StubCP) delBlob(scope string) http.HandlerFunc {
 			"source_revision":      s.sourceRev,
 		})
 	}
+}
+
+func (s *StubCP) deleteAllProjects(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	for key, blob := range s.blobs {
+		if !strings.HasPrefix(key, "project/") && !strings.HasPrefix(key, "project_document/") {
+			continue
+		}
+		if strings.HasPrefix(key, "project/") {
+			deleted++
+		}
+		delete(s.blobs, key)
+		s.deletes[key] = stubDelete{deletedAt: time.Now().UTC(), projectID: blob.ProjectID}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.DeleteAllProjectsResponse{OK: true, Deleted: deleted})
 }
 
 // listStatusRow is one entry in the merged update/delete timeline the

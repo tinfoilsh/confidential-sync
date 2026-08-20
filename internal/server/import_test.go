@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
 func TestSafeZipName(t *testing.T) {
@@ -86,6 +87,48 @@ func TestImportJobPlainJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestImportJobSkipsPreReleaseDeterministicChat(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+
+	createdAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	priorID := priorDeterministicChatID(importer.SourceTinfoil, "conv-1", createdAt)
+	plaintext := []byte(`{"id":"` + priorID + `","title":"Previously imported","messages":[]}`)
+	if _, err := Push(context.Background(), f.handler.deps, importSession(f), PushRequest{
+		Scope: "chat", ID: priorID, Key: f.userKeyB64,
+		Plaintext: base64.StdEncoding.EncodeToString(plaintext), IdempotencyKey: "pre-release-import",
+	}); err != nil {
+		t.Fatalf("seed prior import: %v", err)
+	}
+
+	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	snap := job.Snapshot()
+	if snap.Imported != 0 || snap.Failed != 0 || snap.Counts["chat"].Skipped != 1 {
+		t.Fatalf("unexpected prior import result: %+v", snap)
+	}
+	if len(f.cp.blobs) != 1 {
+		t.Fatalf("pre-release import was duplicated: got %d blobs", len(f.cp.blobs))
+	}
+}
+
+func TestPriorImportedChatProbeRejectsAmbiguousResult(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	f.cp.blobs["chat/prior-id"] = &cpBlob{ETag: 1, KeyID: f.userKeyID, Body: []byte("invalid")}
+
+	exists, err := priorImportedChatExists(context.Background(), f.handler.deps, importSession(f), f.userKeyB64, "prior-id")
+	if err == nil || exists {
+		t.Fatalf("ambiguous probe result = (%v, %v), want false and error", exists, err)
+	}
+}
+
 func TestImportJobZipWithImage(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
@@ -152,7 +195,7 @@ func TestImportJobSkipsUnsupportedBinaryDocument(t *testing.T) {
 	if len(f.cp.attachmentIndex) != 0 {
 		t.Fatalf("expected unsupported binary document to skip attachment upload, got %d", len(f.cp.attachmentIndex))
 	}
-	if len(snap.Errors) == 0 {
+	if len(snap.Warnings) == 0 {
 		t.Fatal("expected warning for skipped binary document")
 	}
 }
@@ -179,7 +222,7 @@ func TestImportJobSkipsUnresolvedTinfoilImages(t *testing.T) {
 	if len(f.cp.attachmentIndex) != 0 {
 		t.Fatalf("expected unresolved image to skip attachment upload, got %d", len(f.cp.attachmentIndex))
 	}
-	if len(snap.Errors) == 0 {
+	if len(snap.Warnings) == 0 {
 		t.Fatal("expected warning for skipped unresolved image")
 	}
 }

@@ -30,6 +30,27 @@ func TestListStatusIncludesChatProjectID(t *testing.T) {
 	}
 }
 
+func TestDeleteAllProjectsDeletesDocumentsAndCountsParents(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "project", "project-1", nil)
+	putStubBlob(t, stub, "project", "project-2", nil)
+	putStubBlob(t, stub, "project_document", "project-1/doc-1", nil)
+	putStubBlob(t, stub, "chat", "chat-1", nil)
+
+	recorder := requestStub(t, stub, http.MethodDelete, controlplane.DeleteAllProjectsPath, "", nil)
+	var response controlplane.DeleteAllProjectsResponse
+	decodeStubResponse(t, recorder, &response)
+	if !response.OK || response.Deleted != 2 {
+		t.Fatalf("response = %+v", response)
+	}
+	if stub.PeekBlob("project", "project-1") != nil || stub.PeekBlob("project_document", "project-1/doc-1") != nil {
+		t.Fatal("project blobs were not deleted")
+	}
+	if stub.PeekBlob("chat", "chat-1") == nil {
+		t.Fatal("non-project blob was deleted")
+	}
+}
+
 func TestStartFreshWipeRequiresSnapshotBeforeResetFloor(t *testing.T) {
 	stub := NewStubCP()
 	putStubBlob(t, stub, "chat", "chat-1", nil)

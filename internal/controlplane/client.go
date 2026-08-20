@@ -179,9 +179,10 @@ type ListStatusResponse struct {
 }
 
 const (
-	RevisionSummaryPath  = "/api/sync/revision-summary"
-	RevisionEventsPath   = "/api/sync/revision-events"
-	RevisionSnapshotPath = "/api/sync/revision-snapshot"
+	RevisionSummaryPath   = "/api/sync/revision-summary"
+	RevisionEventsPath    = "/api/sync/revision-events"
+	RevisionSnapshotPath  = "/api/sync/revision-snapshot"
+	DeleteAllProjectsPath = "/api/sync/blob/projects"
 )
 
 type RevisionSummaryResponse struct {
@@ -668,6 +669,47 @@ func (c *Client) DeleteBlob(ctx context.Context, req DeleteBlobRequest) (*Delete
 		}
 	}
 	return out, nil
+}
+
+type DeleteAllProjectsRequest struct {
+	JWT            string
+	ClerkUserID    string
+	KeyIDHex       string
+	IdempotencyKey string
+	OperationHash  string
+}
+
+type DeleteAllProjectsResponse struct {
+	OK      bool `json:"ok"`
+	Deleted int  `json:"deleted"`
+}
+
+func (c *Client) DeleteAllProjects(ctx context.Context, req DeleteAllProjectsRequest) (*DeleteAllProjectsResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+DeleteAllProjectsPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.addAuth(httpReq, req.JWT, req.ClerkUserID)
+	httpReq.Header.Set(HeaderKeyID, req.KeyIDHex)
+	httpReq.Header.Set(HeaderIdempotency, req.IdempotencyKey)
+	httpReq.Header.Set(HeaderOperationHash, req.OperationHash)
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, parseError(resp.StatusCode, body)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("controlplane: read delete-all-projects response: %w", readErr)
+	}
+	var out DeleteAllProjectsResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("controlplane: decode delete-all-projects response: %w", err)
+	}
+	return &out, nil
 }
 
 func (c *Client) ListStatus(ctx context.Context, scope, cursor string, limit int, jwt, clerkUserID, projectID, direction string) (*ListStatusResponse, error) {

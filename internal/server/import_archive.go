@@ -154,6 +154,9 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 	zr, err := zip.NewReader(reader, job.TotalBytes)
 	if err != nil {
 		if errors.Is(err, zip.ErrFormat) {
+			if job.Source == string(importer.SourceTinfoilBackup) {
+				return nil, errors.New("import: tinfoil backup must be a ZIP archive")
+			}
 			plain, perr := readAllStaged(reader, MaxImportJSONBytes)
 			if perr != nil {
 				return nil, perr
@@ -164,7 +167,7 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 	}
 
 	arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
-	if err := arch.validateAndIndex(); err != nil {
+	if err := arch.validateAndIndex(job.Source); err != nil {
 		return nil, err
 	}
 	return arch, nil
@@ -201,7 +204,7 @@ func readAllStaged(r *stagedArchiveReader, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
-func (a *importArchive) validateAndIndex() error {
+func (a *importArchive) validateAndIndex(source string) error {
 	if len(a.zr.File) > MaxImportEntries {
 		return fmt.Errorf("import: archive has too many entries")
 	}
@@ -210,6 +213,9 @@ func (a *importArchive) validateAndIndex() error {
 	for _, f := range a.zr.File {
 		info := f.FileInfo()
 		if info.IsDir() {
+			if source == string(importer.SourceTinfoilBackup) {
+				return errors.New("import: native backup contains an unlisted directory entry")
+			}
 			continue
 		}
 		mode := f.Mode()
@@ -239,10 +245,36 @@ func (a *importArchive) validateAndIndex() error {
 		}
 	}
 	a.index = importer.NewIndex(names)
+	if source == string(importer.SourceTinfoilBackup) {
+		if _, ok := a.files[nativeManifestPath]; !ok {
+			return errors.New("import: archive is missing manifest.json")
+		}
+		return nil
+	}
 	if a.conversationsName == "" {
 		return errors.New("import: archive is missing conversations.json")
 	}
 	return nil
+}
+
+func (a *importArchive) readEntry(name string, maxBytes int64) ([]byte, error) {
+	f, ok := a.files[name]
+	if !ok {
+		return nil, errors.New("import: archive entry not found")
+	}
+	rc, err := f.Open()
+	if err != nil {
+		return nil, fmt.Errorf("import: open archive entry: %w", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("import: read archive entry: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("import: archive entry exceeds size limit")
+	}
+	return data, nil
 }
 
 // preferConversations prefers the shallowest conversations.json so a

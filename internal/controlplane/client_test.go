@@ -738,6 +738,54 @@ func TestDeleteBlobSendsHeaders(t *testing.T) {
 	}
 }
 
+func TestDeleteAllProjectsWireContract(t *testing.T) {
+	st := newStub(t)
+	st.handle1(http.MethodDelete, DeleteAllProjectsPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(HeaderAuth) != "Bearer jwt-1" || r.Header.Get(HeaderClerkUserID) != "user-1" {
+			t.Errorf("auth headers = %v", r.Header)
+		}
+		if r.Header.Get(HeaderServiceSecret) != "secret-1" || r.Header.Get(HeaderKeyID) != "key-1" {
+			t.Errorf("service/key headers = %v", r.Header)
+		}
+		if r.Header.Get(HeaderIdempotency) != "idem-1" || r.Header.Get(HeaderOperationHash) != "hash-1" {
+			t.Errorf("operation headers = %v", r.Header)
+		}
+		if r.Header.Get(HeaderIfMatch) != "" {
+			t.Errorf("unexpected If-Match = %q", r.Header.Get(HeaderIfMatch))
+		}
+		if r.ContentLength != 0 {
+			t.Errorf("content length = %d", r.ContentLength)
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"deleted":7}`)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("secret-1"))
+	resp, err := c.DeleteAllProjects(context.Background(), DeleteAllProjectsRequest{
+		JWT:            "jwt-1",
+		ClerkUserID:    "user-1",
+		KeyIDHex:       "key-1",
+		IdempotencyKey: "idem-1",
+		OperationHash:  "hash-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Deleted != 7 {
+		t.Fatalf("response = %+v", resp)
+	}
+}
+
+func TestDeleteAllProjectsForwardsUpstreamError(t *testing.T) {
+	st := newStub(t)
+	st.handle1(http.MethodDelete, DeleteAllProjectsPath, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"code":"IDEMPOTENCY_CONFLICT"}`)
+	})
+	_, err := NewClient(st.server.URL, nil).DeleteAllProjects(context.Background(), DeleteAllProjectsRequest{})
+	if !IsCode(err, StatusIdempotencyConflict) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestIsCodeFalseOnPlainError(t *testing.T) {
 	if IsCode(io.EOF, "ANYTHING") {
 		t.Fatalf("plain error should not match")

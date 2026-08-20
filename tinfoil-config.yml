@@ -57,6 +57,7 @@ shim:
     - /v1/sync/revision-events
     - /v1/sync/revision-snapshot
     - /v1/sync/delete
+    - /v1/sync/delete-all-projects
     - /v1/key/register
     - /v1/key/add-bundle
     - /v1/key/remove-bundle
