@@ -6,4 +6,4 @@
 - Source commit: `6e87358b2f1cbe479ec7bb9bcfb67e1ad8643bdf`
 - Source SHA-256: `55db6459b1edda7c2bc25771c9694674908e033141c5609d58258d9e58a71947`
 
-When the web fixture changes, copy it here and update the digest asserted by `TestNativeCloudContractFixtureProvenance`. The parser contract test compacts each semantic payload exactly as web packaging does, builds the upload manifest, and validates it with the production native import validator before any writes.
+When the web fixture changes, copy it here and update the digest asserted by `TestNativeCloudContractFixtureProvenance`. This whole-file digest pins the fixture's provenance. The parser contract test compacts each semantic payload exactly as web packaging does, builds the upload manifest, and validates it with the production native import validator before any writes. Its per-entity size and SHA-256 assertions cover that local archive construction; they do not independently pin the bytes emitted by web packaging.
