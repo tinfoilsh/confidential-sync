@@ -1772,7 +1772,9 @@ func TestDeleteAllProjectsForwardsUpstreamError(t *testing.T) {
 
 func TestDeleteAllProjectsRequiresUpstreamConfirmation(t *testing.T) {
 	f := newFixture(t)
+	f.cp.mu.Lock()
 	f.cp.deleteAllUnconfirmed = true
+	f.cp.mu.Unlock()
 	_, err := DeleteAllProjects(context.Background(), f.handler.deps, importSession(f), DeleteAllProjectsRequest{
 		Key:            f.userKeyB64,
 		IdempotencyKey: "delete-projects-1",

@@ -657,6 +657,7 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 			delete(stored, "base64")
 			delete(stored, "thumbnailBase64")
 			delete(stored, "encryptionKey")
+			delete(stored, "key")
 			if attachment.Type == importer.AttachmentImage {
 				blob, listed := backup.blobs[attachment.ArchivePath]
 				if attachment.ArchivePath == "" || !listed {

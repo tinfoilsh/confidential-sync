@@ -47,6 +47,8 @@
         "reasoningEffort": "high",
         "thinkingEnabled": true,
         "toolsEnabled": ["web_search", "code_execution"],
+        "codeExecutionAccessToken": "secret-token",
+        "syncUserId": "source-user",
         "messages": [
           {
             "role": "user",
@@ -142,6 +144,7 @@
                 "fileName": "photo.png",
                 "mimeType": "image/png",
                 "fileSize": 72,
+                "key": "legacy-source-key",
                 "archivePath": "blobs/0"
               },
               {

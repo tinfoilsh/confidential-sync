@@ -176,7 +176,7 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 		t.Fatalf("document text/pages were not preserved: %#v", document)
 	}
 	image := attachments[0].(map[string]any)
-	if image["archivePath"] != nil || image["encryptionKey"] == nil {
+	if image["archivePath"] != nil || image["encryptionKey"] == nil || image["key"] != nil {
 		t.Fatalf("image reference was not replaced safely: %#v", image)
 	}
 	if payload["codeExecutionAccessToken"] != nil || payload["syncUserId"] != nil {
