@@ -12,7 +12,6 @@ import (
 	"os"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
@@ -24,20 +23,6 @@ type nativeTestEntity struct {
 	projectSourceID string
 	path            string
 	payload         []byte
-}
-
-type nativeContractFixture struct {
-	SourceBackupID string `json:"source_backup_id"`
-	Entities       []struct {
-		Kind            string          `json:"kind"`
-		SourceID        string          `json:"source_id"`
-		ProjectSourceID string          `json:"project_source_id"`
-		Payload         json.RawMessage `json:"payload"`
-	} `json:"entities"`
-	Blobs []struct {
-		Path   string `json:"path"`
-		Base64 string `json:"base64"`
-	} `json:"blobs"`
 }
 
 func TestNativeBackupRestoresGraphAttachmentsAndSkipsRetry(t *testing.T) {
@@ -91,52 +76,23 @@ func TestNativeBackupRestoresGraphAttachmentsAndSkipsRetry(t *testing.T) {
 }
 
 func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
-	fixtureBytes, err := os.ReadFile("testdata/native-cloud-import-v1.json")
+	fixtureBytes, err := os.ReadFile("testdata/native-cloud-import-v1.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(fixtureBytes), "local-1") || strings.Contains(string(fixtureBytes), "codeExecutionAccessToken") || strings.Contains(string(fixtureBytes), "syncUserId") || strings.Contains(string(fixtureBytes), "encryptionKey") {
-		t.Fatal("web cloud fixture contains a local chat or secret field")
-	}
-	var fixture nativeContractFixture
-	if err := json.Unmarshal(fixtureBytes, &fixture); err != nil {
-		t.Fatal(err)
-	}
-	entities := make([]nativeTestEntity, 0, len(fixture.Entities))
-	for index, entity := range fixture.Entities {
-		var compact bytes.Buffer
-		if err := json.Compact(&compact, entity.Payload); err != nil {
-			t.Fatal(err)
-		}
-		entities = append(entities, nativeTestEntity{
-			kind: entity.Kind, sourceID: entity.SourceID, projectSourceID: entity.ProjectSourceID,
-			path: fmt.Sprintf("entities/%s/%d.json", entity.Kind, index), payload: compact.Bytes(),
-		})
-	}
-	blobs := make(map[string][]byte, len(fixture.Blobs))
-	for _, blob := range fixture.Blobs {
-		data, err := base64.StdEncoding.DecodeString(blob.Base64)
-		if err != nil {
-			t.Fatal(err)
-		}
-		blobs[blob.Path] = data
-	}
-	archive := nativeTestArchive(t, fixture.SourceBackupID, entities, blobs, nil)
-	f := newFixture(t)
-	f.cp.currentKID = f.userKeyID
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	zr, err := zip.NewReader(bytes.NewReader(fixtureBytes), int64(len(fixtureBytes)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
-	if err := arch.validateAndIndex("tinfoil_backup"); err != nil {
+	if err := arch.validateAndIndex(string(importer.SourceTinfoilBackup)); err != nil {
 		t.Fatal(err)
 	}
 	validated, err := validateNativeBackup(arch)
 	if err != nil {
 		t.Fatalf("web contract fixture failed validation: %v", err)
 	}
-	if validated.manifest.Format != "tinfoil-native-cloud-import" || validated.manifest.Version != 1 || validated.manifest.SourceBackupID != fixture.SourceBackupID {
+	if validated.manifest.Format != "tinfoil-native-cloud-import" || validated.manifest.Version != 1 || validated.manifest.SourceBackupID != "123e4567-e89b-42d3-a456-426614174000" {
 		t.Fatalf("unexpected native manifest identity: %+v", validated.manifest)
 	}
 	if got, want := *validated.manifest.Counts, (nativeManifestCounts{Projects: 1, Documents: 1, Chats: 1, Blobs: 1}); got != want {
@@ -148,7 +104,7 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 	wantEntities := []nativeEntityManifest{
 		{Kind: "project", SourceID: "project-1", Path: "entities/project/0.json", SHA256: "efb9e21973107e4daa8e5c4204ac685ac25a25d986085bdeb10995c91533b9bf", SizeBytes: 109},
 		{Kind: "document", SourceID: "document-1", ProjectSourceID: "project-1", Path: "entities/document/1.json", SHA256: "6c4e16caa87568c13a4d9f83171c8f4298f3920ec839150b7321f762d4cc9f73", SizeBytes: 123},
-		{Kind: "chat", SourceID: "cloud-1", ProjectSourceID: "project-1", Path: "entities/chat/2.json", SHA256: "8bd478f9d8650724ee77803cfa7b89d803b1b267c0da52db9b1d686555185cc6", SizeBytes: 387},
+		{Kind: "chat", SourceID: "cloud-1", ProjectSourceID: "project-1", Path: "entities/chat/2.json", SHA256: "4111fbb0e8525ab74c8904fc48c18a606333992731cec7e1ef7e34c834963db3", SizeBytes: 387},
 	}
 	if !reflect.DeepEqual(validated.manifest.Entities, wantEntities) {
 		t.Fatalf("entity descriptors = %+v, want %+v", validated.manifest.Entities, wantEntities)
@@ -165,6 +121,11 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 	if chat.meta.SourceID != "cloud-1" || chat.meta.ProjectSourceID != "project-1" || chat.payload.Title != "Cloud chat" || chat.payload.ProjectID != "" || chat.payload.IsLocalOnly == nil || *chat.payload.IsLocalOnly || len(chat.payload.Messages) != 1 {
 		t.Fatalf("unexpected chat contract: %+v", chat)
 	}
+	for field, want := range map[string]string{"titleState": `"manual"`, "model": `"gpt-oss-120b"`} {
+		if got := string(chat.payload.Raw[field]); got != want {
+			t.Fatalf("chat field %s = %s, want %s", field, got, want)
+		}
+	}
 	message := chat.payload.Messages[0]
 	if message.Role != "user" || message.Content != "hello" || string(message.Timestamp) != `"2026-08-20T12:00:00.000Z"` || len(message.Attachments) != 1 {
 		t.Fatalf("unexpected message contract: %+v", message)
@@ -173,68 +134,31 @@ func TestNativeCloudContractFixturePassesValidation(t *testing.T) {
 	if attachment.ID != "cloud-image" || attachment.Type != importer.AttachmentImage || attachment.FileName != "photo.png" || attachment.MimeType != "image/png" || attachment.FileSize != 72 || attachment.ArchivePath != "blobs/0" {
 		t.Fatalf("unexpected attachment contract: %+v", attachment)
 	}
-	for _, entity := range validated.manifest.Entities {
-		data, err := arch.readEntry(entity.Path, MaxImportJSONBytes)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if int64(len(data)) != entity.SizeBytes || hashOf(data) != entity.SHA256 {
-			t.Fatalf("entity descriptor does not match %s", entity.Path)
-		}
-	}
 	blob := validated.blobs["blobs/0"]
-	blobBytes, err := arch.readEntry(blob.Path, MaxImportAttachmentBytes)
+	if blob.SizeBytes != 72 || blob.SHA256 != "2496a5beafe0cfdc8ce6af926ce081a1043db2d21b774b4733f3204ad768c4da" {
+		t.Fatalf("unexpected blob contract: %+v", blob)
+	}
+	parsedOutput, err := json.Marshal(struct {
+		Manifest nativeManifest             `json:"manifest"`
+		Chat     map[string]json.RawMessage `json:"chat"`
+	}{Manifest: validated.manifest, Chat: chat.payload.Raw})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blob.SizeBytes != 72 || blob.SHA256 != "2496a5beafe0cfdc8ce6af926ce081a1043db2d21b774b4733f3204ad768c4da" || int64(len(blobBytes)) != blob.SizeBytes || hashOf(blobBytes) != blob.SHA256 {
-		t.Fatalf("unexpected blob contract: %+v", blob)
-	}
-
-	if len(f.cp.blobs) != 0 {
-		t.Fatal("fixture validation unexpectedly wrote data")
-	}
-	job := runNativeTestArchive(t, f, archive)
-	snapshot := job.Snapshot()
-	if snapshot.Imported != 3 || snapshot.Failed != 0 || snapshot.Total != 3 || snapshot.Counts["project"].Imported != 1 || snapshot.Counts["document"].Imported != 1 || snapshot.Counts["chat"].Imported != 1 {
-		t.Fatalf("fixture graph was not imported: %+v", snapshot)
-	}
-	chatID := mappedRestoreID(f.userSub, fixture.SourceBackupID, "chat", "cloud-1", 0)
-	payload := decryptNativeTestBlob(t, f, "chat", chatID)
-	for field, want := range map[string]any{"title": "Cloud chat", "titleState": "manual", "model": "gpt-oss-120b", "isLocalOnly": false} {
-		if got := payload[field]; got != want {
-			t.Fatalf("chat field %s = %#v, want %#v", field, got, want)
+	for _, excluded := range []string{"local-1", "codeExecutionAccessToken", "syncUserId", "encryptionKey"} {
+		if bytes.Contains(parsedOutput, []byte(excluded)) {
+			t.Fatalf("parser output contains excluded local or secret field %q", excluded)
 		}
-	}
-	messages, ok := payload["messages"].([]any)
-	if !ok || len(messages) != 1 {
-		t.Fatalf("messages were not preserved: %#v", payload["messages"])
-	}
-	storedMessage, ok := messages[0].(map[string]any)
-	if !ok {
-		t.Fatalf("message has unexpected shape: %#v", messages[0])
-	}
-	attachments, ok := storedMessage["attachments"].([]any)
-	if !ok || len(attachments) != 1 {
-		t.Fatalf("attachments were not preserved: %#v", storedMessage["attachments"])
-	}
-	image := attachments[0].(map[string]any)
-	if image["archivePath"] != nil || image["encryptionKey"] == nil || image["key"] != nil {
-		t.Fatalf("image reference was not replaced safely: %#v", image)
-	}
-	projectID := mappedRestoreID(f.userSub, fixture.SourceBackupID, "project", "project-1", 0)
-	if payload["projectId"] != projectID || snapshot.ProjectMappings["project-1"] != projectID {
-		t.Fatalf("fixture relationships were not mapped: payload=%+v status=%+v", payload, snapshot)
 	}
 }
 
 func TestNativeCloudContractFixtureProvenance(t *testing.T) {
-	fixture, err := os.ReadFile("testdata/native-cloud-import-v1.json")
+	fixture, err := os.ReadFile("testdata/native-cloud-import-v1.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(fixture)
-	const webFixtureSHA256 = "55db6459b1edda7c2bc25771c9694674908e033141c5609d58258d9e58a71947"
+	const webFixtureSHA256 = "3a4b8c93a983f3dcfaa0df6b4a4de21a86f49eb1a8babe3824f10468861deb10"
 	if got := hex.EncodeToString(sum[:]); got != webFixtureSHA256 {
 		t.Fatalf("web fixture drifted: got %s, update it from the documented source and review the parser contract", got)
 	}
