@@ -963,7 +963,15 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := blob.ETag + 1
-	s.blobs[key] = &StubBlob{ETag: next, KeyID: req.KeyID, Body: ct, CreatedAt: blob.CreatedAt, UpdatedAt: time.Now().UTC()}
+	s.blobs[key] = &StubBlob{
+		ETag:         next,
+		KeyID:        req.KeyID,
+		Body:         ct,
+		ProjectIDSet: blob.ProjectIDSet,
+		ProjectID:    blob.ProjectID,
+		CreatedAt:    blob.CreatedAt,
+		UpdatedAt:    blob.UpdatedAt,
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "etag": formatETag(next), "key_id": req.KeyID})
 }
 

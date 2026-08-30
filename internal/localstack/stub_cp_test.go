@@ -1,6 +1,7 @@
 package localstack
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -53,6 +54,53 @@ func TestBackupInventoryReturnsKeyFreeRelationships(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "key_id") || strings.Contains(recorder.Body.String(), "ciphertext") {
 		t.Fatalf("inventory leaked sensitive fields: %s", recorder.Body.String())
+	}
+}
+
+func TestRewrapPreservesProjectScopedChatInventoryMetadata(t *testing.T) {
+	stub := NewStubCP()
+	projectID := "project-1"
+	putStubBlob(t, stub, "chat", "chat-1", map[string]string{
+		controlplane.HeaderProjectIDSet: "1",
+		controlplane.HeaderProjectID:    projectID,
+	})
+	before := stub.PeekBlob("chat", "chat-1")
+	if before == nil {
+		t.Fatal("chat blob is missing before rewrap")
+	}
+
+	rewrappedBody := []byte("rewrapped-ciphertext")
+	rewrapRequest, err := json.Marshal(map[string]string{
+		"scope":          "chat",
+		"id":             "chat-1",
+		"key_id":         "key-2",
+		"if_match":       formatETag(before.ETag),
+		"ciphertext_b64": base64.StdEncoding.EncodeToString(rewrappedBody),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := requestStub(t, stub, http.MethodPost, "/api/sync/rewrap", string(rewrapRequest), nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("rewrap status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	after := stub.PeekBlob("chat", "chat-1")
+	if after == nil || after.ETag != before.ETag+1 || after.KeyID != "key-2" || string(after.Body) != string(rewrappedBody) {
+		t.Fatalf("rewrapped blob = %+v", after)
+	}
+	if after.ProjectIDSet != before.ProjectIDSet || after.ProjectID == nil || *after.ProjectID != projectID || !after.CreatedAt.Equal(before.CreatedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("rewrap changed logical metadata: before=%+v after=%+v", before, after)
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.BackupInventoryPath, "", nil)
+	var inventory controlplane.BackupInventoryResponse
+	decodeStubResponse(t, recorder, &inventory)
+	if inventory.TotalItems != 1 || len(inventory.Items) != 1 {
+		t.Fatalf("inventory = %+v", inventory)
+	}
+	item := inventory.Items[0]
+	if item.Scope != "chat" || item.ID != "chat-1" || item.ETag != formatETag(after.ETag) || item.ProjectID == nil || *item.ProjectID != projectID || item.CreatedAt != before.CreatedAt.UTC().Format(time.RFC3339Nano) || item.UpdatedAt != before.UpdatedAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("inventory item = %+v", item)
 	}
 }
 
