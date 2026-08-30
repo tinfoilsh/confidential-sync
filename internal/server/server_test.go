@@ -157,6 +157,7 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
 	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
+	s.mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.handleBackupInventory)
 	s.mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.handleRevisionSummary)
 	s.mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.handleRevisionEvents)
 	s.mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.handleRevisionSnapshot)
@@ -402,6 +403,40 @@ func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates})
+}
+
+func (s *cpStub) handleBackupInventory(w http.ResponseWriter, r *http.Request) {
+	items := make([]controlplane.BackupInventoryItem, 0, len(s.blobs))
+	for key, blob := range s.blobs {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) != 2 || parts[0] == "profile" {
+			continue
+		}
+		item := controlplane.BackupInventoryItem{
+			Scope:     parts[0],
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			ProjectID: blob.ProjectID,
+			CreatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+		}
+		if parts[0] == "project_document" {
+			projectID, documentID, found := strings.Cut(parts[1], "/")
+			if found {
+				item.ID = documentID
+				item.ProjectID = &projectID
+			}
+		}
+		if parts[0] == "project" {
+			item.ProjectID = nil
+		}
+		items = append(items, item)
+	}
+	_ = json.NewEncoder(w).Encode(controlplane.BackupInventoryResponse{
+		CapturedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TotalItems: len(items),
+		Items:      items,
+	})
 }
 
 func (s *cpStub) handleRevisionSummary(w http.ResponseWriter, r *http.Request) {
@@ -1103,6 +1138,9 @@ func TestPullUnknownKey(t *testing.T) {
 	}
 	if pull.Items[0].Code != CodeUnknownKey {
 		t.Fatalf("code: %q", pull.Items[0].Code)
+	}
+	if pull.Items[0].PreviousETag != "" || bytes.Contains(pullBody, []byte(`"previous_etag"`)) {
+		t.Fatalf("failed pull item included previous_etag: %s", pullBody)
 	}
 }
 

@@ -36,6 +36,7 @@ type StubBlob struct {
 	Body         []byte
 	ProjectIDSet bool
 	ProjectID    *string
+	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
 
@@ -128,6 +129,7 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.deleteAllProjects)
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
+	mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.backupInventory)
 	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
 	mux.HandleFunc("GET "+controlplane.RevisionEventsPath, s.revisionEvents)
 	mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.revisionSnapshot)
@@ -210,6 +212,7 @@ func (s *StubCP) SetBlob(scope, id, keyID string, body []byte) {
 		ETag:      next,
 		KeyID:     keyID,
 		Body:      append([]byte(nil), body...),
+		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
 	delete(s.deletes, key)
@@ -236,6 +239,7 @@ func (s *StubCP) CopyBlob(srcScope, srcID, dstScope, dstID string) bool {
 		Body:         append([]byte(nil), src.Body...),
 		ProjectIDSet: src.ProjectIDSet,
 		ProjectID:    src.ProjectID,
+		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
 	return true
@@ -302,10 +306,18 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 			next = blob.ETag + 1
 		}
 		updatedAt := time.Now().UTC()
+		createdAt := updatedAt
+		if blob != nil {
+			createdAt = blob.CreatedAt
+			if createdAt.IsZero() {
+				createdAt = blob.UpdatedAt
+			}
+		}
 		nextBlob := &StubBlob{
 			ETag:      next,
 			KeyID:     r.Header.Get("X-Key-Id"),
 			Body:      body,
+			CreatedAt: createdAt,
 			UpdatedAt: updatedAt,
 		}
 		if blob != nil {
@@ -622,6 +634,53 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *StubCP) backupInventory(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]controlplane.BackupInventoryItem, 0, len(s.blobs))
+	for key, blob := range s.blobs {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) != 2 || parts[0] == "profile" {
+			continue
+		}
+		createdAt := blob.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = blob.UpdatedAt
+		}
+		item := controlplane.BackupInventoryItem{
+			Scope:     parts[0],
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			ProjectID: blob.ProjectID,
+			CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
+			UpdatedAt: blob.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		}
+		if parts[0] == "project_document" {
+			projectID, documentID, found := strings.Cut(parts[1], "/")
+			if found {
+				item.ID = documentID
+				item.ProjectID = &projectID
+			}
+		}
+		if parts[0] == "project" {
+			item.ProjectID = nil
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Scope != items[j].Scope {
+			return items[i].Scope < items[j].Scope
+		}
+		return items[i].ID < items[j].ID
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.BackupInventoryResponse{
+		CapturedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TotalItems: len(items),
+		Items:      items,
+	})
+}
+
 func (s *StubCP) revisionSummary(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -904,7 +963,7 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := blob.ETag + 1
-	s.blobs[key] = &StubBlob{ETag: next, KeyID: req.KeyID, Body: ct, UpdatedAt: time.Now().UTC()}
+	s.blobs[key] = &StubBlob{ETag: next, KeyID: req.KeyID, Body: ct, CreatedAt: blob.CreatedAt, UpdatedAt: time.Now().UTC()}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "etag": formatETag(next), "key_id": req.KeyID})
 }
 

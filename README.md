@@ -85,6 +85,7 @@ All authenticated `/v1` routes require a Clerk-issued Bearer JWT in the `Authori
 |--------|------|------|---------|
 | `POST` | `/v1/sync/push` | yes | Seal a blob and store it via the controlplane, guarded by compare-and-set. |
 | `POST` | `/v1/sync/pull` | yes | Fetch and unseal a stored blob. |
+| `POST` | `/v1/sync/backup-inventory` | yes | Return key-free metadata for backup reconciliation. |
 | `POST` | `/v1/sync/list-status` | yes | List scoped sync metadata for profile, project, document, and chat pagination. |
 | `POST` | `/v1/sync/revision-summary` | yes | Report the current and oldest replayable metadata revisions. |
 | `POST` | `/v1/sync/revision-events` | yes | Replay paginated metadata changes across a bounded revision window. |
@@ -105,6 +106,10 @@ All authenticated `/v1` routes require a Clerk-issued Bearer JWT in the `Authori
 | `POST` | `/v1/share/seal` | yes | Seal a chat for sharing and return a share key. |
 | `POST` | `/v1/share/open` | no | Open a shared chat using the share key as the access proof. |
 | `GET` | `/health`, `/v1/health` | no | Liveness and build-version check. |
+
+`/v1/sync/backup-inventory` accepts only `{}` and returns bounded, validated metadata with `Cache-Control: no-store`; it never returns keys, content, key IDs, or user IDs.
+
+Successful lazy rewraps include `previous_etag` with the pre-rewrap value while `etag` contains the post-rewrap value. Other pull items omit `previous_etag`.
 
 The unauthenticated `get-public` and `share/open` routes use possession of the per-item key as the access proof, mirroring the trust model of the legacy in-browser share path. The exposed path list is kept in lockstep with the CVM shim allowlist in [`tinfoil-config.yml`](./tinfoil-config.yml); a test fails if the two drift.
 

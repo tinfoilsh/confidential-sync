@@ -30,6 +30,32 @@ func TestListStatusIncludesChatProjectID(t *testing.T) {
 	}
 }
 
+func TestBackupInventoryReturnsKeyFreeRelationships(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "project", "project-1", nil)
+	putStubBlob(t, stub, "project_document", "project-1/doc-1", nil)
+	putStubBlob(t, stub, "chat", "chat-1", nil)
+
+	recorder := requestStub(t, stub, http.MethodGet, controlplane.BackupInventoryPath, "", nil)
+	var response controlplane.BackupInventoryResponse
+	decodeStubResponse(t, recorder, &response)
+	if response.TotalItems != 3 || len(response.Items) != 3 {
+		t.Fatalf("response = %+v", response)
+	}
+	if response.Items[0].Scope != "chat" || response.Items[0].ID != "chat-1" || response.Items[0].ProjectID != nil {
+		t.Fatalf("chat item = %+v", response.Items[0])
+	}
+	if response.Items[1].Scope != "project" || response.Items[1].ID != "project-1" || response.Items[1].ProjectID != nil {
+		t.Fatalf("project item = %+v", response.Items[1])
+	}
+	if response.Items[2].Scope != "project_document" || response.Items[2].ID != "doc-1" || response.Items[2].ProjectID == nil || *response.Items[2].ProjectID != "project-1" {
+		t.Fatalf("relationships = %+v", response.Items)
+	}
+	if strings.Contains(recorder.Body.String(), "key_id") || strings.Contains(recorder.Body.String(), "ciphertext") {
+		t.Fatalf("inventory leaked sensitive fields: %s", recorder.Body.String())
+	}
+}
+
 func TestDeleteAllProjectsDeletesDocumentsAndCountsParents(t *testing.T) {
 	stub := NewStubCP()
 	putStubBlob(t, stub, "project", "project-1", nil)

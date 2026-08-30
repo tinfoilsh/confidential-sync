@@ -52,6 +52,7 @@ shim:
     - /v1/health
     - /v1/sync/push
     - /v1/sync/pull
+    - /v1/sync/backup-inventory
     - /v1/sync/list-status
     - /v1/sync/revision-summary
     - /v1/sync/revision-events

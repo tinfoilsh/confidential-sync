@@ -50,11 +50,15 @@ type PullRequest struct {
 }
 
 type PullItem struct {
-	ID           string  `json:"id"`
-	OK           bool    `json:"ok"`
-	Plaintext    string  `json:"plaintext,omitempty"`
-	KeyID        string  `json:"key_id,omitempty"`
-	ETag         string  `json:"etag,omitempty"`
+	ID        string `json:"id"`
+	OK        bool   `json:"ok"`
+	Plaintext string `json:"plaintext,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
+	ETag      string `json:"etag,omitempty"`
+	// PreviousETag is present only when this pull lazily rewrapped the
+	// row. ETag is then the post-rewrap value and PreviousETag is the
+	// value observed before the compare-and-set rewrap.
+	PreviousETag string  `json:"previous_etag,omitempty"`
 	ProjectIDSet bool    `json:"project_id_set,omitempty"`
 	ProjectID    *string `json:"project_id,omitempty"`
 	NeedsRewrap  bool    `json:"needs_rewrap,omitempty"`
