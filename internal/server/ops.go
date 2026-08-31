@@ -387,6 +387,7 @@ func pullOne(
 					Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
 					KeyID:        targetKIDHex,
 					ETag:         newETag,
+					PreviousETag: blob.ETag,
 					ProjectIDSet: blob.ProjectIDSet,
 					ProjectID:    blob.ProjectID,
 					NeedsRewrap:  false,

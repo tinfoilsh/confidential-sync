@@ -81,6 +81,9 @@ func (h *Handler) routeSpecs() []routeSpec {
 			return h.pushRequestIDMiddleware(h.authMiddlewareWithTimeout(h.push, SyncPushRequestTimeout))
 		}},
 		{"POST", "/v1/sync/pull", func(h *Handler) http.Handler { return h.authMiddleware(h.pull) }},
+		{"POST", "/v1/sync/backup-inventory", func(h *Handler) http.Handler {
+			return withBackupInventoryNoStore(h.authMiddleware(h.backupInventory))
+		}},
 		{"POST", "/v1/sync/list-status", func(h *Handler) http.Handler { return h.authMiddleware(h.listStatus) }},
 		{"POST", "/v1/sync/revision-summary", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionSummary) }},
 		{"POST", "/v1/sync/revision-events", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionEvents) }},
@@ -336,6 +339,21 @@ func (h *Handler) pull(w http.ResponseWriter, r *http.Request, sess Session) {
 		return
 	}
 	resp, err := Pull(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) backupInventory(w http.ResponseWriter, r *http.Request, sess Session) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxBackupInventoryRequestBytes)
+	var req BackupInventoryRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := BackupInventory(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

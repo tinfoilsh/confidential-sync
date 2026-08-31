@@ -1,6 +1,7 @@
 package localstack
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -27,6 +28,79 @@ func TestListStatusIncludesChatProjectID(t *testing.T) {
 	decodeStubResponse(t, recorder, &response)
 	if len(response.Updates) != 1 || response.Updates[0].ProjectID == nil || *response.Updates[0].ProjectID != projectID {
 		t.Fatalf("updates = %+v", response.Updates)
+	}
+}
+
+func TestBackupInventoryReturnsKeyFreeRelationships(t *testing.T) {
+	stub := NewStubCP()
+	putStubBlob(t, stub, "project", "project-1", nil)
+	putStubBlob(t, stub, "project_document", "project-1/doc-1", nil)
+	putStubBlob(t, stub, "chat", "chat-1", nil)
+
+	recorder := requestStub(t, stub, http.MethodGet, controlplane.BackupInventoryPath, "", nil)
+	var response controlplane.BackupInventoryResponse
+	decodeStubResponse(t, recorder, &response)
+	if response.TotalItems != 3 || len(response.Items) != 3 {
+		t.Fatalf("response = %+v", response)
+	}
+	if response.Items[0].Scope != "chat" || response.Items[0].ID != "chat-1" || response.Items[0].ProjectID != nil {
+		t.Fatalf("chat item = %+v", response.Items[0])
+	}
+	if response.Items[1].Scope != "project" || response.Items[1].ID != "project-1" || response.Items[1].ProjectID != nil {
+		t.Fatalf("project item = %+v", response.Items[1])
+	}
+	if response.Items[2].Scope != "project_document" || response.Items[2].ID != "doc-1" || response.Items[2].ProjectID == nil || *response.Items[2].ProjectID != "project-1" {
+		t.Fatalf("relationships = %+v", response.Items)
+	}
+	if strings.Contains(recorder.Body.String(), "key_id") || strings.Contains(recorder.Body.String(), "ciphertext") {
+		t.Fatalf("inventory leaked sensitive fields: %s", recorder.Body.String())
+	}
+}
+
+func TestRewrapPreservesProjectScopedChatInventoryMetadata(t *testing.T) {
+	stub := NewStubCP()
+	projectID := "project-1"
+	putStubBlob(t, stub, "chat", "chat-1", map[string]string{
+		controlplane.HeaderProjectIDSet: "1",
+		controlplane.HeaderProjectID:    projectID,
+	})
+	before := stub.PeekBlob("chat", "chat-1")
+	if before == nil {
+		t.Fatal("chat blob is missing before rewrap")
+	}
+
+	rewrappedBody := []byte("rewrapped-ciphertext")
+	rewrapRequest, err := json.Marshal(map[string]string{
+		"scope":          "chat",
+		"id":             "chat-1",
+		"key_id":         "key-2",
+		"if_match":       formatETag(before.ETag),
+		"ciphertext_b64": base64.StdEncoding.EncodeToString(rewrappedBody),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := requestStub(t, stub, http.MethodPost, "/api/sync/rewrap", string(rewrapRequest), nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("rewrap status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	after := stub.PeekBlob("chat", "chat-1")
+	if after == nil || after.ETag != before.ETag+1 || after.KeyID != "key-2" || string(after.Body) != string(rewrappedBody) {
+		t.Fatalf("rewrapped blob = %+v", after)
+	}
+	if after.ProjectIDSet != before.ProjectIDSet || after.ProjectID == nil || *after.ProjectID != projectID || !after.CreatedAt.Equal(before.CreatedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("rewrap changed logical metadata: before=%+v after=%+v", before, after)
+	}
+
+	recorder = requestStub(t, stub, http.MethodGet, controlplane.BackupInventoryPath, "", nil)
+	var inventory controlplane.BackupInventoryResponse
+	decodeStubResponse(t, recorder, &inventory)
+	if inventory.TotalItems != 1 || len(inventory.Items) != 1 {
+		t.Fatalf("inventory = %+v", inventory)
+	}
+	item := inventory.Items[0]
+	if item.Scope != "chat" || item.ID != "chat-1" || item.ETag != formatETag(after.ETag) || item.ProjectID == nil || *item.ProjectID != projectID || item.CreatedAt != before.CreatedAt.UTC().Format(time.RFC3339Nano) || item.UpdatedAt != before.UpdatedAt.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("inventory item = %+v", item)
 	}
 }
 

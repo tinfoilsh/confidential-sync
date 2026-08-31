@@ -109,6 +109,12 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	if pr.Items[0].NeedsRewrap {
 		t.Fatalf("expected needs_rewrap=false after auto-rewrap")
 	}
+	if pr.Items[0].PreviousETag != "1" || pr.Items[0].ETag != "2" {
+		t.Fatalf("rewrap etags: previous=%q current=%q", pr.Items[0].PreviousETag, pr.Items[0].ETag)
+	}
+	if !bytes.Contains(body, []byte(`"previous_etag":"1"`)) {
+		t.Fatalf("successful lazy rewrap omitted previous_etag: %s", body)
+	}
 	got, err := base64.StdEncoding.DecodeString(pr.Items[0].Plaintext)
 	if err != nil || string(got) != string(chatJSON) {
 		t.Fatalf("plaintext mismatch: %s err=%v", got, err)
@@ -119,6 +125,24 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	f.cp.mu.Unlock()
 	if envelope.Detect(after) != envelope.VersionV2 {
 		t.Fatalf("blob still legacy after auto-rewrap: %s", after)
+	}
+}
+
+func TestPullItemPreviousETagWireContract(t *testing.T) {
+	withoutRewrap, err := json.Marshal(PullItem{ID: "chat-1", OK: true, ETag: "7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(withoutRewrap, []byte(`"previous_etag"`)) {
+		t.Fatalf("non-rewrapped contract included previous_etag: %s", withoutRewrap)
+	}
+
+	withRewrap, err := json.Marshal(PullItem{ID: "chat-1", OK: true, ETag: "8", PreviousETag: "7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(withRewrap, []byte(`"etag":"8"`)) || !bytes.Contains(withRewrap, []byte(`"previous_etag":"7"`)) {
+		t.Fatalf("lazy-rewrap contract has wrong etags: %s", withRewrap)
 	}
 }
 
@@ -156,6 +180,9 @@ func TestPullSkipsRewrapWhenNoCurrentKey(t *testing.T) {
 	}
 	if !pr.Items[0].NeedsRewrap {
 		t.Fatalf("expected needs_rewrap=true when target is not the current key")
+	}
+	if pr.Items[0].PreviousETag != "" || bytes.Contains(body, []byte(`"previous_etag"`)) {
+		t.Fatalf("non-rewrapped item included previous_etag: %s", body)
 	}
 	got, err := base64.StdEncoding.DecodeString(pr.Items[0].Plaintext)
 	if err != nil || string(got) != string(chatJSON) {
