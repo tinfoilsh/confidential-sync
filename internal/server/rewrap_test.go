@@ -128,6 +128,46 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	}
 }
 
+// A batch that names the same legacy id twice must rewrap it exactly
+// once and answer both positions with the promoted row.
+func TestPullDuplicateLegacyIDsRewrapOnce(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	chatJSON := []byte(`{"id":"c1","messages":[]}`)
+	f.cp.mu.Lock()
+	f.cp.currentKID = f.userKeyID
+	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlob(t, f.userKey, chatJSON)}
+	f.cp.mu.Unlock()
+
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat",
+		IDs:   []string{"c1", "c1"},
+		Keys:  []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull: %d %s", resp.StatusCode, body)
+	}
+	var pr PullResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if len(pr.Items) != 2 {
+		t.Fatalf("items: %+v", pr.Items)
+	}
+	for i, item := range pr.Items {
+		if item.ID != "c1" || !item.OK || item.NeedsRewrap || item.ETag != "2" {
+			t.Fatalf("item %d: %+v", i, item)
+		}
+	}
+	f.cp.mu.Lock()
+	after := f.cp.blobs["chat/c1"]
+	f.cp.mu.Unlock()
+	if after.ETag != 2 {
+		t.Fatalf("expected a single rewrap, etag=%d", after.ETag)
+	}
+}
+
 func TestPullItemPreviousETagWireContract(t *testing.T) {
 	withoutRewrap, err := json.Marshal(PullItem{ID: "chat-1", OK: true, ETag: "7"})
 	if err != nil {

@@ -244,13 +244,17 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 // Pull batch bounds. Every id costs one controlplane round trip (plus
 // an inline rewrap for legacy rows), and the whole request must finish
 // inside StandardRequestTimeout. MaxPullIDs caps how much work one
-// request may ask for so a caller cannot construct a batch that is
-// guaranteed to time out; pullConcurrency bounds the parallel fan-out
-// against the controlplane so a full batch completes well inside the
-// deadline without saturating the upstream connection pool.
+// explicit ids[] request may ask for so a caller cannot construct a
+// batch that is guaranteed to time out; pullConcurrency bounds the
+// parallel fan-out against the controlplane so a full batch completes
+// well inside the deadline without saturating the upstream connection
+// pool. maxPullAllPageSize is the independent page-size bound for
+// all=true listing pulls.
 const (
-	MaxPullIDs      = 100
-	pullConcurrency = 8
+	MaxPullIDs         = 100
+	pullConcurrency    = 8
+	maxPullAllPageSize = 500
+	defaultPullAllPage = 100
 )
 
 // Pull fetches one or more blobs and decrypts them. Each item is
@@ -274,8 +278,8 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	}
 	defer cleanup()
 
-	if req.Limit <= 0 || req.Limit > MaxPullIDs {
-		req.Limit = MaxPullIDs
+	if req.Limit <= 0 || req.Limit > maxPullAllPageSize {
+		req.Limit = defaultPullAllPage
 	}
 
 	var ids []string
@@ -322,12 +326,20 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	// storm on every sync.
 	canRewrap := currentPrimaryKeyIs(ctx, deps, sess, targetKIDHex)
 
-	items := make([]PullItem, len(ids))
+	// Fetch each distinct id once. Concurrent pulls of the same legacy
+	// id would race their lazy rewrap CAS, leaving one copy with a
+	// stale ETag and needs_rewrap=true.
+	itemByID := make(map[string]*PullItem, len(ids))
 	var group errgroup.Group
 	group.SetLimit(pullConcurrency)
-	for i, id := range ids {
+	for _, id := range ids {
+		if _, seen := itemByID[id]; seen {
+			continue
+		}
+		item := &PullItem{}
+		itemByID[id] = item
 		group.Go(func() error {
-			items[i] = pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex, canRewrap)
+			*item = pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex, canRewrap)
 			return nil
 		})
 	}
@@ -335,6 +347,10 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	// the item itself so one bad row cannot fail its batch peers.
 	_ = group.Wait()
 
+	items := make([]PullItem, len(ids))
+	for i, id := range ids {
+		items[i] = *itemByID[id]
+	}
 	out := &PullResponse{NextCursor: nextCursor, Items: items}
 	var okCount, failCount, legacyCount int
 	for _, item := range items {
