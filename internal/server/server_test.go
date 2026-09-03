@@ -1144,6 +1144,125 @@ func TestPullUnknownKey(t *testing.T) {
 	}
 }
 
+// A concurrent batch must still answer positionally: item i describes
+// ids[i], and one failing row (missing, sealed under another key) must
+// not disturb its neighbours.
+func TestPullBatchPreservesRequestOrderAcrossMixedOutcomes(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	otherKey := make([]byte, cryptopkg.KeySize)
+	rand.Read(otherKey)
+	otherKeyB64 := base64.StdEncoding.EncodeToString(otherKey)
+
+	const batch = 40
+	ids := make([]string, 0, batch)
+	for i := 0; i < batch; i++ {
+		id := fmt.Sprintf("chat_%02d", i)
+		ids = append(ids, id)
+		switch i % 4 {
+		case 3:
+			// Never pushed: NOT_FOUND.
+			continue
+		case 2:
+			// Sealed under a key this pull does not hold: UNKNOWN_KEY.
+			resp, body := f.post("/v1/sync/push", PushRequest{
+				Scope: "chat", ID: id, Key: otherKeyB64,
+				Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"` + id + `"}`)),
+				IdempotencyKey: "idem-" + id,
+			}, tok)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("push %s: %d %s", id, resp.StatusCode, body)
+			}
+		default:
+			resp, body := f.post("/v1/sync/push", PushRequest{
+				Scope: "chat", ID: id, Key: f.userKeyB64,
+				Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"` + id + `"}`)),
+				IdempotencyKey: "idem-" + id,
+			}, tok)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("push %s: %d %s", id, resp.StatusCode, body)
+			}
+		}
+	}
+
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat",
+		IDs:   ids,
+		Keys:  []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull: %d %s", resp.StatusCode, body)
+	}
+	var pull PullResponse
+	if err := json.Unmarshal(body, &pull); err != nil {
+		t.Fatal(err)
+	}
+	if len(pull.Items) != batch {
+		t.Fatalf("items: got %d want %d", len(pull.Items), batch)
+	}
+	for i, item := range pull.Items {
+		if item.ID != ids[i] {
+			t.Fatalf("item %d: id %q, want %q", i, item.ID, ids[i])
+		}
+		switch i % 4 {
+		case 3:
+			if item.OK || item.Code != CodeNotFound {
+				t.Fatalf("item %d (%s): want NOT_FOUND, got %+v", i, item.ID, item)
+			}
+		case 2:
+			if item.OK || item.Code != CodeUnknownKey {
+				t.Fatalf("item %d (%s): want UNKNOWN_KEY, got %+v", i, item.ID, item)
+			}
+		default:
+			if !item.OK {
+				t.Fatalf("item %d (%s): want ok, got %+v", i, item.ID, item)
+			}
+			got, err := base64.StdEncoding.DecodeString(item.Plaintext)
+			if err != nil || string(got) != `{"id":"`+item.ID+`"}` {
+				t.Fatalf("item %d (%s): plaintext %q err=%v", i, item.ID, got, err)
+			}
+		}
+	}
+}
+
+func TestPullRejectsOversizedBatch(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+
+	ids := make([]string, MaxPullIDs+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("chat_%d", i)
+	}
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat",
+		IDs:   ids,
+		Keys:  []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: %d %s", resp.StatusCode, body)
+	}
+	var appErr struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &appErr); err != nil {
+		t.Fatal(err)
+	}
+	if appErr.Code != CodeBadRequest {
+		t.Fatalf("code: %q", appErr.Code)
+	}
+
+	ids = ids[:MaxPullIDs]
+	resp, body = f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat",
+		IDs:   ids,
+		Keys:  []PullKey{{Key: f.userKeyB64}},
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("batch at the cap must be accepted: %d %s", resp.StatusCode, body)
+	}
+}
+
 func TestAuthMissingBearer(t *testing.T) {
 	f := newFixture(t)
 	resp, _ := f.post("/v1/sync/push", PushRequest{Scope: "chat"}, "")
