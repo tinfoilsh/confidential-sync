@@ -248,13 +248,15 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 // batch that is guaranteed to time out; pullConcurrency bounds the
 // parallel fan-out against the controlplane so a full batch completes
 // well inside the deadline without saturating the upstream connection
-// pool. maxPullAllPageSize is the independent page-size bound for
-// all=true listing pulls.
+// pool. maxListStatusPageSize is the largest page the controlplane
+// list-status endpoint serves; every listing-driven request (list-status,
+// all=true pulls, migrate) clamps to it.
 const (
-	MaxPullIDs         = 100
-	pullConcurrency    = 8
-	maxPullAllPageSize = 500
-	defaultPullAllPage = 100
+	MaxPullIDs             = 100
+	pullConcurrency        = 8
+	maxListStatusPageSize  = 500
+	defaultListStatusPage  = 100
+	defaultMigratePageSize = 50
 )
 
 // Pull fetches one or more blobs and decrypts them. Each item is
@@ -278,8 +280,8 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	}
 	defer cleanup()
 
-	if req.Limit <= 0 || req.Limit > maxPullAllPageSize {
-		req.Limit = defaultPullAllPage
+	if req.Limit <= 0 || req.Limit > maxListStatusPageSize {
+		req.Limit = defaultListStatusPage
 	}
 
 	var ids []string
@@ -471,8 +473,8 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	if req.Direction != "" && req.Direction != "asc" && req.Direction != "desc" {
 		return nil, badRequest("invalid direction (must be 'asc' or 'desc')")
 	}
-	if req.Limit <= 0 || req.Limit > 500 {
-		req.Limit = 100
+	if req.Limit <= 0 || req.Limit > maxListStatusPageSize {
+		req.Limit = defaultListStatusPage
 	}
 	deps.logInfo("list-status begin: user=%s scope=%s limit=%d project=%s direction=%q cursor=%q",
 		sess.Claims.Subject, req.Scope, req.Limit, req.ProjectID, req.Direction, req.Cursor)
@@ -955,8 +957,8 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 	if len(req.Keys) == 0 {
 		return nil, badRequest("keys is required and must not be empty")
 	}
-	if req.Limit <= 0 || req.Limit > 500 {
-		req.Limit = 50
+	if req.Limit <= 0 || req.Limit > maxListStatusPageSize {
+		req.Limit = defaultMigratePageSize
 	}
 	targetKey, err := decodeKey(req.Target.Key)
 	if err != nil {
