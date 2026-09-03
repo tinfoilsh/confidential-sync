@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
@@ -239,8 +241,21 @@ func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idem
 	}), nil
 }
 
+// Pull batch bounds. Every id costs one controlplane round trip (plus
+// an inline rewrap for legacy rows), and the whole request must finish
+// inside StandardRequestTimeout. MaxPullIDs caps how much work one
+// request may ask for so a caller cannot construct a batch that is
+// guaranteed to time out; pullConcurrency bounds the parallel fan-out
+// against the controlplane so a full batch completes well inside the
+// deadline without saturating the upstream connection pool.
+const (
+	MaxPullIDs      = 100
+	pullConcurrency = 8
+)
+
 // Pull fetches one or more blobs and decrypts them. Each item is
-// independent: a single bad blob does not fail the batch.
+// independent: a single bad blob does not fail the batch. Items are
+// fetched concurrently but returned in request order.
 func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullResponse, error) {
 	scope := envelope.Scope(req.Scope)
 	if !scope.Valid() {
@@ -249,6 +264,9 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	if len(req.Keys) == 0 {
 		return nil, badRequest("keys is required and must not be empty")
 	}
+	if len(req.IDs) > MaxPullIDs {
+		return nil, badRequest(fmt.Sprintf("ids exceeds the maximum batch size of %d", MaxPullIDs))
+	}
 
 	keys, cleanup, err := decodeKeys(req.Keys)
 	if err != nil {
@@ -256,8 +274,8 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	}
 	defer cleanup()
 
-	if req.Limit <= 0 || req.Limit > 500 {
-		req.Limit = 100
+	if req.Limit <= 0 || req.Limit > MaxPullIDs {
+		req.Limit = MaxPullIDs
 	}
 
 	var ids []string
@@ -304,11 +322,22 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	// storm on every sync.
 	canRewrap := currentPrimaryKeyIs(ctx, deps, sess, targetKIDHex)
 
-	out := &PullResponse{NextCursor: nextCursor}
+	items := make([]PullItem, len(ids))
+	var group errgroup.Group
+	group.SetLimit(pullConcurrency)
+	for i, id := range ids {
+		group.Go(func() error {
+			items[i] = pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex, canRewrap)
+			return nil
+		})
+	}
+	// pullOne never returns an error; per-item failures are encoded in
+	// the item itself so one bad row cannot fail its batch peers.
+	_ = group.Wait()
+
+	out := &PullResponse{NextCursor: nextCursor, Items: items}
 	var okCount, failCount, legacyCount int
-	for _, id := range ids {
-		item := pullOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex, canRewrap)
-		out.Items = append(out.Items, item)
+	for _, item := range items {
 		switch {
 		case !item.OK:
 			failCount++
