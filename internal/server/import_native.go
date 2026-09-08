@@ -660,6 +660,10 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 		out := cloneRawMap(message.Raw)
 		attachments := make([]map[string]json.RawMessage, 0, len(message.Attachments))
 		for _, attachment := range message.Attachments {
+			if attachment.Type == importer.AttachmentDocument && !nativeDocumentHasPayload(attachment) {
+				job.addWarning("document attachment without content skipped")
+				continue
+			}
 			stored := cloneRawMap(attachment.Raw)
 			delete(stored, "archivePath")
 			delete(stored, "backup_path")
@@ -732,6 +736,29 @@ func buildNativeChatPayload(ctx context.Context, deps Deps, sess Session, arch *
 	}
 	body, err := json.Marshal(payload)
 	return body, attachmentIDs, err
+}
+
+func nativeDocumentHasPayload(attachment nativeAttachmentPayload) bool {
+	if strings.TrimSpace(attachment.TextContent) != "" {
+		return true
+	}
+	pagesJSON, ok := attachment.Raw["pages"]
+	if !ok {
+		return false
+	}
+	var pages []map[string]json.RawMessage
+	if json.Unmarshal(pagesJSON, &pages) != nil {
+		return false
+	}
+	for _, page := range pages {
+		for _, field := range []string{"text", "image"} {
+			var value *string
+			if json.Unmarshal(page[field], &value) == nil && value != nil && strings.TrimSpace(*value) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func cloneRawMap(input map[string]json.RawMessage) map[string]json.RawMessage {

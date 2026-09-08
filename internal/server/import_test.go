@@ -227,6 +227,36 @@ func TestImportJobSkipsUnresolvedTinfoilImages(t *testing.T) {
 	}
 }
 
+func TestImportJobSkipsTinfoilDocumentsWithoutContent(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	f.cp.mux.HandleFunc("POST /api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	archive := []byte(`[{"uuid":"conv-doc-empty","name":"Doc","created_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"read this","created_at":"2024-02-02T00:00:00Z","attachments":[{"id":"doc-1","type":"document","fileName":"missing.pdf"}]}]}]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	createdAt := time.Date(2024, time.February, 2, 0, 0, 0, 0, time.UTC)
+	chatID := deterministicChatID(f.userSub, importer.SourceTinfoil, "conv-doc-empty", createdAt)
+	payload := decryptNativeTestBlob(t, f, "chat", chatID)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `"attachments"`) {
+		t.Fatalf("payload retained empty document attachment: %s", encoded)
+	}
+	if len(job.Snapshot().Warnings) == 0 {
+		t.Fatal("expected warning for skipped empty document")
+	}
+}
+
 func TestImportJobEnforcesMessageLimit(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
