@@ -201,7 +201,7 @@ func TestNativePortableMessageFieldsRoundTrip(t *testing.T) {
 }
 
 func TestNativeChatPayloadSkipsDocumentsWithoutContent(t *testing.T) {
-	input := []byte(`{"title":"Documents","messages":[{"role":"user","content":"read","timestamp":"2026-08-20T12:00:00.000Z","attachments":[{"id":"empty","type":"document","fileName":"empty.pdf"},{"id":"invalid-pages","type":"document","fileName":"invalid.pdf","pages":[{}]},{"id":"pages","type":"document","fileName":"scan.pdf","pages":[{"page":1,"text":"page"}]}]}],"createdAt":"2026-08-20T12:00:00.000Z","isLocalOnly":false}`)
+	input := []byte(`{"title":"Documents","messages":[{"role":"user","content":"read","timestamp":"2026-08-20T12:00:00.000Z","attachments":[{"id":"empty","type":"document","fileName":"empty.pdf"},{"id":"invalid-pages","type":"document","fileName":"invalid.pdf","pages":[{}]},{"id":"blank-pages","type":"document","fileName":"blank.pdf","pages":[{"text":"   "}]},{"id":"pages","type":"document","fileName":"scan.pdf","pages":[{"page":1,"text":"page"}]}]}],"createdAt":"2026-08-20T12:00:00.000Z","isLocalOnly":false}`)
 	var chat nativeChatPayload
 	if err := json.Unmarshal(input, &chat); err != nil {
 		t.Fatal(err)

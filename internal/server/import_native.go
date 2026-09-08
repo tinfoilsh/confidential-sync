@@ -753,7 +753,7 @@ func nativeDocumentHasPayload(attachment nativeAttachmentPayload) bool {
 	for _, page := range pages {
 		for _, field := range []string{"text", "image"} {
 			var value *string
-			if json.Unmarshal(page[field], &value) == nil && value != nil {
+			if json.Unmarshal(page[field], &value) == nil && value != nil && strings.TrimSpace(*value) != "" {
 				return true
 			}
 		}
