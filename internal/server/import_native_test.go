@@ -200,6 +200,31 @@ func TestNativePortableMessageFieldsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNativeChatPayloadSkipsDocumentsWithoutContent(t *testing.T) {
+	input := []byte(`{"title":"Documents","messages":[{"role":"user","content":"read","timestamp":"2026-08-20T12:00:00.000Z","attachments":[{"id":"empty","type":"document","fileName":"empty.pdf"},{"id":"pages","type":"document","fileName":"scan.pdf","pages":[{"page":1,"text":"page"}]}]}],"createdAt":"2026-08-20T12:00:00.000Z","isLocalOnly":false}`)
+	var chat nativeChatPayload
+	if err := json.Unmarshal(input, &chat); err != nil {
+		t.Fatal(err)
+	}
+	job := &ImportJobState{}
+	output, _, err := buildNativeChatPayload(context.Background(), Deps{}, Session{}, nil, nil, job, "chat-1", "", importer.RestoreMarker{}, chat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored map[string]any
+	if err := json.Unmarshal(output, &restored); err != nil {
+		t.Fatal(err)
+	}
+	message := restored["messages"].([]any)[0].(map[string]any)
+	attachments := message["attachments"].([]any)
+	if len(attachments) != 1 || attachments[0].(map[string]any)["id"] != "pages" {
+		t.Fatalf("unexpected restored attachments: %#v", attachments)
+	}
+	if len(job.Snapshot().Warnings) == 0 {
+		t.Fatal("expected warning for skipped empty document")
+	}
+}
+
 func TestNativeImportStatusFieldNamesMatchWebContract(t *testing.T) {
 	response := ImportStatusResponse{
 		Status: string(ImportJobCompleted), Phase: "complete", Imported: 3, Failed: 1, Total: 5,

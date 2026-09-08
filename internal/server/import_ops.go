@@ -128,6 +128,10 @@ func sealImportedChat(
 		msg := &chat.Messages[mi]
 		kept := make([]importer.Attachment, 0, len(msg.Attachments))
 		for _, att := range msg.Attachments {
+			if att.Type == importer.AttachmentDocument && att.BinaryRef == "" && strings.TrimSpace(att.TextContent) == "" {
+				job.addWarning("document attachment without content skipped")
+				continue
+			}
 			if att.BinaryRef == "" {
 				if att.Type == importer.AttachmentImage && (att.ID == "" || att.EncryptionKey == "") {
 					job.addWarning("image attachment skipped")
