@@ -746,8 +746,19 @@ func nativeDocumentHasPayload(attachment nativeAttachmentPayload) bool {
 	if !ok {
 		return false
 	}
-	var pages []json.RawMessage
-	return json.Unmarshal(pagesJSON, &pages) == nil && len(pages) > 0
+	var pages []map[string]json.RawMessage
+	if json.Unmarshal(pagesJSON, &pages) != nil {
+		return false
+	}
+	for _, page := range pages {
+		for _, field := range []string{"text", "image"} {
+			var value *string
+			if json.Unmarshal(page[field], &value) == nil && value != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func cloneRawMap(input map[string]json.RawMessage) map[string]json.RawMessage {
