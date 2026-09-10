@@ -68,7 +68,7 @@ const chatgptSyntheticRoot = "client-created-root"
 func parseChatGPT(data []byte, opts Options, emit EmitFunc) (Result, error) {
 	var conversations []chatgptConversation
 	if err := json.Unmarshal(data, &conversations); err != nil {
-		return Result{}, fmt.Errorf("importer: parse chatgpt conversations: %w", err)
+		return Result{}, fmt.Errorf("%w: parse chatgpt conversations: %w", ErrInvalidExport, err)
 	}
 
 	var result Result

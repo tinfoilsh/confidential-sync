@@ -163,7 +163,7 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 			}
 			return &importArchive{plainJSON: plain}, nil
 		}
-		return nil, importFailure(ImportFailureInvalidArchive, fmt.Errorf("import: open archive: %w", err))
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open archive: %w", err))
 	}
 
 	arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
@@ -314,12 +314,12 @@ func (a *importArchive) readConversations() ([]byte, error) {
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return nil, importFailure(ImportFailureInvalidArchive, fmt.Errorf("import: open conversations.json: %w", err))
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open conversations.json: %w", err))
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, int64(MaxImportJSONBytes)+1))
 	if err != nil {
-		return nil, importFailure(ImportFailureInvalidArchive, fmt.Errorf("import: read conversations.json: %w", err))
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: read conversations.json: %w", err))
 	}
 	if int64(len(data)) > int64(MaxImportJSONBytes) {
 		return nil, limitExceededErr("import: conversations.json exceeds size limit")

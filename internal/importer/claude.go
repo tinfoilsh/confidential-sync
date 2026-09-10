@@ -49,7 +49,7 @@ type claudeFile struct {
 func parseClaude(data []byte, opts Options, emit EmitFunc) (Result, error) {
 	var conversations []claudeConversation
 	if err := json.Unmarshal(data, &conversations); err != nil {
-		return Result{}, fmt.Errorf("importer: parse claude conversations: %w", err)
+		return Result{}, fmt.Errorf("%w: parse claude conversations: %w", ErrInvalidExport, err)
 	}
 
 	var result Result

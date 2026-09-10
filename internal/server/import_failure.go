@@ -1,9 +1,13 @@
 package server
 
 import (
+	"archive/zip"
+	"compress/flate"
 	"context"
-	"encoding/json"
 	"errors"
+	"io"
+
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
 // ImportFailureReason is the user-safe classification of why an import
@@ -41,9 +45,16 @@ type importFailureErr struct {
 func (e *importFailureErr) Error() string { return e.err.Error() }
 func (e *importFailureErr) Unwrap() error { return e.err }
 
+// importFailure tags err with reason. An error that already carries a
+// tag is returned unchanged so the most specific classification, made
+// closest to the cause, survives outer wrapping.
 func importFailure(reason ImportFailureReason, err error) error {
 	if err == nil {
 		return nil
+	}
+	var tagged *importFailureErr
+	if errors.As(err, &tagged) {
+		return err
 	}
 	return &importFailureErr{reason: reason, err: err}
 }
@@ -56,14 +67,25 @@ func limitExceededErr(msg string) error {
 	return importFailure(ImportFailureLimitExceeded, errors.New(msg))
 }
 
-// classifyParseFailure tags a ParseEach error. The parsers fail with a
-// JSON decode error when the archive is not a valid export; any other
-// error originated in the emit callback and is already classified (or
-// is a transport error the coordinator maps to internal/timeout).
+// classifyParseFailure tags a ParseEach error. Only a parser rejection
+// of the root document means the upload is not a valid export; any
+// other error originated in the emit callback and is either already
+// classified or a transport error the coordinator maps to
+// internal/timeout.
 func classifyParseFailure(err error) error {
-	var syntaxErr *json.SyntaxError
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+	if errors.Is(err, importer.ErrInvalidExport) {
+		return importFailure(ImportFailureInvalidArchive, err)
+	}
+	return err
+}
+
+// classifyArchiveReadErr tags ZIP or deflate corruption as an invalid
+// archive. Anything else (a staged-chunk fetch failing or timing out)
+// is left untagged so it is reported as internal or timeout.
+func classifyArchiveReadErr(err error) error {
+	var corrupt flate.CorruptInputError
+	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) || errors.Is(err, zip.ErrAlgorithm) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &corrupt) {
 		return importFailure(ImportFailureInvalidArchive, err)
 	}
 	return err
@@ -97,7 +119,7 @@ func importFailureMessage(reason ImportFailureReason) string {
 	case ImportFailureInvalidArchive:
 		return "import archive could not be read"
 	case ImportFailureLimitExceeded:
-		return "import archive exceeds size limits"
+		return "import archive exceeds import limits"
 	case ImportFailureKeyMismatch:
 		return "import key is not the current key"
 	default:

@@ -1,10 +1,17 @@
 package importer
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrInvalidExport is wrapped by every parser when the root document is
+// not a valid export for the requested source. Callers use it to tell
+// a corrupt upload apart from errors raised by their own emit callback,
+// which ParseEach forwards unchanged.
+var ErrInvalidExport = errors.New("importer: invalid export")
 
 // Options configures a parse run.
 type Options struct {
