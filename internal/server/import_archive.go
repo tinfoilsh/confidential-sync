@@ -85,7 +85,9 @@ func (r *stagedArchiveReader) getChunk(idx int) ([]byte, error) {
 
 	chunk, err := r.deps.Buckets.Get(r.ctx, r.owner, importChunkToken(r.uploadID, idx), r.stagingKey)
 	if err != nil {
-		return nil, fmt.Errorf("import: fetch staged chunk: %w", err)
+		// A staging fetch failure is ours, not the user's, even when it
+		// surfaces as a truncated read while the ZIP reader is decoding.
+		return nil, importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", err))
 	}
 	if int64(len(chunk)) != r.expectedChunkLen(idx) {
 		return nil, fmt.Errorf("import: staged chunk %d has unexpected size", idx)

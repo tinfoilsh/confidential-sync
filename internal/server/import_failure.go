@@ -96,11 +96,14 @@ func classifyArchiveReadErr(err error) error {
 // user learns their archive was too large to finish rather than seeing
 // a generic failure.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ImportFailureTimeout
+	}
 	var tagged *importFailureErr
 	if errors.As(err, &tagged) {
 		return tagged.reason
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ImportFailureTimeout
 	}
 	var appErr *AppError

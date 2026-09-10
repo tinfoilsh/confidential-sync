@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
@@ -33,7 +34,9 @@ func TestClassifyImportFailure(t *testing.T) {
 		{"emit callback transport error is not an archive problem", context.Background(), classifyParseFailure(errors.New("push: connection reset")), ImportFailureInternal},
 		{"zip corruption", context.Background(), classifyArchiveReadErr(fmt.Errorf("import: open archive: %w", zip.ErrFormat)), ImportFailureInvalidArchive},
 		{"chunk fetch timeout while reading zip", expired, classifyArchiveReadErr(fmt.Errorf("import: read conversations.json: %w", context.DeadlineExceeded)), ImportFailureTimeout},
-		{"chunk fetch failure while reading zip", context.Background(), classifyArchiveReadErr(errors.New("import: fetch staged chunk: 503")), ImportFailureInternal},
+		{"chunk fetch failure while reading zip", context.Background(), classifyArchiveReadErr(importFailure(ImportFailureInternal, errors.New("import: fetch staged chunk: 503"))), ImportFailureInternal},
+		{"truncated chunk fetch is not archive corruption", context.Background(), classifyArchiveReadErr(importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", io.ErrUnexpectedEOF))), ImportFailureInternal},
+		{"chunk fetch deadline wins over its internal tag", expired, importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", context.DeadlineExceeded)), ImportFailureTimeout},
 		{"stale key", context.Background(), &AppError{Code: CodeStaleKey}, ImportFailureKeyMismatch},
 	}
 	for _, tc := range cases {
