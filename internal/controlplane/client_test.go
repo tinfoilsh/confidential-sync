@@ -1066,7 +1066,7 @@ func TestNotifyImportOutcomeSendsFailureReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("notify import outcome: %v", err)
 	}
-	if body["status"] != "failed" || body["failureReason"] != "timeout" || body["importedCount"] != float64(12) {
+	if body["status"] != "failed" || body["failureReason"] != "timeout" || body["importedCount"] != float64(12) || body["failedCount"] != float64(1) {
 		t.Fatalf("unexpected failure body: %v", body)
 	}
 }

@@ -1378,7 +1378,7 @@ func (c *Client) NotifyImportOutcome(ctx context.Context, outcome ImportOutcome)
 		"importedCount": outcome.Imported,
 		"failedCount":   outcome.Failed,
 	}
-	if outcome.FailureReason != "" {
+	if outcome.Status == ImportOutcomeFailed && outcome.FailureReason != "" {
 		payload["failureReason"] = outcome.FailureReason
 	}
 	body, err := json.Marshal(payload)
