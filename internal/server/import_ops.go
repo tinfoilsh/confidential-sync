@@ -62,17 +62,17 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	emit := func(chat *importer.Chat) error {
 		conversations++
 		if conversations > MaxImportConversations {
-			return errors.New("import: conversation limit exceeded")
+			return limitExceededErr("import: conversation limit exceeded")
 		}
 		messages += len(chat.Messages)
 		if messages > maxImportMessages {
-			return errors.New("import: message limit exceeded")
+			return limitExceededErr("import: message limit exceeded")
 		}
 		for _, msg := range chat.Messages {
 			parsedAttachments += len(msg.Attachments)
 		}
 		if parsedAttachments > MaxImportAttachments {
-			return errors.New("import: attachment limit exceeded")
+			return limitExceededErr("import: attachment limit exceeded")
 		}
 		chat.Restore = &importer.RestoreMarker{
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
@@ -100,7 +100,7 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	}
 
 	if _, err := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit); err != nil {
-		return err
+		return classifyParseFailure(err)
 	}
 
 	job.setProgress(imported, failed, conversations)
@@ -158,7 +158,7 @@ func sealImportedChat(
 				continue
 			}
 			if *attachments >= MaxImportAttachments {
-				return errors.New("import: attachment limit exceeded")
+				return limitExceededErr("import: attachment limit exceeded")
 			}
 
 			idem := attachmentIdemKey(chat.ID, att.BinaryRef, idx)

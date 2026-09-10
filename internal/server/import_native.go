@@ -218,7 +218,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 		return nil, errors.New("import: invalid manifest counts")
 	}
 	if len(manifest.Entities) > MaxImportConversations || len(manifest.Blobs) > MaxImportAttachments {
-		return nil, errors.New("import: native backup count limit exceeded")
+		return nil, limitExceededErr("import: native backup count limit exceeded")
 	}
 
 	out := &validatedNativeBackup{manifest: manifest, blobs: make(map[string]nativeBlobManifest)}
@@ -256,7 +256,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 		}
 		entityBytes += int64(len(data))
 		if entityBytes > MaxImportJSONBytes {
-			return nil, errors.New("import: aggregate entity JSON exceeds size limit")
+			return nil, limitExceededErr("import: aggregate entity JSON exceeds size limit")
 		}
 		if err := validateListedData(data, entity.SizeBytes, entity.SHA256, true); err != nil {
 			return nil, fmt.Errorf("import: entity %q: %w", entity.SourceID, err)
@@ -317,7 +317,7 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 				}
 			}
 			if messages > MaxImportMessages || attachments > MaxImportAttachments {
-				return nil, errors.New("import: native chat aggregate limit exceeded")
+				return nil, limitExceededErr("import: native chat aggregate limit exceeded")
 			}
 			if !validJSONTime(payload.CreatedAt) {
 				return nil, errors.New("import: invalid chat createdAt")
@@ -444,7 +444,7 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 	job.setPhase("validating")
 	backup, err := validateNativeBackup(arch)
 	if err != nil {
-		return err
+		return importFailure(ImportFailureInvalidArchive, err)
 	}
 
 	projects := make(map[string]string)

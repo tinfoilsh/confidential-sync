@@ -44,6 +44,7 @@ type ImportStatusResponse struct {
 	Errors          []string                    `json:"errors,omitempty"`
 	ProjectMappings map[string]string           `json:"project_mappings,omitempty"`
 	JobID           string                      `json:"job_id,omitempty"`
+	FailureReason   string                      `json:"failure_reason,omitempty"`
 }
 
 type ImportKindCounts struct {
