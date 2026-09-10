@@ -91,10 +91,11 @@ func classifyArchiveReadErr(err error) error {
 	return err
 }
 
-// classifyImportFailure maps a job error to its user-safe reason.
-// Tagged errors win; a budget expiry is reported as a timeout so the
-// user learns their archive was too large to finish rather than seeing
-// a generic failure.
+// classifyImportFailure maps a job error to its user-safe reason. A
+// deadline anywhere in the chain is reported as a timeout before any
+// tag is consulted, so the user learns their archive was too large to
+// finish rather than seeing a generic failure; otherwise the tag set
+// closest to the cause wins.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ImportFailureTimeout
