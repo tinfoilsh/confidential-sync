@@ -397,7 +397,7 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 	defer cancel()
 
 	deps.logInfo("import job begin: user=%s job=%s source=%s", job.UserID, job.ID, job.Source)
-	err := c.runner(ctx, deps, sess, job)
+	err := c.runGuarded(ctx, deps, sess, job)
 	if err != nil {
 		reason := classifyImportFailure(ctx, err)
 		deps.logError("import job failed: user=%s job=%s reason=%s err=%v", job.UserID, job.ID, reason, err)
@@ -419,6 +419,19 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 		return
 	}
 	time.AfterFunc(retention, func() { c.deleteIfSame(job) })
+}
+
+// runGuarded converts a panic in the detached job into an ordinary
+// error. The HTTP middleware's recover does not cover this goroutine,
+// so without it one malformed archive would take down the enclave and
+// every other user's in-flight import with it.
+func (c *ImportCoordinator) runGuarded(ctx context.Context, deps Deps, sess Session, job *ImportJobState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("import: panic: %v", r)
+		}
+	}()
+	return c.runner(ctx, deps, sess, job)
 }
 
 // cleanupStaging deletes every staged chunk for the job. Buckets delete

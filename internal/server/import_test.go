@@ -394,6 +394,27 @@ func TestImportJobBudgetExpiryReportsTimeout(t *testing.T) {
 	}
 }
 
+func TestImportJobPanicIsContainedAndReported(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	notified := captureImportNotifications(t, f)
+
+	archive := []byte(`[]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	coord := NewImportCoordinator()
+	coord.runner = func(context.Context, Deps, Session, *ImportJobState) error {
+		panic("malformed export")
+	}
+	snap := runCoordinatorJob(t, f, coord, job)
+
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureInternal {
+		t.Fatalf("status=%s reason=%q, want failed/internal", snap.Status, snap.FailureReason)
+	}
+	if body := notified.single(t); body["failureReason"] != string(ImportFailureInternal) {
+		t.Fatalf("unexpected panic notification: %v", body)
+	}
+}
+
 func TestImportJobStaleKeyReportsKeyMismatch(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = "someone-elses-key"
