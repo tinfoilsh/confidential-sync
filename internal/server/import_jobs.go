@@ -62,6 +62,7 @@ type ImportJobState struct {
 	projectMappings map[string]string
 	warnings        []string
 	errs            []string
+	failureReason   ImportFailureReason
 	startedRun      bool
 	updatedAt       time.Time
 
@@ -79,6 +80,7 @@ type ImportJobSnapshot struct {
 	Warnings        []string
 	Errors          []string
 	ProjectMappings map[string]string
+	FailureReason   ImportFailureReason
 }
 
 func (j *ImportJobState) Snapshot() ImportJobSnapshot {
@@ -105,6 +107,7 @@ func (j *ImportJobState) Snapshot() ImportJobSnapshot {
 		Warnings:        warnings,
 		Errors:          errs,
 		ProjectMappings: projectMappings,
+		FailureReason:   j.failureReason,
 	}
 }
 
@@ -218,12 +221,23 @@ func (j *ImportJobState) setProgress(imported, failed, total int) {
 }
 
 func (j *ImportJobState) finish(status ImportJobStatus) {
+	j.finishWithReason(status, "")
+}
+
+// fail records why the job ended so the status response and the
+// controlplane notification can tell the user what went wrong.
+func (j *ImportJobState) fail(reason ImportFailureReason) {
+	j.finishWithReason(ImportJobFailed, reason)
+}
+
+func (j *ImportJobState) finishWithReason(status ImportJobStatus, reason ImportFailureReason) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.status == ImportJobCompleted || j.status == ImportJobFailed {
 		return
 	}
 	j.status = status
+	j.failureReason = reason
 	j.updatedAt = time.Now().UTC()
 	cryptopkg.Zero(j.cek)
 	cryptopkg.Zero(j.stagingKey)
@@ -383,11 +397,14 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 	defer cancel()
 
 	deps.logInfo("import job begin: user=%s job=%s source=%s", job.UserID, job.ID, job.Source)
-	err := c.runner(ctx, deps, sess, job)
+	err := c.runGuarded(ctx, deps, sess, job)
 	if err != nil {
-		deps.logError("import job failed: user=%s job=%s err=%v", job.UserID, job.ID, err)
-		job.addError("import failed")
-		job.finish(ImportJobFailed)
+		reason := classifyImportFailure(ctx, err)
+		deps.logError("import job failed: user=%s job=%s reason=%s err=%v", job.UserID, job.ID, reason, err)
+		job.addError(importFailureMessage(reason))
+		snap := job.Snapshot()
+		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason)
+		job.fail(reason)
 	} else {
 		snap := job.Snapshot()
 		deps.logInfo("import job done: user=%s job=%s imported=%d failed=%d", job.UserID, job.ID, snap.Imported, snap.Failed)
@@ -402,6 +419,19 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 		return
 	}
 	time.AfterFunc(retention, func() { c.deleteIfSame(job) })
+}
+
+// runGuarded converts a panic in the detached job into an ordinary
+// error. The HTTP middleware's recover does not cover this goroutine,
+// so without it one malformed archive would take down the enclave and
+// every other user's in-flight import with it.
+func (c *ImportCoordinator) runGuarded(ctx context.Context, deps Deps, sess Session, job *ImportJobState) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("import: panic: %v", r)
+		}
+	}()
+	return c.runner(ctx, deps, sess, job)
 }
 
 // cleanupStaging deletes every staged chunk for the job. Buckets delete

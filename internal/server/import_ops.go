@@ -62,17 +62,17 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	emit := func(chat *importer.Chat) error {
 		conversations++
 		if conversations > MaxImportConversations {
-			return errors.New("import: conversation limit exceeded")
+			return limitExceededErr("import: conversation limit exceeded")
 		}
 		messages += len(chat.Messages)
 		if messages > maxImportMessages {
-			return errors.New("import: message limit exceeded")
+			return limitExceededErr("import: message limit exceeded")
 		}
 		for _, msg := range chat.Messages {
 			parsedAttachments += len(msg.Attachments)
 		}
 		if parsedAttachments > MaxImportAttachments {
-			return errors.New("import: attachment limit exceeded")
+			return limitExceededErr("import: attachment limit exceeded")
 		}
 		chat.Restore = &importer.RestoreMarker{
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
@@ -100,7 +100,7 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	}
 
 	if _, err := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit); err != nil {
-		return err
+		return classifyParseFailure(err)
 	}
 
 	job.setProgress(imported, failed, conversations)
@@ -158,7 +158,7 @@ func sealImportedChat(
 				continue
 			}
 			if *attachments >= MaxImportAttachments {
-				return errors.New("import: attachment limit exceeded")
+				return limitExceededErr("import: attachment limit exceeded")
 			}
 
 			idem := attachmentIdemKey(chat.ID, att.BinaryRef, idx)
@@ -291,13 +291,30 @@ func attachmentIdemKey(chatID, ref string, index int) string {
 // notifyImportComplete tells the controlplane to email the user. It is
 // best-effort: a failure is logged but never fails the job.
 func notifyImportComplete(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int) {
+	notifyImportOutcome(ctx, deps, controlplane.ImportOutcome{
+		ClerkUserID: clerkUserID, JobID: jobID, Source: source,
+		Status: controlplane.ImportOutcomeCompleted, Imported: imported, Failed: failed,
+	})
+}
+
+// notifyImportFailed tells the controlplane why the job did not finish
+// so the user is emailed instead of left polling a job that has gone.
+func notifyImportFailed(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int, reason ImportFailureReason) {
+	notifyImportOutcome(ctx, deps, controlplane.ImportOutcome{
+		ClerkUserID: clerkUserID, JobID: jobID, Source: source,
+		Status: controlplane.ImportOutcomeFailed, Imported: imported, Failed: failed,
+		FailureReason: string(reason),
+	})
+}
+
+func notifyImportOutcome(ctx context.Context, deps Deps, outcome controlplane.ImportOutcome) {
 	if deps.Controlplane == nil {
 		return
 	}
-	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importNotifyTimeout)
 	defer cancel()
-	if err := deps.Controlplane.NotifyImportComplete(notifyCtx, clerkUserID, jobID, source, imported, failed); err != nil {
-		deps.logError("import notify failed: user=%s job=%s err=%v", clerkUserID, jobID, err)
+	if err := deps.Controlplane.NotifyImportOutcome(notifyCtx, outcome); err != nil {
+		deps.logError("import notify failed: user=%s job=%s status=%s err=%v", outcome.ClerkUserID, outcome.JobID, outcome.Status, err)
 	}
 }
 

@@ -41,7 +41,7 @@ type tinfoilAttachment struct {
 func parseTinfoil(data []byte, opts Options, emit EmitFunc) (Result, error) {
 	var conversations []tinfoilConversation
 	if err := json.Unmarshal(data, &conversations); err != nil {
-		return Result{}, fmt.Errorf("importer: parse tinfoil conversations: %w", err)
+		return Result{}, fmt.Errorf("%w: parse tinfoil conversations: %w", ErrInvalidExport, err)
 	}
 
 	var result Result

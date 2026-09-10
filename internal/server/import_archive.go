@@ -85,7 +85,9 @@ func (r *stagedArchiveReader) getChunk(idx int) ([]byte, error) {
 
 	chunk, err := r.deps.Buckets.Get(r.ctx, r.owner, importChunkToken(r.uploadID, idx), r.stagingKey)
 	if err != nil {
-		return nil, fmt.Errorf("import: fetch staged chunk: %w", err)
+		// A staging fetch failure is ours, not the user's, even when it
+		// surfaces as a truncated read while the ZIP reader is decoding.
+		return nil, importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", err))
 	}
 	if int64(len(chunk)) != r.expectedChunkLen(idx) {
 		return nil, fmt.Errorf("import: staged chunk %d has unexpected size", idx)
@@ -155,7 +157,7 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 	if err != nil {
 		if errors.Is(err, zip.ErrFormat) {
 			if job.Source == string(importer.SourceTinfoilBackup) {
-				return nil, errors.New("import: tinfoil backup must be a ZIP archive")
+				return nil, invalidArchiveErr("import: tinfoil backup must be a ZIP archive")
 			}
 			plain, perr := readAllStaged(reader, MaxImportJSONBytes)
 			if perr != nil {
@@ -163,7 +165,7 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 			}
 			return &importArchive{plainJSON: plain}, nil
 		}
-		return nil, fmt.Errorf("import: open archive: %w", err)
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open archive: %w", err))
 	}
 
 	arch := &importArchive{zr: zr, files: make(map[string]*zip.File)}
@@ -186,7 +188,7 @@ func verifyStagedArchiveHash(r *stagedArchiveReader, wantHex string) error {
 	}
 	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(got, wantHex) {
-		return errors.New("import: archive hash mismatch")
+		return invalidArchiveErr("import: archive hash mismatch")
 	}
 	return nil
 }
@@ -199,14 +201,14 @@ func readAllStaged(r *stagedArchiveReader, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("import: read archive: %w", err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, errors.New("import: conversations.json exceeds size limit")
+		return nil, limitExceededErr("import: conversations.json exceeds size limit")
 	}
 	return data, nil
 }
 
 func (a *importArchive) validateAndIndex(source string) error {
 	if len(a.zr.File) > MaxImportEntries {
-		return fmt.Errorf("import: archive has too many entries")
+		return limitExceededErr("import: archive has too many entries")
 	}
 	var totalUncompressed uint64
 	names := make([]string, 0, len(a.zr.File))
@@ -214,27 +216,27 @@ func (a *importArchive) validateAndIndex(source string) error {
 		info := f.FileInfo()
 		if info.IsDir() {
 			if source == string(importer.SourceTinfoilBackup) {
-				return errors.New("import: native backup contains an unlisted directory entry")
+				return invalidArchiveErr("import: native backup contains an unlisted directory entry")
 			}
 			continue
 		}
 		mode := f.Mode()
 		if mode&os.ModeSymlink != 0 || !mode.IsRegular() {
-			return errors.New("import: archive contains an unsafe entry")
+			return invalidArchiveErr("import: archive contains an unsafe entry")
 		}
 		name, ok := safeZipName(f.Name)
 		if !ok {
-			return errors.New("import: archive contains an unsafe path")
+			return invalidArchiveErr("import: archive contains an unsafe path")
 		}
 		if _, dup := a.files[name]; dup {
-			return errors.New("import: archive contains a duplicate path")
+			return invalidArchiveErr("import: archive contains a duplicate path")
 		}
 		if f.UncompressedSize64 > uint64(MaxImportJSONBytes) {
-			return errors.New("import: archive entry exceeds size limit")
+			return limitExceededErr("import: archive entry exceeds size limit")
 		}
 		totalUncompressed += f.UncompressedSize64
 		if totalUncompressed > uint64(MaxImportUncompressedBytes) {
-			return errors.New("import: archive uncompressed size exceeds limit")
+			return limitExceededErr("import: archive uncompressed size exceeds limit")
 		}
 		a.files[name] = f
 		names = append(names, name)
@@ -247,12 +249,12 @@ func (a *importArchive) validateAndIndex(source string) error {
 	a.index = importer.NewIndex(names)
 	if source == string(importer.SourceTinfoilBackup) {
 		if _, ok := a.files[nativeManifestPath]; !ok {
-			return errors.New("import: archive is missing manifest.json")
+			return invalidArchiveErr("import: archive is missing manifest.json")
 		}
 		return nil
 	}
 	if a.conversationsName == "" {
-		return errors.New("import: archive is missing conversations.json")
+		return invalidArchiveErr("import: archive is missing conversations.json")
 	}
 	return nil
 }
@@ -272,7 +274,7 @@ func (a *importArchive) readEntry(name string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("import: read archive entry: %w", err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, errors.New("import: archive entry exceeds size limit")
+		return nil, limitExceededErr("import: archive entry exceeds size limit")
 	}
 	return data, nil
 }
@@ -310,19 +312,19 @@ func (a *importArchive) readConversations() ([]byte, error) {
 	}
 	f, ok := a.files[a.conversationsName]
 	if !ok {
-		return nil, errors.New("import: conversations.json not found")
+		return nil, invalidArchiveErr("import: conversations.json not found")
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return nil, fmt.Errorf("import: open conversations.json: %w", err)
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open conversations.json: %w", err))
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, int64(MaxImportJSONBytes)+1))
 	if err != nil {
-		return nil, fmt.Errorf("import: read conversations.json: %w", err)
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: read conversations.json: %w", err))
 	}
 	if int64(len(data)) > int64(MaxImportJSONBytes) {
-		return nil, errors.New("import: conversations.json exceeds size limit")
+		return nil, limitExceededErr("import: conversations.json exceeds size limit")
 	}
 	return data, nil
 }

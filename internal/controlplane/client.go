@@ -1340,23 +1340,52 @@ func (c *Client) RegisterAttachmentIndex(ctx context.Context, jwt, clerkUserID, 
 	)
 }
 
-// NotifyImportComplete asks the controlplane to email the user that an
-// off-device chat import finished. The enclave has no JWT to forward
-// for a detached job (it may have expired mid-import), so this is a
-// service-secret call that asserts the user only via X-Clerk-User-Id.
-func (c *Client) NotifyImportComplete(ctx context.Context, clerkUserID, jobID, source string, imported, failed int) error {
-	if clerkUserID == "" {
+// ImportOutcomeStatus tells the controlplane whether an import job
+// finished or stopped early so it can pick the matching email.
+type ImportOutcomeStatus string
+
+const (
+	ImportOutcomeCompleted ImportOutcomeStatus = "completed"
+	ImportOutcomeFailed    ImportOutcomeStatus = "failed"
+)
+
+// ImportOutcome is the payload for the import notification callback.
+// FailureReason is only set when Status is ImportOutcomeFailed and
+// carries the enclave's user-safe classification, never raw error text.
+type ImportOutcome struct {
+	ClerkUserID   string
+	JobID         string
+	Source        string
+	Status        ImportOutcomeStatus
+	Imported      int
+	Failed        int
+	FailureReason string
+}
+
+// NotifyImportOutcome asks the controlplane to email the user that an
+// off-device chat import finished or failed. The enclave has no JWT to
+// forward for a detached job (it may have expired mid-import), so this
+// is a service-secret call that asserts the user only via
+// X-Clerk-User-Id.
+func (c *Client) NotifyImportOutcome(ctx context.Context, outcome ImportOutcome) error {
+	if outcome.ClerkUserID == "" {
 		return fmt.Errorf("controlplane: clerk user id is required")
 	}
-	body, err := json.Marshal(map[string]any{
-		"jobId":         jobID,
-		"source":        source,
-		"importedCount": imported,
-		"failedCount":   failed,
-	})
+	payload := map[string]any{
+		"jobId":         outcome.JobID,
+		"source":        outcome.Source,
+		"status":        string(outcome.Status),
+		"importedCount": outcome.Imported,
+		"failedCount":   outcome.Failed,
+	}
+	if outcome.Status == ImportOutcomeFailed && outcome.FailureReason != "" {
+		payload["failureReason"] = outcome.FailureReason
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
+	clerkUserID := outcome.ClerkUserID
 	endpoint := c.baseURL + "/api/sync/notify-import-complete"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {

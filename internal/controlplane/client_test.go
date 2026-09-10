@@ -1018,8 +1018,9 @@ func TestAddAuthStampsClerkUserIDFromCaller(t *testing.T) {
 	}
 }
 
-func TestNotifyImportCompleteOmitsEmptyBearer(t *testing.T) {
+func TestNotifyImportOutcomeOmitsEmptyBearer(t *testing.T) {
 	st := newStub(t)
+	var body map[string]any
 	st.handle1("POST", "/api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get(HeaderAuth); got != "" {
 			t.Errorf("authorization header: %q, want empty", got)
@@ -1027,11 +1028,46 @@ func TestNotifyImportCompleteOmitsEmptyBearer(t *testing.T) {
 		if got := r.Header.Get(HeaderClerkUserID); got != "user_real" {
 			t.Errorf("clerk-user-id header: %q", got)
 		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
-	if err := c.NotifyImportComplete(context.Background(), "user_real", "job_1", "chatgpt", 3, 0); err != nil {
-		t.Fatalf("notify import complete: %v", err)
+	err := c.NotifyImportOutcome(context.Background(), ImportOutcome{
+		ClerkUserID: "user_real", JobID: "job_1", Source: "chatgpt",
+		Status: ImportOutcomeCompleted, Imported: 3,
+	})
+	if err != nil {
+		t.Fatalf("notify import outcome: %v", err)
+	}
+	if body["status"] != "completed" || body["importedCount"] != float64(3) {
+		t.Fatalf("unexpected completion body: %v", body)
+	}
+	if _, ok := body["failureReason"]; ok {
+		t.Fatalf("completed outcome must not carry a failure reason: %v", body)
+	}
+}
+
+func TestNotifyImportOutcomeSendsFailureReason(t *testing.T) {
+	st := newStub(t)
+	var body map[string]any
+	st.handle1("POST", "/api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
+	err := c.NotifyImportOutcome(context.Background(), ImportOutcome{
+		ClerkUserID: "user_real", JobID: "job_1", Source: "claude",
+		Status: ImportOutcomeFailed, Imported: 12, Failed: 1, FailureReason: "timeout",
+	})
+	if err != nil {
+		t.Fatalf("notify import outcome: %v", err)
+	}
+	if body["status"] != "failed" || body["failureReason"] != "timeout" || body["importedCount"] != float64(12) || body["failedCount"] != float64(1) {
+		t.Fatalf("unexpected failure body: %v", body)
 	}
 }
 

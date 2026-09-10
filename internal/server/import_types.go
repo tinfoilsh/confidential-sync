@@ -1,5 +1,7 @@
 package server
 
+import "time"
+
 // Wire shapes for the off-device chat import endpoints. The webapp
 // uploads a raw ChatGPT/Claude/Tinfoil export archive in chunks, hands
 // the enclave its CEK, and the enclave parses, seals, and stores every
@@ -44,6 +46,7 @@ type ImportStatusResponse struct {
 	Errors          []string                    `json:"errors,omitempty"`
 	ProjectMappings map[string]string           `json:"project_mappings,omitempty"`
 	JobID           string                      `json:"job_id,omitempty"`
+	FailureReason   string                      `json:"failure_reason,omitempty"`
 }
 
 type ImportKindCounts struct {
@@ -78,5 +81,9 @@ const (
 	// MaxImportJobErrors caps how many per-item warnings a job retains.
 	MaxImportJobErrors = 100
 )
+
+// importNotifyTimeout bounds the completion/failure callback to the
+// controlplane so a slow notify cannot hold the job goroutine open.
+const importNotifyTimeout = 30 * time.Second
 
 var maxImportMessages = MaxImportMessages
