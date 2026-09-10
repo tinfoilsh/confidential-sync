@@ -402,6 +402,8 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 		reason := classifyImportFailure(ctx, err)
 		deps.logError("import job failed: user=%s job=%s reason=%s err=%v", job.UserID, job.ID, reason, err)
 		job.addError(importFailureMessage(reason))
+		snap := job.Snapshot()
+		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason)
 		job.fail(reason)
 	} else {
 		snap := job.Snapshot()

@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -269,8 +271,12 @@ func TestImportJobEnforcesMessageLimit(t *testing.T) {
 	maxImportMessages = 0
 	t.Cleanup(func() { maxImportMessages = old })
 
-	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err == nil {
+	err := runImportJob(context.Background(), f.handler.deps, importSession(f), job)
+	if err == nil {
 		t.Fatal("expected message-limit error")
+	}
+	if got := classifyImportFailure(context.Background(), err); got != ImportFailureLimitExceeded {
+		t.Fatalf("message limit classified as %q, want %q", got, ImportFailureLimitExceeded)
 	}
 }
 
@@ -283,8 +289,126 @@ func TestImportJobRejectsHashMismatch(t *testing.T) {
 	job.ArchiveSHA256 = hashOf([]byte("different"))
 	job.cek = append([]byte(nil), f.userKey...)
 
-	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err == nil {
+	err := runImportJob(context.Background(), f.handler.deps, importSession(f), job)
+	if err == nil {
 		t.Fatal("expected hash-mismatch error")
+	}
+	if got := classifyImportFailure(context.Background(), err); got != ImportFailureInvalidArchive {
+		t.Fatalf("hash mismatch classified as %q, want %q", got, ImportFailureInvalidArchive)
+	}
+}
+
+// importNotifyCapture records every callback the enclave makes to the
+// controlplane's import notification endpoint.
+type importNotifyCapture struct {
+	mu    sync.Mutex
+	calls []map[string]any
+}
+
+func captureImportNotifications(t *testing.T, f *fixture) *importNotifyCapture {
+	t.Helper()
+	cap := &importNotifyCapture{}
+	f.cp.mux.HandleFunc("POST /api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode notify body: %v", err)
+		}
+		cap.mu.Lock()
+		cap.calls = append(cap.calls, body)
+		cap.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	return cap
+}
+
+func (c *importNotifyCapture) single(t *testing.T) map[string]any {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.calls) != 1 {
+		t.Fatalf("expected exactly one notification, got %d: %v", len(c.calls), c.calls)
+	}
+	return c.calls[0]
+}
+
+// runCoordinatorJob drives a staged job through the coordinator the way
+// the start handler does and waits for the detached goroutine to end.
+func runCoordinatorJob(t *testing.T, f *fixture, coord *ImportCoordinator, job *ImportJobState) ImportJobSnapshot {
+	t.Helper()
+	coord.jobs[job.UserID] = job
+	if !coord.Start(context.Background(), f.handler.deps, importSession(f), job, append([]byte(nil), f.userKey...)) {
+		t.Fatal("start returned false")
+	}
+	select {
+	case <-job.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("job did not finish")
+	}
+	return job.Snapshot()
+}
+
+func TestImportJobFailureNotifiesControlplaneWithReason(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	notified := captureImportNotifications(t, f)
+
+	job := stageArchive(t, f, "claude", []byte(`{"not":"an array"`))
+	coord := NewImportCoordinator()
+	snap := runCoordinatorJob(t, f, coord, job)
+
+	if snap.Status != ImportJobFailed {
+		t.Fatalf("status=%s, want failed", snap.Status)
+	}
+	if snap.FailureReason != ImportFailureInvalidArchive {
+		t.Fatalf("failure_reason=%q, want %q", snap.FailureReason, ImportFailureInvalidArchive)
+	}
+	if len(snap.Errors) != 1 || snap.Errors[0] != importFailureMessage(ImportFailureInvalidArchive) {
+		t.Fatalf("errors=%v, want the invalid-archive message", snap.Errors)
+	}
+	body := notified.single(t)
+	if body["status"] != "failed" || body["failureReason"] != string(ImportFailureInvalidArchive) {
+		t.Fatalf("unexpected failure notification: %v", body)
+	}
+}
+
+func TestImportJobBudgetExpiryReportsTimeout(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	notified := captureImportNotifications(t, f)
+
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	coord := NewImportCoordinator()
+	coord.runner = func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error {
+		<-ctx.Done()
+		return fmt.Errorf("import: push chat: %w", ctx.Err())
+	}
+	coord.budget = time.Millisecond
+	snap := runCoordinatorJob(t, f, coord, job)
+
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureTimeout {
+		t.Fatalf("status=%s reason=%q, want failed/timeout", snap.Status, snap.FailureReason)
+	}
+	if body := notified.single(t); body["failureReason"] != string(ImportFailureTimeout) {
+		t.Fatalf("unexpected timeout notification: %v", body)
+	}
+}
+
+func TestImportJobStaleKeyReportsKeyMismatch(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = "someone-elses-key"
+	notified := captureImportNotifications(t, f)
+
+	archive := []byte(`[]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	coord := NewImportCoordinator()
+	snap := runCoordinatorJob(t, f, coord, job)
+
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureKeyMismatch {
+		t.Fatalf("status=%s reason=%q errors=%v, want failed/key_mismatch", snap.Status, snap.FailureReason, snap.Errors)
+	}
+	if body := notified.single(t); body["failureReason"] != string(ImportFailureKeyMismatch) {
+		t.Fatalf("unexpected key notification: %v", body)
 	}
 }
 
