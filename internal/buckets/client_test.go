@@ -242,3 +242,35 @@ func TestConfiguredRejectsMalformedBuckets(t *testing.T) {
 		t.Error("Configured() = true on nil client")
 	}
 }
+
+func TestClientHTTPFailuresPreserveStatusWithoutResponseDetails(t *testing.T) {
+	const privateDetails = "private-object-path-and-message"
+	for _, status := range []int{http.StatusBadRequest, http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `<Error><Code>`+privateDetails+`</Code><Message>`+privateDetails+`</Message></Error>`)
+			}))
+			t.Cleanup(srv.Close)
+			c := NewClient(srv.URL, testBucket, srv.Client())
+			key := make([]byte, encryptionKeySize)
+			for name, call := range map[string]func() error{
+				"get":    func() error { _, err := c.Get(context.Background(), testOwner, testToken, key); return err },
+				"put":    func() error { return c.Put(context.Background(), testOwner, testToken, []byte("content"), key) },
+				"delete": func() error { return c.Delete(context.Background(), testOwner, testToken) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					err := call()
+					var statusErr *HTTPError
+					if !errors.As(err, &statusErr) || statusErr.StatusCode != status {
+						t.Fatalf("lost HTTP status: %v", err)
+					}
+					if strings.Contains(err.Error(), privateDetails) {
+						t.Fatal("bucket error retained private response details")
+					}
+				})
+			}
+		})
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
@@ -122,18 +123,24 @@ func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
 		return ImportFailureKeyMismatch
 	}
 	var upstreamErr *controlplane.Error
-	if errors.As(err, &upstreamErr) {
-		switch upstreamErr.StatusCode {
-		case http.StatusRequestTimeout, http.StatusGatewayTimeout:
-			return ImportFailureRequestTimeout
-		case http.StatusTooManyRequests:
-			return ImportFailureRateLimited
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return ImportFailureAuthorization
-		}
-		if upstreamErr.StatusCode >= http.StatusInternalServerError {
-			return ImportFailureServiceUnavailable
-		}
+	var bucketErr *buckets.HTTPError
+	var statusCode int
+	switch {
+	case errors.As(err, &upstreamErr):
+		statusCode = upstreamErr.StatusCode
+	case errors.As(err, &bucketErr):
+		statusCode = bucketErr.StatusCode
+	}
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return ImportFailureRequestTimeout
+	case http.StatusTooManyRequests:
+		return ImportFailureRateLimited
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ImportFailureAuthorization
+	}
+	if statusCode >= http.StatusInternalServerError {
+		return ImportFailureServiceUnavailable
 	}
 	if networkErr != nil || (appErr != nil && appErr.Code == CodeNetwork) {
 		return ImportFailureServiceUnavailable

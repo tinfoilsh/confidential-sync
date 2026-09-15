@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 )
 
@@ -157,5 +159,49 @@ func TestPullResponseDoesNotExposeFetchErrorDetails(t *testing.T) {
 	}
 	if result.Items[0].Reason != "" || bytes.Contains(body, []byte(privateImportTestText)) {
 		t.Fatal("pull response exposed raw fetch error text")
+	}
+}
+
+func TestImportJobReportsStagedStorageFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   ImportFailureReason
+	}{
+		{http.StatusServiceUnavailable, ImportFailureServiceUnavailable},
+		{http.StatusTooManyRequests, ImportFailureRateLimited},
+		{http.StatusGatewayTimeout, ImportFailureRequestTimeout},
+		{http.StatusForbidden, ImportFailureAuthorization},
+	} {
+		t.Run(string(tc.want), func(t *testing.T) {
+			f := newFixture(t)
+			f.cp.currentKID = f.userKeyID
+			notified := captureImportNotifications(t, f)
+			job := stageArchive(t, f, "claude", []byte(`[]`))
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(privateImportTestText))
+			}))
+			t.Cleanup(srv.Close)
+			f.handler.deps.Buckets = buckets.NewClient(srv.URL, "test-bucket", srv.Client())
+			capture := &importFailureLogCapture{}
+			f.handler.deps.Logger = capture
+			snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
+			if snap.Status != ImportJobFailed || snap.FailureReason != tc.want {
+				t.Fatalf("status=%s reason=%s, want failed/%s", snap.Status, snap.FailureReason, tc.want)
+			}
+			body := notified.single(t)
+			if body["failureReason"] != string(tc.want) {
+				t.Fatalf("notification reason=%v, want %s", body["failureReason"], tc.want)
+			}
+			for _, value := range []any{importStatusResponse(snap), body, capture.String()} {
+				encoded, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(encoded, []byte(privateImportTestText)) {
+					t.Fatal("staged storage failure exposed its response body")
+				}
+			}
+		})
 	}
 }
