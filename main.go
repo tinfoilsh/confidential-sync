@@ -19,11 +19,6 @@ import (
 // gitSHA is injected at build time via -ldflags="-X main.gitSHA=...".
 var gitSHA = "unknown"
 
-type stdLogger struct{}
-
-func (stdLogger) Errorf(f string, a ...any) { log.Printf("ERROR: "+f, a...) }
-func (stdLogger) Infof(f string, a ...any)  { log.Printf("INFO:  "+f, a...) }
-
 func main() {
 	addr := envDefault("LISTEN_ADDR", ":8089")
 	clerkIssuer := os.Getenv("CLERK_ISSUER")
@@ -96,7 +91,6 @@ func main() {
 		log.Printf("WARN: search backend not configured (SEARCH_BUCKETS_URL / SEARCH_INDEXES_BUCKET / TINFOIL_API_KEY unset or invalid bucket name); search routes will return 503")
 	}
 
-	logger := stdLogger{}
 	deps := server.Deps{
 		Controlplane:      cpClient,
 		Buckets:           bucketsClient,
@@ -104,11 +98,10 @@ func main() {
 		Embedder:          embedder,
 		GitSHA:            gitSHA,
 		SyncEnclaveSecret: syncEnclaveSecret,
-		Logger:            logger,
 	}
-	handler := server.NewHandler(deps, verifier, logger)
-	server.StartAttachmentOrphanReaper(ctx, deps, logger)
-	server.StartSearchIndexDeletionWorker(ctx, deps, logger)
+	handler := server.NewHandler(deps, verifier)
+	server.StartAttachmentOrphanReaper(ctx, deps)
+	server.StartSearchIndexDeletionWorker(ctx, deps)
 
 	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
 	// every legacy blob scope under a wall-clock budget capped to

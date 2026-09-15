@@ -396,19 +396,14 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 	ctx := context.WithoutCancel(parentCtx)
 	ctx, cancel := context.WithTimeout(ctx, c.budget)
 	defer cancel()
-
-	deps.logInfo("import job begin: user=%s job=%s source=%s", job.UserID, job.ID, job.Source)
 	err := c.runGuarded(ctx, deps, sess, job)
 	if err != nil {
 		reason := classifyImportFailure(ctx, err)
 		job.addError(importFailureMessage(reason))
 		snap := job.Snapshot()
-		deps.logError("import job failed: user=%s job=%s reason=%s imported=%d failed=%d error_type=%T", job.UserID, job.ID, reason, snap.Imported, snap.Failed, err)
 		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason)
 		job.fail(reason)
 	} else {
-		snap := job.Snapshot()
-		deps.logInfo("import job done: user=%s job=%s imported=%d failed=%d", job.UserID, job.ID, snap.Imported, snap.Failed)
 		job.finish(ImportJobCompleted)
 	}
 

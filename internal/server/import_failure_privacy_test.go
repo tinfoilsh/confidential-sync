@@ -5,12 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
@@ -18,27 +15,6 @@ import (
 )
 
 const privateImportTestText = "private conversation title, message, filename, and key"
-
-type importFailureLogCapture struct {
-	mu   sync.Mutex
-	text bytes.Buffer
-}
-
-func (l *importFailureLogCapture) Infof(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	fmt.Fprintf(&l.text, format, args...)
-}
-
-func (l *importFailureLogCapture) Errorf(format string, args ...any) {
-	l.Infof(format, args...)
-}
-
-func (l *importFailureLogCapture) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.text.String()
-}
 
 func TestImportFailureDoesNotExposePrivateErrorDetails(t *testing.T) {
 	cases := []struct {
@@ -55,8 +31,6 @@ func TestImportFailureDoesNotExposePrivateErrorDetails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			capture := &importFailureLogCapture{}
-			f.handler.deps.Logger = capture
 			notified := captureImportNotifications(t, f)
 			job := stageArchive(t, f, "claude", []byte(`[]`))
 			coord := NewImportCoordinator()
@@ -75,7 +49,7 @@ func TestImportFailureDoesNotExposePrivateErrorDetails(t *testing.T) {
 			if body["failureReason"] != string(tc.want) || body["importedCount"] != float64(255) {
 				t.Fatalf("unexpected notification: %v", body)
 			}
-			for _, value := range []any{importStatusResponse(snap), body, capture.String()} {
+			for _, value := range []any{importStatusResponse(snap), body} {
 				encoded, err := json.Marshal(value)
 				if err != nil {
 					t.Fatal(err)
@@ -83,9 +57,6 @@ func TestImportFailureDoesNotExposePrivateErrorDetails(t *testing.T) {
 				if bytes.Contains(encoded, []byte(privateImportTestText)) {
 					t.Fatal("private error details escaped the import worker")
 				}
-			}
-			if !strings.Contains(capture.String(), "reason="+string(tc.want)) {
-				t.Fatal("safe failure reason missing from logs")
 			}
 		})
 	}
@@ -183,8 +154,6 @@ func TestImportJobReportsStagedStorageFailures(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 			f.handler.deps.Buckets = buckets.NewClient(srv.URL, "test-bucket", srv.Client())
-			capture := &importFailureLogCapture{}
-			f.handler.deps.Logger = capture
 			snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
 			if snap.Status != ImportJobFailed || snap.FailureReason != tc.want {
 				t.Fatalf("status=%s reason=%s, want failed/%s", snap.Status, snap.FailureReason, tc.want)
@@ -193,7 +162,7 @@ func TestImportJobReportsStagedStorageFailures(t *testing.T) {
 			if body["failureReason"] != string(tc.want) {
 				t.Fatalf("notification reason=%v, want %s", body["failureReason"], tc.want)
 			}
-			for _, value := range []any{importStatusResponse(snap), body, capture.String()} {
+			for _, value := range []any{importStatusResponse(snap), body} {
 				encoded, err := json.Marshal(value)
 				if err != nil {
 					t.Fatal(err)

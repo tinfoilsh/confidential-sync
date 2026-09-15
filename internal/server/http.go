@@ -37,18 +37,12 @@ const (
 type Handler struct {
 	deps               Deps
 	verifier           auth.Verifier
-	logger             Logger
 	coordinator        *MigrationCoordinator
 	importCoordinator  *ImportCoordinator
 	reindexCoordinator *SearchReindexCoordinator
 }
 
-type Logger interface {
-	Errorf(format string, args ...any)
-	Infof(format string, args ...any)
-}
-
-func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
+func NewHandler(deps Deps, verifier auth.Verifier) *Handler {
 	if deps.SearchCache == nil {
 		deps.SearchCache = newSearchIndexCache(searchCacheBudgetBytes)
 	}
@@ -58,7 +52,6 @@ func NewHandler(deps Deps, verifier auth.Verifier, logger Logger) *Handler {
 	return &Handler{
 		deps:               deps,
 		verifier:           verifier,
-		logger:             logger,
 		coordinator:        NewMigrationCoordinator(),
 		importCoordinator:  NewImportCoordinator(),
 		reindexCoordinator: NewSearchReindexCoordinator(),
@@ -286,9 +279,6 @@ func (h *Handler) commonMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				if h.logger != nil {
-					h.logger.Errorf("panic in handler: %v", rec)
-				}
 				writeError(w, &AppError{Status: http.StatusInternalServerError, Code: CodeInternal, Message: "internal error"})
 			}
 		}()
@@ -453,10 +443,7 @@ func (h *Handler) registerKey(w http.ResponseWriter, r *http.Request, sess Sessi
 	}
 	oldSearchObject := ""
 	if searchConfigured(h.deps) {
-		state, stateErr := h.deps.Controlplane.GetSearchIndexState(r.Context(), sess.RawJWT, sess.Claims.Subject)
-		if stateErr != nil {
-			h.deps.logError("key register search state lookup failed: user=%s err=%v", sess.Claims.Subject, stateErr)
-		} else {
+		if state, stateErr := h.deps.Controlplane.GetSearchIndexState(r.Context(), sess.RawJWT, sess.Claims.Subject); stateErr == nil {
 			oldSearchObject = state.ObjectKey
 		}
 	}
@@ -467,7 +454,6 @@ func (h *Handler) registerKey(w http.ResponseWriter, r *http.Request, sess Sessi
 	}
 	if resp.SearchIndexFenced {
 		if err := resetSearchForUser(r.Context(), h.deps, h.reindexCoordinator, sess.Claims.Subject, oldSearchObject); err != nil {
-			h.deps.logError("key-change search reset failed: user=%s err=%v", sess.Claims.Subject, err)
 			writeError(w, err)
 			return
 		}
@@ -734,16 +720,13 @@ func (h *Handler) searchQuery(w http.ResponseWriter, r *http.Request, sess Sessi
 		return
 	}
 	if resp.repairEmbeddings {
-		repairReq, normalizeErr := normalizeSearchReindexRequest(SearchReindexRequest{
+		// Embedding repair is best-effort: the push already succeeded, and
+		// the reindex path repairs any gap on the next run.
+		if repairReq, normalizeErr := normalizeSearchReindexRequest(SearchReindexRequest{
 			Keys: []PullKey{{Key: req.Key}},
-		})
-		if normalizeErr != nil {
-			h.deps.logError("search embedding repair request failed: user=%s err=%v", sess.Claims.Subject, normalizeErr)
-		} else {
+		}); normalizeErr == nil {
 			repairReq.embeddingRepairOnly = true
-			if _, _, startErr := h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, repairReq); startErr != nil {
-				h.deps.logError("search embedding repair kickoff failed: user=%s err=%v", sess.Claims.Subject, startErr)
-			}
+			_, _, _ = h.reindexCoordinator.StartOrGet(r.Context(), h.deps, sess, repairReq)
 		}
 	}
 	encode(w, http.StatusOK, resp)

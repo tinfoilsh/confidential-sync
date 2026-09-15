@@ -12,12 +12,12 @@ const (
 	searchIndexDeletionBatchSize = 25
 )
 
-func StartSearchIndexDeletionWorker(ctx context.Context, deps Deps, logger Logger) {
+func StartSearchIndexDeletionWorker(ctx context.Context, deps Deps) {
 	if deps.Controlplane == nil || deps.SearchBuckets == nil || !deps.SearchBuckets.Configured() {
 		return
 	}
 	go func() {
-		runSearchIndexDeletionSweep(ctx, deps, logger)
+		runSearchIndexDeletionSweep(ctx, deps)
 		ticker := time.NewTicker(searchIndexDeletionInterval)
 		defer ticker.Stop()
 		for {
@@ -25,23 +25,14 @@ func StartSearchIndexDeletionWorker(ctx context.Context, deps Deps, logger Logge
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runSearchIndexDeletionSweep(ctx, deps, logger)
+				runSearchIndexDeletionSweep(ctx, deps)
 			}
 		}
 	}()
 }
 
-func runSearchIndexDeletionSweep(ctx context.Context, deps Deps, logger Logger) {
-	count, err := sweepSearchIndexDeletions(ctx, deps)
-	if err != nil {
-		if logger != nil {
-			logger.Errorf("search index deletion sweep failed: %v", err)
-		}
-		return
-	}
-	if count > 0 && logger != nil {
-		logger.Infof("search index deletion sweep removed %d item(s)", count)
-	}
+func runSearchIndexDeletionSweep(ctx context.Context, deps Deps) {
+	_, _ = sweepSearchIndexDeletions(ctx, deps)
 }
 
 func sweepSearchIndexDeletions(ctx context.Context, deps Deps) (int, error) {
