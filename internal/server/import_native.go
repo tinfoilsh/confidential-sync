@@ -790,12 +790,10 @@ func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, atta
 	defer cancel()
 	for _, attachmentID := range attachmentIDs {
 		if err := deps.Controlplane.DeleteAttachmentIndex(cleanupCtx, sess.RawJWT, sess.Claims.Subject, attachmentID); err != nil {
-			deps.logError("native import attachment index cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
 			continue
 		}
 		if deps.Buckets != nil && deps.Buckets.Configured() {
 			if err := deps.Buckets.Delete(cleanupCtx, sess.Claims.Subject, attachmentID); err != nil {
-				deps.logError("native import attachment blob cleanup failed: user=%s att=%s err=%v", sess.Claims.Subject, attachmentID, err)
 			}
 		}
 	}

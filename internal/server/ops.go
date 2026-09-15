@@ -41,22 +41,6 @@ type Deps struct {
 	// Empty in test fixtures, where the legacy-claim guard is
 	// bypassed.
 	SyncEnclaveSecret string
-	// Logger is optional; when nil, logInfo/logError become no-ops.
-	// Tests leave this unset so verbose sync/migration logging stays
-	// out of test output.
-	Logger Logger
-}
-
-func (d Deps) logInfo(format string, args ...any) {
-	if d.Logger != nil {
-		d.Logger.Infof(format, args...)
-	}
-}
-
-func (d Deps) logError(format string, args ...any) {
-	if d.Logger != nil {
-		d.Logger.Errorf(format, args...)
-	}
 }
 
 // Session is the per-request authenticated context: the bearer token (to
@@ -150,9 +134,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// it controls whether an overwrite is accepted, so it is bound
 	// into the operation hash above.
 	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
-	deps.logInfo("push begin: user=%s scope=%s id=%s kid=%s if_match=%s plaintext_bytes=%d",
-		sess.Claims.Subject, scope, req.ID, kidHex, ifMatch, len(plaintext))
-
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:               req.Scope,
 		ID:                  req.ID,
@@ -171,8 +152,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	})
 	if err == nil {
 		committedAt := time.Now()
-		deps.logInfo("push ok: user=%s scope=%s id=%s kid=%s new_etag=%s",
-			sess.Claims.Subject, scope, req.ID, kidHex, resp.ETag)
 		// Search indexing is inline (the plaintext and CEK only exist
 		// for this request) but best-effort: the blob write already
 		// succeeded, so an indexing failure degrades search instead
@@ -181,8 +160,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		if scope == envelope.ScopeChat && searchConfigured(deps) {
 			indexed := true
 			if idxErr := indexCurrentChatForSearch(ctx, deps, sess, key, req.ID, plaintext, resp.ETag, committedAt, resp.SourceRevision); idxErr != nil {
-				deps.logError("push search index failed: user=%s id=%s err=%v",
-					sess.Claims.Subject, req.ID, idxErr)
 				indexed = false
 			}
 			searchIndexed = &indexed
@@ -196,8 +173,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		if errors.As(err, &cpe) {
 			currentETag = cpe.CurrentETag
 		}
-		deps.logInfo("push stale blob: user=%s scope=%s id=%s current_etag=%s",
-			sess.Claims.Subject, scope, req.ID, currentETag)
 		return nil, &AppError{
 			Status:      http.StatusConflict,
 			Code:        CodeSyncConflict,
@@ -205,8 +180,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 			CurrentETag: currentETag,
 		}
 	}
-	deps.logError("push failed: user=%s scope=%s id=%s err=%v",
-		sess.Claims.Subject, scope, req.ID, err)
 	return nil, err
 }
 
@@ -315,9 +288,6 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 	}
 	targetKIDHex := cryptopkg.KeyIDHex(targetKIDBytes)
 
-	deps.logInfo("pull begin: user=%s scope=%s candidate_keys=%d target_kid=%s ids=%d all=%t",
-		sess.Claims.Subject, scope, len(keys), targetKIDHex, len(ids), req.All)
-
 	// Inline rewrap promotes legacy rows to v2 on first read, but the
 	// controlplane gates every rewrap CAS on the user's registered
 	// current key. When the pull target is not that key (none
@@ -366,8 +336,7 @@ func Pull(ctx context.Context, deps Deps, sess Session, req PullRequest) (*PullR
 			okCount++
 		}
 	}
-	deps.logInfo("pull done: user=%s scope=%s ok=%d failed=%d legacy_needs_rewrap=%d",
-		sess.Claims.Subject, scope, okCount, failCount, legacyCount)
+
 	return out, nil
 }
 
@@ -418,12 +387,8 @@ func pullOne(
 			NeedsRewrap:  false,
 		}
 	case envelope.VersionV0, envelope.VersionV1:
-		deps.logInfo("pull legacy detected: user=%s scope=%s id=%s",
-			sess.Claims.Subject, scope, id)
 		dec, err := envelope.DecryptLegacy(blob.Ciphertext, keys)
 		if err != nil {
-			deps.logError("pull legacy decrypt failed: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, id, err)
 			return PullItem{ID: id, OK: false, Code: CodeUnknownKey, Reason: "no_key_decrypted_legacy"}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
@@ -439,9 +404,6 @@ func pullOne(
 					ProjectID:    blob.ProjectID,
 					NeedsRewrap:  false,
 				}
-			} else {
-				deps.logError("pull lazy rewrap failed: user=%s scope=%s id=%s err=%v",
-					sess.Claims.Subject, scope, id, rewrapErr)
 			}
 		}
 		// rewrap is best-effort: if the controlplane PUT loses a CAS
@@ -476,16 +438,10 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 	if req.Limit <= 0 || req.Limit > maxListStatusPageSize {
 		req.Limit = defaultListStatusPage
 	}
-	deps.logInfo("list-status begin: user=%s scope=%s limit=%d project=%s direction=%q cursor=%q",
-		sess.Claims.Subject, req.Scope, req.Limit, req.ProjectID, req.Direction, req.Cursor)
 	resp, err := deps.Controlplane.ListStatus(ctx, req.Scope, req.Cursor, req.Limit, sess.RawJWT, sess.Claims.Subject, req.ProjectID, req.Direction)
 	if err != nil {
-		deps.logError("list-status failed: user=%s scope=%s err=%v",
-			sess.Claims.Subject, req.Scope, err)
 		return nil, err
 	}
-	deps.logInfo("list-status ok: user=%s scope=%s updates=%d deletes=%d next_cursor=%q",
-		sess.Claims.Subject, req.Scope, len(resp.Updates), len(resp.Deletes), resp.NextCursor)
 	out := &ListStatusResponse{NextCursor: resp.NextCursor}
 	for _, u := range resp.Updates {
 		update := ListStatusUpdate{
@@ -509,6 +465,7 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 			Cursor:    d.Cursor,
 		})
 	}
+
 	return out, nil
 }
 
@@ -536,17 +493,12 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 	}
 	kidHex := cryptopkg.KeyIDHex(kidBytes)
 
-	deps.logInfo("delete begin: user=%s scope=%s id=%s kid=%s if_match=%v",
-		sess.Claims.Subject, scope, req.ID, kidHex, req.IfMatch)
-
 	// If the caller passed a concrete ifMatch, run a single CAS-delete
 	// against that etag — a STALE_BLOB surfaces to the caller because
 	// they explicitly chose to race the etag they had.
 	if req.IfMatch != nil && *req.IfMatch != "" {
 		resp, cpResp, err := deleteOnce(ctx, deps, sess, req, key, kidHex, *req.IfMatch)
 		if err != nil {
-			deps.logError("delete (explicit if_match) failed: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, req.ID, err)
 			return nil, err
 		}
 		sourceRevision := int64(0)
@@ -557,7 +509,6 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 			}
 		}
 		dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
-		deps.logInfo("delete ok: user=%s scope=%s id=%s", sess.Claims.Subject, scope, req.ID)
 		return resp, nil
 	}
 
@@ -578,12 +529,8 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				// or a crash between the two); the idempotent replay
 				// must still finish the search cleanup.
 				dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, 0)
-				deps.logInfo("delete already-gone: user=%s scope=%s id=%s",
-					sess.Claims.Subject, scope, req.ID)
 				return &OKResponse{OK: true}, nil
 			}
-			deps.logError("delete fetch-etag failed: user=%s scope=%s id=%s attempt=%d err=%v",
-				sess.Claims.Subject, scope, req.ID, attempt, err)
 			return nil, err
 		}
 		attemptReq := req
@@ -609,21 +556,13 @@ func Delete(ctx context.Context, deps Deps, sess Session, req DeleteRequest) (*O
 				sourceRevision = cpResp.SourceRevision
 			}
 			dropChatFromSearch(ctx, deps, sess, scope, req.ID, key, sourceRevision)
-			deps.logInfo("delete ok: user=%s scope=%s id=%s attempt=%d",
-				sess.Claims.Subject, scope, req.ID, attempt)
 			return resp, nil
 		}
 		if controlplane.IsCode(err, controlplane.StatusStaleBlob) {
-			deps.logInfo("delete stale, retrying: user=%s scope=%s id=%s attempt=%d",
-				sess.Claims.Subject, scope, req.ID, attempt)
 			continue
 		}
-		deps.logError("delete attempt failed: user=%s scope=%s id=%s attempt=%d err=%v",
-			sess.Claims.Subject, scope, req.ID, attempt, err)
 		return nil, err
 	}
-	deps.logError("delete exhausted retries: user=%s scope=%s id=%s",
-		sess.Claims.Subject, scope, req.ID)
 	return nil, &AppError{Status: http.StatusConflict, Code: CodeSyncConflict, Reason: "delete_exhausted_retries"}
 }
 
@@ -752,17 +691,10 @@ func RegisterKey(ctx context.Context, deps Deps, sess Session, req KeyRegisterRe
 		IdempotencyKey: req.IdempotencyKey,
 		Body:           body,
 	})
-
-	deps.logInfo("key register begin: user=%s kid=%s created_via=%s if_match=%s bundle=%t",
-		sess.Claims.Subject, kidHex, req.CreatedVia, req.IfMatch, req.InitialBundle != nil)
 	cpResp, err := deps.Controlplane.RegisterKey(ctx, cpReq)
 	if err != nil {
-		deps.logError("key register failed: user=%s kid=%s err=%v",
-			sess.Claims.Subject, kidHex, err)
 		return nil, err
 	}
-	deps.logInfo("key register ok: user=%s kid=%s wiped_attachments=%d",
-		sess.Claims.Subject, kidHex, len(cpResp.WipedV2Attachments))
 	// Drain the buckets blobs the controlplane wiped under the
 	// start-fresh bypass. The controlplane already committed its
 	// half of the wipe; failures here only leave orphaned buckets
@@ -816,16 +748,10 @@ func AddBundle(ctx context.Context, deps Deps, sess Session, req AddBundleReques
 		return nil, err
 	}
 	cpReq.OperationHash = opHash
-	deps.logInfo("key add-bundle begin: user=%s kid=%s credential=%s",
-		sess.Claims.Subject, req.KeyID, req.CredentialID)
 	err = deps.Controlplane.AddBundle(ctx, cpReq)
 	if err != nil {
-		deps.logError("key add-bundle failed: user=%s kid=%s credential=%s err=%v",
-			sess.Claims.Subject, req.KeyID, req.CredentialID, err)
 		return nil, err
 	}
-	deps.logInfo("key add-bundle ok: user=%s kid=%s credential=%s",
-		sess.Claims.Subject, req.KeyID, req.CredentialID)
 	return &OKResponse{OK: true}, nil
 }
 
@@ -863,16 +789,10 @@ func RemoveBundle(ctx context.Context, deps Deps, sess Session, req RemoveBundle
 		return nil, err
 	}
 	cpReq.OperationHash = opHash
-	deps.logInfo("key remove-bundle begin: user=%s kid=%s credential=%s",
-		sess.Claims.Subject, req.KeyID, req.CredentialID)
 	err = deps.Controlplane.RemoveBundle(ctx, cpReq)
 	if err != nil {
-		deps.logError("key remove-bundle failed: user=%s kid=%s credential=%s err=%v",
-			sess.Claims.Subject, req.KeyID, req.CredentialID, err)
 		return nil, err
 	}
-	deps.logInfo("key remove-bundle ok: user=%s kid=%s credential=%s",
-		sess.Claims.Subject, req.KeyID, req.CredentialID)
 	return &OKResponse{OK: true}, nil
 }
 
@@ -898,10 +818,8 @@ func operationHashForKey(cek []byte, method, path, keyIDHex, idempotencyKey stri
 // surfaces as KeyID=nil + empty bundles via a 404 from the
 // controlplane; we re-emit that 404 here.
 func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentRequest) (*KeyCurrentResponse, error) {
-	deps.logInfo("key current begin: user=%s", sess.Claims.Subject)
 	resp, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
-		deps.logError("key current failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
 	}
 	// No registered key. Older controlplanes answer with a 404 (resp ==
@@ -914,15 +832,12 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 		if resp != nil {
 			hasData = resp.HasData
 		}
-		deps.logInfo("key current absent: user=%s has_data=%t", sess.Claims.Subject, hasData)
 		return &KeyCurrentResponse{
 			KeyID:   nil,
 			Bundles: map[string]KeyCurrentBundle{},
 			HasData: hasData,
 		}, nil
 	}
-	deps.logInfo("key current ok: user=%s kid=%s bundles=%d created_via=%s",
-		sess.Claims.Subject, resp.KeyID, len(resp.Bundles), resp.CreatedVia)
 	out := &KeyCurrentResponse{
 		KeyID:      &resp.KeyID,
 		ETag:       resp.ETag,
@@ -946,6 +861,7 @@ func KeyCurrent(ctx context.Context, deps Deps, sess Session, _ KeyCurrentReques
 			out.Bundles[cid] = ent
 		}
 	}
+
 	return out, nil
 }
 
@@ -978,9 +894,6 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 	}
 	defer cleanup()
 
-	deps.logInfo("migrate begin: user=%s scope=%s target_kid=%s candidate_keys=%d limit=%d explicit_ids=%d",
-		sess.Claims.Subject, scope, targetKIDHex, len(keys), req.Limit, len(req.IDs))
-
 	var ids []string
 	var retryableRemaining, blockedUnmigrated int
 
@@ -989,15 +902,11 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 	} else {
 		list, err := deps.Controlplane.ListNeedsMigration(ctx, req.Scope, req.Limit, sess.RawJWT, sess.Claims.Subject)
 		if err != nil {
-			deps.logError("migrate list-needs failed: user=%s scope=%s err=%v",
-				sess.Claims.Subject, scope, err)
 			return nil, err
 		}
 		ids = list.IDs
 		retryableRemaining = list.RetryableRemaining
 		blockedUnmigrated = list.BlockedUnmigrated
-		deps.logInfo("migrate list-needs: user=%s scope=%s ids=%d retryable_remaining=%d blocked_unmigrated=%d",
-			sess.Claims.Subject, scope, len(ids), retryableRemaining, blockedUnmigrated)
 	}
 
 	out := &MigrateResponse{}
@@ -1009,8 +918,6 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 		// fetch, burning the 24h cooldown on rows we never actually
 		// attempted.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			deps.logInfo("migrate cancellation observed: user=%s scope=%s processed=%d remaining=%d err=%v",
-				sess.Claims.Subject, scope, out.Migrated+len(out.Blocked), len(ids)-(out.Migrated+len(out.Blocked)), ctxErr)
 			break
 		}
 		ok := migrateOne(ctx, deps, sess, scope, id, keys, targetKey, targetKIDHex)
@@ -1023,14 +930,10 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 		// failure), don't record a migration failure or count the
 		// row as blocked — the row stays retryable.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			deps.logInfo("migrate cancellation observed mid-item: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, id, ctxErr)
 			break
 		}
 		out.Blocked = append(out.Blocked, id)
 		if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject); err != nil {
-			deps.logError("migrate record-failure failed: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, id, err)
 		}
 	}
 
@@ -1044,9 +947,6 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 		out.RetryableRemaining = 0
 		out.BlockedUnmigrated = len(out.Blocked)
 	}
-
-	deps.logInfo("migrate done: user=%s scope=%s migrated=%d blocked=%d retryable_remaining=%d blocked_unmigrated=%d",
-		sess.Claims.Subject, scope, out.Migrated, len(out.Blocked), out.RetryableRemaining, out.BlockedUnmigrated)
 
 	return out, nil
 }
@@ -1094,8 +994,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 	}
 
 	if err := ensureCurrentKeyRegistered(ctx, deps, sess, req.Target.Key); err != nil {
-		deps.logError("migrate-all bootstrap current-key failed: user=%s err=%v",
-			sess.Claims.Subject, err)
 		return nil, err
 	}
 
@@ -1106,9 +1004,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 		envelope.ScopeProject,
 		envelope.ScopeProjectDocument,
 	}
-
-	deps.logInfo("migrate-all begin: user=%s scopes=%d budget=%s candidate_keys=%d",
-		sess.Claims.Subject, len(scopes), MigrateAllBudget, len(req.Keys))
 
 	out := &MigrateAllResponse{Scopes: make([]MigrateAllScopeReport, 0, len(scopes))}
 
@@ -1122,8 +1017,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 				if progress != nil {
 					progress.markPartial()
 				}
-				deps.logInfo("migrate-all context done: user=%s scope=%s pages=%d err=%v",
-					sess.Claims.Subject, scope, pages, ctxErr)
 				break
 			}
 			if time.Now().After(deadline) {
@@ -1131,8 +1024,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 				if progress != nil {
 					progress.markPartial()
 				}
-				deps.logInfo("migrate-all budget exhausted: user=%s scope=%s pages=%d",
-					sess.Claims.Subject, scope, pages)
 				break
 			}
 			budgetLeft := time.Until(deadline)
@@ -1141,8 +1032,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 				if progress != nil {
 					progress.markPartial()
 				}
-				deps.logInfo("migrate-all budget exhausted: user=%s scope=%s pages=%d",
-					sess.Claims.Subject, scope, pages)
 				break
 			}
 
@@ -1162,16 +1051,12 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 				// client retries with a fresh token instead of
 				// burning the loop on a thousand 401s.
 				if isAuthError(err) {
-					deps.logError("migrate-all auth failed mid-loop, aborting: user=%s scope=%s page=%d err=%v",
-						sess.Claims.Subject, scope, pages, err)
 					out.Partial = true
 					if progress != nil {
 						progress.markPartial()
 					}
 					break
 				}
-				deps.logError("migrate-all page failed: user=%s scope=%s page=%d err=%v",
-					sess.Claims.Subject, scope, pages, err)
 				return nil, err
 			}
 			pages++
@@ -1191,9 +1076,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 			}
 		}
 
-		deps.logInfo("migrate-all scope done: user=%s scope=%s pages=%d migrated=%d blocked=%d retryable_remaining=%d blocked_unmigrated=%d",
-			sess.Claims.Subject, scope, pages, report.Migrated, len(report.Blocked), report.RetryableRemaining, report.BlockedUnmigrated)
-
 		out.Migrated += report.Migrated
 		out.RetryableRemaining += report.RetryableRemaining
 		out.BlockedUnmigrated += report.BlockedUnmigrated
@@ -1203,9 +1085,6 @@ func migrateAllWithProgress(ctx context.Context, deps Deps, sess Session, req Mi
 			break
 		}
 	}
-
-	deps.logInfo("migrate-all done: user=%s migrated=%d retryable_remaining=%d blocked_unmigrated=%d partial=%t",
-		sess.Claims.Subject, out.Migrated, out.RetryableRemaining, out.BlockedUnmigrated, out.Partial)
 
 	return out, nil
 }
@@ -1255,8 +1134,6 @@ func ensureCurrentKeyRegistered(
 
 	if current != nil && current.KeyID != "" {
 		if current.KeyID != targetKIDHex {
-			deps.logError("migrate-all bootstrap: user=%s target kid=%s != current kid=%s; refusing to migrate",
-				sess.Claims.Subject, targetKIDHex, current.KeyID)
 			return &AppError{
 				Status:  http.StatusConflict,
 				Code:    CodeStaleKey,
@@ -1264,8 +1141,6 @@ func ensureCurrentKeyRegistered(
 				Message: "migration target is not the registered current key",
 			}
 		}
-		deps.logInfo("migrate-all bootstrap: user=%s current_kid=%s target_kid=%s",
-			sess.Claims.Subject, current.KeyID, targetKIDHex)
 		return nil
 	}
 
@@ -1277,8 +1152,6 @@ func ensureCurrentKeyRegistered(
 	// must register the primary key (with its bundle) before driving
 	// migration, so surface a precondition error instead of stamping a
 	// key the user can never unlock.
-	deps.logError("migrate-all bootstrap: user=%s no current key registered; refusing to migrate target kid=%s",
-		sess.Claims.Subject, targetKIDHex)
 	return &AppError{
 		Status:  http.StatusConflict,
 		Code:    CodeUnknownKey,
@@ -1297,8 +1170,6 @@ func ensureCurrentKeyRegistered(
 func currentPrimaryKeyIs(ctx context.Context, deps Deps, sess Session, targetKIDHex string) bool {
 	current, err := deps.Controlplane.GetCurrentKey(ctx, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
-		deps.logError("current-key probe failed: user=%s target_kid=%s err=%v",
-			sess.Claims.Subject, targetKIDHex, err)
 		return false
 	}
 	return current != nil && current.KeyID == targetKIDHex
@@ -1336,8 +1207,6 @@ func migrateOne(
 	for attempt := 0; attempt < migrateRewrapMaxRetries; attempt++ {
 		blob, err := deps.Controlplane.GetBlob(ctx, string(scope), id, sess.RawJWT, sess.Claims.Subject)
 		if err != nil {
-			deps.logError("migrate item fetch failed: user=%s scope=%s id=%s err=%v",
-				sess.Claims.Subject, scope, id, err)
 			return false
 		}
 		version := envelope.Detect(blob.Ciphertext)
@@ -1347,34 +1216,22 @@ func migrateOne(
 			// end state, so count it migrated rather than re-sealing it
 			// or recording a failure. A v2 row under a different key
 			// still falls through to the rewrap below.
-			deps.logInfo("migrate item already at target: user=%s scope=%s id=%s attempt=%d",
-				sess.Claims.Subject, scope, id, attempt)
 			return true
 		}
 		plaintext, ok := decryptAnyVersion(blob.Ciphertext, keys, scope, id, sess.Claims.Subject)
 		if !ok {
-			deps.logError("migrate item decrypt failed: user=%s scope=%s id=%s version=%v",
-				sess.Claims.Subject, scope, id, version)
 			return false
 		}
-		newETag, rerr := rewrapBlob(ctx, deps, sess, scope, id, plaintext, blob.ETag, targetKey, targetKIDHex)
+		_, rerr := rewrapBlob(ctx, deps, sess, scope, id, plaintext, blob.ETag, targetKey, targetKIDHex)
 		cryptopkg.Zero(plaintext)
 		if rerr == nil {
-			deps.logInfo("migrate item ok: user=%s scope=%s id=%s version=%v target_kid=%s new_etag=%s",
-				sess.Claims.Subject, scope, id, version, targetKIDHex, newETag)
 			return true
 		}
 		if controlplane.IsCode(rerr, controlplane.StatusStaleBlob) {
-			deps.logInfo("migrate item stale, retrying: user=%s scope=%s id=%s attempt=%d",
-				sess.Claims.Subject, scope, id, attempt)
 			continue
 		}
-		deps.logError("migrate item rewrap failed: user=%s scope=%s id=%s version=%v err=%v",
-			sess.Claims.Subject, scope, id, version, rerr)
 		return false
 	}
-	deps.logError("migrate item exhausted retries: user=%s scope=%s id=%s",
-		sess.Claims.Subject, scope, id)
 	return false
 }
 

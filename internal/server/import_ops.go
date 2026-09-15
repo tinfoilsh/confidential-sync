@@ -344,9 +344,9 @@ func notifyImportOutcome(ctx context.Context, deps Deps, outcome controlplane.Im
 	}
 	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importNotifyTimeout)
 	defer cancel()
-	if err := deps.Controlplane.NotifyImportOutcome(notifyCtx, outcome); err != nil {
-		deps.logError("import notify failed: user=%s job=%s status=%s error_type=%T", outcome.ClerkUserID, outcome.JobID, outcome.Status, err)
-	}
+	// Notification is best-effort: the job outcome is already recorded
+	// in the status response, and a missed email is not a data loss.
+	_ = deps.Controlplane.NotifyImportOutcome(notifyCtx, outcome)
 }
 
 func cekFromImportStart(req ImportStartRequest) ([]byte, error) {

@@ -613,14 +613,10 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 		UpdatedAt:      committedAt.UTC().Format(time.RFC3339Nano),
 	}
 	tokens := searchindex.Tokenize(strings.Join(chunks, "\n"))
-	var embedErr error
 	if len(chunks) > 0 {
 		entry.EmbeddingPending = true
 		entry.EmbeddingKeyID = keyID
-		vecs, err := embedChunks(ctx, deps, owner, searchDocPrefix, chunks, false)
-		if err != nil {
-			embedErr = err
-		} else {
+		if vecs, err := embedChunks(ctx, deps, owner, searchDocPrefix, chunks, false); err == nil {
 			entry.Vectors = quantizeAll(vecs)
 			entry.EmbeddingPending = false
 			entry.EmbeddingKeyID = ""
@@ -668,7 +664,6 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 		// A slower push must not clobber the entry a newer push (or a
 		// rebuild) already wrote for this chat.
 		if existing, ok := ix.Chats[chatID]; ok && searchEntrySupersedes(existing, etag, sourceRevision, committedAt) {
-			deps.logInfo("push search index skipped stale write: user=%s id=%s", owner, chatID)
 			return nil
 		}
 		if existing, ok := ix.Chats[chatID]; ok &&
@@ -697,9 +692,6 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 				continue
 			}
 			return err
-		}
-		if embedErr != nil {
-			deps.logError("push search embedding failed: user=%s id=%s err=%v", owner, chatID, embedErr)
 		}
 		return nil
 	}
@@ -781,8 +773,6 @@ func dropChatFromSearch(ctx context.Context, deps Deps, sess Session, scope enve
 		return
 	}
 	if err := removeDeletedChatFromSearch(ctx, deps, sess, cek, chatID, sourceRevision); err != nil {
-		deps.logError("delete search index cleanup failed: user=%s id=%s err=%v",
-			sess.Claims.Subject, chatID, err)
 	}
 }
 
@@ -842,7 +832,6 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	ix, state, err := loadSearchIndex(ctx, deps, sess.Claims.Subject, objectKey, indexKey)
 	if err != nil {
 		runlock()
-		deps.logError("search query index load failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
 	}
 	if len(ix.Chats) == 0 {
@@ -862,7 +851,6 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	var queryVector []float32
 	vecs, err := embedWithSearchInferenceGate(ctx, deps, sess.Claims.Subject, []string{searchQueryPrefix + query}, false)
 	if err != nil {
-		deps.logError("search query embed failed: user=%s err=%v", sess.Claims.Subject, err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -889,7 +877,6 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	ix, state, err = loadSearchIndex(ctx, deps, sess.Claims.Subject, objectKey, indexKey)
 	if err != nil {
 		runlock()
-		deps.logError("search query index load failed: user=%s err=%v", sess.Claims.Subject, err)
 		return nil, err
 	}
 	resp := &SearchQueryResponse{
@@ -905,8 +892,6 @@ func SearchQuery(ctx context.Context, deps Deps, sess Session, req SearchQueryRe
 	for _, r := range results {
 		resp.Results = append(resp.Results, SearchQueryResult{ID: r.ID, Score: r.Score})
 	}
-	deps.logInfo("search query ok: user=%s indexed=%d results=%d",
-		sess.Claims.Subject, resp.TotalIndexed, len(resp.Results))
 	return resp, nil
 }
 
@@ -1225,7 +1210,6 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 	if len(texts) > 0 && embedDocuments {
 		vectors, err = embedChunks(ctx, deps, sess.Claims.Subject, searchDocPrefix, texts, true)
 		if err != nil {
-			deps.logError("search reindex embed failed: user=%s err=%v", sess.Claims.Subject, err)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -1375,8 +1359,6 @@ func searchReindexPage(ctx context.Context, deps Deps, sess Session, keys []Pull
 			ResumeStartedAt:            startedAt,
 			ResumeTargetSourceRevision: targetSourceRevision,
 		}
-		deps.logInfo("search reindex page ok: user=%s indexed=%d failed=%d done=%t total=%d",
-			sess.Claims.Subject, indexed, attemptFailed, resp.Done, resp.TotalIndexed)
 		return resp, nil
 	}
 	return nil, errors.New("search index reindex publication retries exhausted")

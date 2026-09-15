@@ -880,7 +880,7 @@ func newFixture(t *testing.T) *fixture {
 	bkClient := buckets.NewClient(bk.server.URL, testBucketName, nil)
 
 	deps := Deps{Controlplane: cpClient, Buckets: bkClient, GitSHA: "test-sha"}
-	handler := NewHandler(deps, v, nil)
+	handler := NewHandler(deps, v)
 	// Shorten retention so migrate-all kickoff tests don't leak
 	// in-memory job state across cases.
 	handler.coordinator.retention = 50 * time.Millisecond

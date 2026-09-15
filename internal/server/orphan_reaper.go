@@ -14,12 +14,12 @@ const (
 	pendingAttachmentSweepLimit    = 200
 )
 
-func StartAttachmentOrphanReaper(ctx context.Context, deps Deps, logger Logger) {
+func StartAttachmentOrphanReaper(ctx context.Context, deps Deps) {
 	if deps.Controlplane == nil || deps.Buckets == nil || !deps.Buckets.Configured() {
 		return
 	}
 	go func() {
-		runAttachmentOrphanSweep(ctx, deps, logger)
+		runAttachmentOrphanSweep(ctx, deps)
 		ticker := time.NewTicker(attachmentOrphanReaperInterval)
 		defer ticker.Stop()
 		for {
@@ -27,12 +27,12 @@ func StartAttachmentOrphanReaper(ctx context.Context, deps Deps, logger Logger) 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runAttachmentOrphanSweep(ctx, deps, logger)
+				runAttachmentOrphanSweep(ctx, deps)
 			}
 		}
 	}()
 	go func() {
-		runPendingAttachmentSweep(ctx, deps, logger)
+		runPendingAttachmentSweep(ctx, deps)
 		ticker := time.NewTicker(pendingAttachmentSweepInterval)
 		defer ticker.Stop()
 		for {
@@ -40,25 +40,16 @@ func StartAttachmentOrphanReaper(ctx context.Context, deps Deps, logger Logger) 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				runPendingAttachmentSweep(ctx, deps, logger)
+				runPendingAttachmentSweep(ctx, deps)
 			}
 		}
 	}()
 }
 
-func runAttachmentOrphanSweep(ctx context.Context, deps Deps, logger Logger) {
+func runAttachmentOrphanSweep(ctx context.Context, deps Deps) {
 	sweepCtx, cancel := context.WithTimeout(ctx, AttachmentRequestTimeout)
 	defer cancel()
-	count, err := sweepAttachmentOrphans(sweepCtx, deps)
-	if err != nil {
-		if logger != nil {
-			logger.Errorf("attachment orphan sweep failed: %v", err)
-		}
-		return
-	}
-	if count > 0 && logger != nil {
-		logger.Infof("attachment orphan sweep removed %d item(s)", count)
-	}
+	_, _ = sweepAttachmentOrphans(sweepCtx, deps)
 }
 
 func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
@@ -84,17 +75,13 @@ func sweepAttachmentOrphans(ctx context.Context, deps Deps) (int, error) {
 // owner of the buckets cleanup for that id. A buckets delete failure
 // only leaves an unreferenced ciphertext blob — no chat row points to
 // it, so the cost is wasted storage rather than data corruption.
-func runPendingAttachmentSweep(ctx context.Context, deps Deps, logger Logger) {
+func runPendingAttachmentSweep(ctx context.Context, deps Deps) {
 	listCtx, cancelList := context.WithTimeout(ctx, AttachmentRequestTimeout)
 	rows, err := deps.Controlplane.SweepPendingAttachmentWrites(listCtx, pendingAttachmentSweepLimit)
 	cancelList()
 	if err != nil {
-		if logger != nil {
-			logger.Errorf("pending attachment sweep failed: %v", err)
-		}
 		return
 	}
-	swept := 0
 	for _, row := range rows {
 		// Each buckets delete gets its own deadline so a slow row
 		// near the end of the batch doesn't inherit a shared budget
@@ -102,17 +89,7 @@ func runPendingAttachmentSweep(ctx context.Context, deps Deps, logger Logger) {
 		// removed every row in `rows` from the pending ledger, so a
 		// dropped delete here is a wasted blob, not data corruption.
 		deleteCtx, cancelDelete := context.WithTimeout(ctx, AttachmentRequestTimeout)
-		err := deps.Buckets.Delete(deleteCtx, row.ClerkUserID, row.AttachmentID)
+		_ = deps.Buckets.Delete(deleteCtx, row.ClerkUserID, row.AttachmentID)
 		cancelDelete()
-		if err != nil {
-			if logger != nil {
-				logger.Errorf("pending attachment cleanup failed for %s: %v", row.AttachmentID, err)
-			}
-			continue
-		}
-		swept++
-	}
-	if swept > 0 && logger != nil {
-		logger.Infof("pending attachment sweep removed %d item(s)", swept)
 	}
 }

@@ -111,7 +111,7 @@ func Start(cfg Config) (*Stack, error) {
 		Buckets:           bucketsClient,
 		GitSHA:            "local-stack",
 		SyncEnclaveSecret: LocalStackSyncEnclaveSecret,
-	}, verifier, nil)
+	}, verifier)
 
 	enclaveLn, err := listen(cfg.EnclaveAddr)
 	if err != nil {

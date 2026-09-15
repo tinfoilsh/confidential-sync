@@ -291,12 +291,7 @@ func (c *SearchReindexCoordinator) run(ctx context.Context, deps Deps, sess Sess
 		case <-ctx.Done():
 		}
 	}
-
-	deps.logInfo("search reindex job begin: user=%s job=%s budget=%s", job.UserID, job.ID, c.budget)
 	err := c.runnerHook(ctx, deps, sess, req, job)
-	if err != nil {
-		deps.logError("search reindex job failed: user=%s job=%s err=%v", job.UserID, job.ID, err)
-	}
 	job.finish(err)
 
 	retention := c.retention
@@ -345,13 +340,11 @@ func runSearchReindex(ctx context.Context, deps Deps, sess Session, req SearchRe
 		cursor = resumeCursor
 		startedAt = resumeStartedAt
 		targetSourceRevision = resumeTargetSourceRevision
-		deps.logInfo("search reindex job resume: user=%s job=%s cursor=%q", job.UserID, job.ID, cursor)
 	}
 	coverageFailure := false
 	for {
 		if ctx.Err() != nil {
 			job.markPartial()
-			deps.logInfo("search reindex job stopped at budget: user=%s job=%s", job.UserID, job.ID)
 			if coverageFailure {
 				return errSearchReindexIncomplete
 			}

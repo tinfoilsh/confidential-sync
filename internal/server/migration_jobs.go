@@ -252,14 +252,9 @@ func (c *MigrationCoordinator) run(parentCtx context.Context, deps Deps, sess Se
 	ctx := context.WithoutCancel(parentCtx)
 	ctx, cancel := context.WithTimeout(ctx, c.budget)
 	defer cancel()
-
-	deps.logInfo("migration job begin: user=%s job=%s budget=%s", job.UserID, job.ID, c.budget)
 	resp, err := c.runnerHook(ctx, deps, sess, req, job)
 	if err != nil {
-		deps.logError("migration job failed: user=%s job=%s err=%v", job.UserID, job.ID, err)
 	} else if resp != nil {
-		deps.logInfo("migration job done: user=%s job=%s migrated=%d retryable_remaining=%d blocked_unmigrated=%d partial=%t",
-			job.UserID, job.ID, resp.Migrated, resp.RetryableRemaining, resp.BlockedUnmigrated, resp.Partial)
 	}
 	job.finish(resp, err)
 
