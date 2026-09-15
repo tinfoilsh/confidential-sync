@@ -101,6 +101,20 @@ func TestRetryTransientImportCallStopsOnJobDeadline(t *testing.T) {
 	}
 }
 
+func TestRetryTransientImportCallSkipsWorkWhenAlreadyCanceled(t *testing.T) {
+	stubImportSleep(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+	err := retryTransientImportCall(ctx, func() error {
+		attempts++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || attempts != 0 {
+		t.Fatalf("err=%v attempts=%d, want context.Canceled with no attempts", err, attempts)
+	}
+}
+
 func TestImportJobRecoversFromTransientProbeFailure(t *testing.T) {
 	stubImportSleep(t)
 	f := newFixture(t)
@@ -125,7 +139,7 @@ func TestImportJobRecoversFromTransientProbeFailure(t *testing.T) {
 	}
 }
 
-func TestImportJobContinuesWhenProbeStaysUnavailable(t *testing.T) {
+func TestImportJobSkipsChatWhenProbeStaysUnavailable(t *testing.T) {
 	stubImportSleep(t)
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
@@ -133,38 +147,8 @@ func TestImportJobContinuesWhenProbeStaysUnavailable(t *testing.T) {
 
 	createdAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
 	priorID := priorDeterministicChatID(importer.SourceTinfoil, "conv-1", createdAt)
-	failures := make([]int, importRetryMaxAttempts)
-	for i := range failures {
-		failures[i] = http.StatusServiceUnavailable
-	}
-	f.cp.getBlobFailures["chat/"+priorID] = failures
-
-	job := stageArchive(t, f, "tinfoil", []byte(retryTestArchive))
-	snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
-
-	if snap.Status != ImportJobCompleted || snap.Imported != 1 || snap.Failed != 0 {
-		t.Fatalf("status=%s imported=%d failed=%d errors=%v, want completed/1/0", snap.Status, snap.Imported, snap.Failed, snap.Errors)
-	}
-	if len(snap.Warnings) != 1 {
-		t.Fatalf("expected one probe warning, got %v", snap.Warnings)
-	}
-	if len(f.cp.blobs) != 1 {
-		t.Fatalf("expected exactly one chat written, got %d", len(f.cp.blobs))
-	}
-	if body := notified.single(t); body["status"] != "completed" {
-		t.Fatalf("notification=%v, want completed", body)
-	}
-}
-
-func TestImportJobProbeFallbackWritesUnderCurrentID(t *testing.T) {
-	stubImportSleep(t)
-	f := newFixture(t)
-	f.cp.currentKID = f.userKeyID
-
-	createdAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
-	priorID := priorDeterministicChatID(importer.SourceTinfoil, "conv-1", createdAt)
-	// Seed the pre-release row under the prior id so a duplicate would
-	// be observable, then make its probe permanently unavailable.
+	// Seed a legacy row so a write under the current id family would be
+	// an observable duplicate of the same conversation.
 	if _, err := Push(context.Background(), f.handler.deps, importSession(f), PushRequest{
 		Scope: "chat", ID: priorID, Key: f.userKeyB64,
 		Plaintext: base64.StdEncoding.EncodeToString([]byte(`{"id":"` + priorID + `"}`)), IdempotencyKey: "seed",
@@ -180,15 +164,39 @@ func TestImportJobProbeFallbackWritesUnderCurrentID(t *testing.T) {
 	job := stageArchive(t, f, "tinfoil", []byte(retryTestArchive))
 	snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
 
-	// The new deterministic id differs from the prior id, so the push
-	// creates one new row: the fallback trades a skip for one extra
-	// write of the same content under the current id family, never a
-	// second copy under the same id.
-	if snap.Status != ImportJobCompleted || snap.Imported != 1 {
-		t.Fatalf("status=%s imported=%d errors=%v", snap.Status, snap.Imported, snap.Errors)
+	if snap.Status != ImportJobCompleted || snap.Imported != 0 || snap.Failed != 1 {
+		t.Fatalf("status=%s imported=%d failed=%d, want completed/0/1 (chat skipped, job not aborted)", snap.Status, snap.Imported, snap.Failed)
 	}
-	if len(f.cp.blobs) != 2 {
-		t.Fatalf("expected seed + one import, got %d blobs", len(f.cp.blobs))
+	if len(f.cp.blobs) != 1 {
+		t.Fatalf("an unverifiable chat must not be written: got %d blobs, want only the seed", len(f.cp.blobs))
+	}
+	body := notified.single(t)
+	if body["status"] != "completed" || body["failedCount"] != float64(1) {
+		t.Fatalf("notification=%v, want completed with failedCount=1", body)
+	}
+}
+
+func TestImportJobAbortsOnDefinitiveProbeError(t *testing.T) {
+	stubImportSleep(t)
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	notified := captureImportNotifications(t, f)
+
+	createdAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	priorID := priorDeterministicChatID(importer.SourceTinfoil, "conv-1", createdAt)
+	f.cp.getBlobFailures["chat/"+priorID] = []int{http.StatusForbidden}
+
+	job := stageArchive(t, f, "tinfoil", []byte(retryTestArchive))
+	snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
+
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureAuthorization {
+		t.Fatalf("status=%s reason=%s, want failed/authorization_failed", snap.Status, snap.FailureReason)
+	}
+	if len(f.cp.blobs) != 0 {
+		t.Fatalf("no chat should be written after a definitive probe error, got %d", len(f.cp.blobs))
+	}
+	if body := notified.single(t); body["status"] != "failed" {
+		t.Fatalf("notification=%v, want failed", body)
 	}
 }
 

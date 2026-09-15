@@ -78,16 +78,22 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
 			Kind: "chat", SourceID: chat.StableKey, Generation: 0,
 		}
-		// A failed probe is not fatal: the push below is idempotent and
-		// reports an existing row as already imported, so the worst case
-		// of skipping the probe is one extra round trip, not a duplicate.
+		// The probe looks up the pre-release id family, which differs
+		// from the id the push writes under, so the push's idempotency
+		// cannot dedupe against a legacy row. If the probe is still
+		// unavailable after retries, count this chat as failed and move
+		// on rather than risk a duplicate; a re-run picks it up once the
+		// probe recovers. Definitive probe errors still abort the job.
 		priorImport, err := priorImportedChatExistsWithRetry(ctx, deps, sess, cekB64, priorIDs[chat.ID])
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || !isTransientImportFailure(ctx, err) {
 				return err
 			}
-			job.addWarning("prior import check unavailable; relying on idempotent push")
-			priorImport = false
+			failed++
+			job.addError("chat skipped: prior import check unavailable")
+			job.setProgress(imported, failed, conversations)
+			job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
+			return nil
 		}
 		if priorImport {
 			skipped++

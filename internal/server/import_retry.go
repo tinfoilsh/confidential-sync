@@ -48,6 +48,9 @@ func isTransientImportFailure(ctx context.Context, err error) bool {
 func retryTransientImportCall(ctx context.Context, fn func() error) error {
 	delay := importRetryBaseDelay
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		err := fn()
 		if err == nil || attempt == importRetryMaxAttempts || !isTransientImportFailure(ctx, err) {
 			return err
