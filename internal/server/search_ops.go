@@ -787,10 +787,10 @@ func removeDeletedChatFromSearch(ctx context.Context, deps Deps, sess Session, c
 // entry only means a deleted chat can still surface in results until
 // the next reindex, so failures are swallowed.
 func dropChatFromSearch(ctx context.Context, deps Deps, sess Session, scope envelope.Scope, chatID string, cek []byte, sourceRevision int64) {
+	defer func() { _ = recover() }()
 	if scope != envelope.ScopeChat || !searchConfigured(deps) {
 		return
 	}
-	defer func() { _ = recover() }()
 	_ = removeDeletedChatFromSearch(ctx, deps, sess, cek, chatID, sourceRevision)
 }
 

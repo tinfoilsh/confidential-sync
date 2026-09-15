@@ -87,6 +87,14 @@ func TestImportJobSurvivesSearchIndexPanic(t *testing.T) {
 	if snap.Status != ImportJobCompleted || snap.Imported != 1 || snap.Failed != 0 {
 		t.Fatalf("status=%s reason=%s imported=%d failed=%d, want completed/1/0", snap.Status, snap.FailureReason, snap.Imported, snap.Failed)
 	}
+	if len(sf.cp.blobs) != 1 {
+		t.Fatalf("expected exactly one chat blob written, got %d", len(sf.cp.blobs))
+	}
+	for _, blob := range sf.cp.blobs {
+		if len(blob.Body) == 0 || blob.KeyID != sf.userKeyID {
+			t.Fatalf("imported blob is empty or sealed under the wrong key: len=%d kid=%s", len(blob.Body), blob.KeyID)
+		}
+	}
 	if body := notified.single(t); body["status"] != "completed" {
 		t.Fatalf("notification=%v, want completed", body)
 	}
