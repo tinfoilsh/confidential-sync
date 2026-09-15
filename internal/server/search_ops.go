@@ -575,7 +575,20 @@ func indexChatForSearch(ctx context.Context, deps Deps, owner string, cek []byte
 	return indexChatForSearchWithHook(ctx, deps, sess, cek, chatID, plaintext, etag, committedAt, 0, nil)
 }
 
-func indexCurrentChatForSearch(ctx context.Context, deps Deps, sess Session, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time, sourceRevision int64) error {
+// errSearchIndexPanic is returned when best-effort indexing panics, so
+// the caller sees an ordinary failure and the blob write is unaffected.
+var errSearchIndexPanic = errors.New("search index update panicked")
+
+// indexCurrentChatForSearch runs inline after a chat write. The write has
+// already committed, so nothing here may fail the push: an error only
+// degrades search until the next reindex, and a panic is contained the
+// same way rather than unwinding into the request or import worker.
+func indexCurrentChatForSearch(ctx context.Context, deps Deps, sess Session, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time, sourceRevision int64) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errSearchIndexPanic
+		}
+	}()
 	hook := func(ctx context.Context, ix *searchindex.Index, state searchLoadState) (bool, bool, error) {
 		snapshotState, err := searchChatSnapshotState(ctx, deps, sess, chatID, etag)
 		if err != nil {
@@ -777,6 +790,7 @@ func dropChatFromSearch(ctx context.Context, deps Deps, sess Session, scope enve
 	if scope != envelope.ScopeChat || !searchConfigured(deps) {
 		return
 	}
+	defer func() { _ = recover() }()
 	_ = removeDeletedChatFromSearch(ctx, deps, sess, cek, chatID, sourceRevision)
 }
 
