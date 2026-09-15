@@ -89,6 +89,30 @@ func TestChatSearchChunksEdgeCases(t *testing.T) {
 		t.Fatal("multibyte splitting lost text")
 	}
 
+	// Two parts whose lengths plus the separator sum to exactly the
+	// target fill a chunk with no room left, not even for a separator.
+	// An oversized part arriving next must close that chunk and start a
+	// fresh one rather than index past the end of the current one.
+	titleLen := 38
+	exactTitle := strings.Repeat("t", titleLen)
+	exactBody := strings.Repeat("b", searchChunkChars-titleLen-1)
+	overflow := strings.Repeat("o", searchChunkChars+571)
+	exactThenOverflow := chatSearchChunks(chatJSON(t, "x", exactTitle, exactBody, overflow))
+	if len(exactThenOverflow) != 3 {
+		t.Fatalf("expected 3 chunks for exact-fill+overflow, got lengths=%v", chunkLengths(exactThenOverflow))
+	}
+	if exactThenOverflow[0] != exactTitle+"\n"+exactBody || len(exactThenOverflow[0]) != searchChunkChars {
+		t.Fatal("exactly-filled first chunk was not preserved intact")
+	}
+	if strings.Join(exactThenOverflow[1:], "") != overflow {
+		t.Fatal("overflow part lost text")
+	}
+	for i, c := range exactThenOverflow {
+		if len(c) > searchChunkChars {
+			t.Fatalf("chunk %d exceeds target: %d bytes", i, len(c))
+		}
+	}
+
 	// Total coverage is capped at MaxChunksPerChat.
 	var contents []string
 	for i := 0; i < searchindex.MaxChunksPerChat+1; i++ {
@@ -123,6 +147,8 @@ func TestTruncateUTF8(t *testing.T) {
 		{"hello", 5, "hello"},
 		{"hello", 3, "hel"},
 		{"hello", 0, ""},
+		{"hello", -1, ""},
+		{"", -5, ""},
 		{"h\u00e9llo", 2, "h"}, // cutting into the 2-byte é backs off
 		{"h\u00e9llo", 3, "h\u00e9"},
 		{"\u20ac\u20ac", 4, "\u20ac"}, // 3-byte runes

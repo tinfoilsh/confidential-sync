@@ -548,8 +548,13 @@ func quantizeAll(vecs [][]float32) []searchindex.Vector {
 	return out
 }
 
-// truncateUTF8 cuts s to at most n bytes without splitting a rune.
+// truncateUTF8 cuts s to at most n bytes without splitting a rune. A
+// non-positive n yields the empty string, which the chunker treats as
+// "no room left; flush and retry".
 func truncateUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	if len(s) <= n {
 		return s
 	}
