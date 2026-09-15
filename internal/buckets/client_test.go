@@ -245,7 +245,7 @@ func TestConfiguredRejectsMalformedBuckets(t *testing.T) {
 
 func TestClientHTTPFailuresPreserveStatusWithoutResponseDetails(t *testing.T) {
 	const privateDetails = "private-object-path-and-message"
-	for _, status := range []int{http.StatusBadRequest, http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
