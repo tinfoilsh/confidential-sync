@@ -30,11 +30,11 @@ const (
 	// ImportFailureLimitExceeded means the archive exceeded a v1 import
 	// cap (conversations, messages, attachments, or entry sizes).
 	ImportFailureLimitExceeded ImportFailureReason = "limit_exceeded"
-	// ImportFailureKeyMismatch means the supplied CEK is not the user's
-	// registered current key, so nothing was written.
+	// ImportFailureKeyMismatch means the supplied key cannot access the
+	// user's cloud chats or is not their registered current key.
 	ImportFailureKeyMismatch ImportFailureReason = "key_mismatch"
-	// ImportFailureInternal covers everything else (storage, network,
-	// panics); the user is asked to retry.
+	// ImportFailureInternal is the fallback when the cause cannot be
+	// mapped to a more specific user-safe reason.
 	ImportFailureInternal           ImportFailureReason = "internal"
 	ImportFailureRequestTimeout     ImportFailureReason = "request_timeout"
 	ImportFailureServiceUnavailable ImportFailureReason = "service_unavailable"
@@ -80,8 +80,7 @@ func limitExceededErr(msg string) error {
 // classifyParseFailure tags a ParseEach error. Only a parser rejection
 // of the root document means the upload is not a valid export; any
 // other error originated in the emit callback and is either already
-// classified or a transport error the coordinator maps to
-// internal/timeout.
+// classified or a service error the coordinator classifies.
 func classifyParseFailure(err error) error {
 	if errors.Is(err, importer.ErrInvalidExport) {
 		return importFailure(ImportFailureInvalidArchive, err)
@@ -90,8 +89,8 @@ func classifyParseFailure(err error) error {
 }
 
 // classifyArchiveReadErr tags ZIP or deflate corruption as an invalid
-// archive. Anything else (a staged-chunk fetch failing or timing out)
-// is left untagged so it is reported as internal or timeout.
+// archive. Other errors retain their original causes and tags so the
+// coordinator can distinguish storage failures from invalid exports.
 func classifyArchiveReadErr(err error) error {
 	var corrupt flate.CorruptInputError
 	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) || errors.Is(err, zip.ErrAlgorithm) ||
@@ -101,11 +100,10 @@ func classifyArchiveReadErr(err error) error {
 	return err
 }
 
-// classifyImportFailure maps a job error to its user-safe reason. A
-// deadline anywhere in the chain is reported as a timeout before any
-// tag is consulted, so the user learns their archive was too large to
-// finish rather than seeing a generic failure; otherwise the tag set
-// closest to the cause wins.
+// classifyImportFailure maps a job error to its user-safe reason. Job
+// deadline expiry takes precedence, followed by request timeouts.
+// Specific source tags and typed service errors take precedence over
+// generic fallback tags.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ImportFailureTimeout
