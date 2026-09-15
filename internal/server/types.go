@@ -64,6 +64,8 @@ type PullItem struct {
 	NeedsRewrap  bool    `json:"needs_rewrap,omitempty"`
 	Code         string  `json:"code,omitempty"`
 	Reason       string  `json:"reason,omitempty"`
+
+	cause error
 }
 
 type PullResponse struct {

@@ -55,8 +55,19 @@ var ErrForbidden = errors.New("buckets: forbidden")
 // maximum accepted response size.
 var ErrTooLarge = errors.New("buckets: item too large")
 
+// HTTPError preserves an unexpected sidecar status without retaining its
+// response body, which may contain private object or request details.
+type HTTPError struct {
+	StatusCode int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("buckets: status %d", e.StatusCode)
+}
+
 const (
 	defaultRequestTimeout = 5 * time.Minute
+	maxErrorBodyBytes     = 8192
 
 	// encryptionKeySize is the AES-256 key length the sidecar's
 	// multitenant resolver requires; it rejects any key that does not
@@ -232,14 +243,14 @@ func (c *Client) GetLimited(ctx context.Context, owner, accessToken string, key 
 		// mismatch (DecryptionFailed); the headers we send are always
 		// valid. Confirm the S3 error code before mapping so genuine
 		// InvalidArgument bugs aren't silently treated as forbidden.
-		code, msg := s3Error(resp.Body)
+		code := s3ErrorCode(resp.Body)
 		if code == s3CodeDecryptionFailed {
 			return nil, ErrForbidden
 		}
-		return nil, fmt.Errorf("buckets: get status 400: %s", joinCodeMessage(code, msg))
+		return nil, &HTTPError{StatusCode: resp.StatusCode}
 	default:
-		code, msg := s3Error(resp.Body)
-		return nil, fmt.Errorf("buckets: get status %d: %s", resp.StatusCode, joinCodeMessage(code, msg))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return nil, &HTTPError{StatusCode: resp.StatusCode}
 	}
 }
 
@@ -285,8 +296,8 @@ func (c *Client) expectOK(resp *http.Response) error {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	code, msg := s3Error(resp.Body)
-	return fmt.Errorf("buckets: status %d: %s", resp.StatusCode, joinCodeMessage(code, msg))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
+	return &HTTPError{StatusCode: resp.StatusCode}
 }
 
 // TenantForUser exposes the per-user tenant derivation so test
@@ -312,29 +323,16 @@ func tenantForUser(owner string) (string, error) {
 }
 
 type s3ErrorBody struct {
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
+	Code string `xml:"Code"`
 }
 
-// s3Error reads a bounded S3 XML error body and returns its Code and
-// Message. On a body that isn't parseable XML it returns an empty code
-// and the trimmed raw text so the caller can still surface something.
-func s3Error(r io.Reader) (code, message string) {
-	raw, _ := io.ReadAll(io.LimitReader(r, 8192))
+// s3ErrorCode reads a bounded S3 XML error body for sentinel matching.
+// Malformed responses do not produce a code or expose the raw body.
+func s3ErrorCode(r io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(r, maxErrorBodyBytes))
 	var e s3ErrorBody
 	if err := xml.Unmarshal(raw, &e); err == nil && e.Code != "" {
-		return e.Code, e.Message
+		return e.Code
 	}
-	return "", strings.TrimSpace(string(raw))
-}
-
-func joinCodeMessage(code, message string) string {
-	switch {
-	case code != "" && message != "":
-		return code + ": " + message
-	case code != "":
-		return code
-	default:
-		return message
-	}
+	return ""
 }

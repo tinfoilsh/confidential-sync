@@ -6,7 +6,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/http"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
@@ -26,12 +30,18 @@ const (
 	// ImportFailureLimitExceeded means the archive exceeded a v1 import
 	// cap (conversations, messages, attachments, or entry sizes).
 	ImportFailureLimitExceeded ImportFailureReason = "limit_exceeded"
-	// ImportFailureKeyMismatch means the supplied CEK is not the user's
-	// registered current key, so nothing was written.
+	// ImportFailureKeyMismatch means the supplied key cannot access the
+	// user's cloud chats or is not their registered current key.
 	ImportFailureKeyMismatch ImportFailureReason = "key_mismatch"
-	// ImportFailureInternal covers everything else (storage, network,
-	// panics); the user is asked to retry.
-	ImportFailureInternal ImportFailureReason = "internal"
+	// ImportFailureInternal is the fallback when the cause cannot be
+	// mapped to a more specific user-safe reason.
+	ImportFailureInternal           ImportFailureReason = "internal"
+	ImportFailureRequestTimeout     ImportFailureReason = "request_timeout"
+	ImportFailureServiceUnavailable ImportFailureReason = "service_unavailable"
+	ImportFailureRateLimited        ImportFailureReason = "rate_limited"
+	ImportFailureAuthorization      ImportFailureReason = "authorization_failed"
+	ImportFailureExistingChatCheck  ImportFailureReason = "existing_chat_check_failed"
+	ImportFailureWorker             ImportFailureReason = "worker_failed"
 )
 
 // importFailureErr tags an error with the reason a job failed. Code that
@@ -70,8 +80,7 @@ func limitExceededErr(msg string) error {
 // classifyParseFailure tags a ParseEach error. Only a parser rejection
 // of the root document means the upload is not a valid export; any
 // other error originated in the emit callback and is either already
-// classified or a transport error the coordinator maps to
-// internal/timeout.
+// classified or a service error the coordinator classifies.
 func classifyParseFailure(err error) error {
 	if errors.Is(err, importer.ErrInvalidExport) {
 		return importFailure(ImportFailureInvalidArchive, err)
@@ -80,8 +89,8 @@ func classifyParseFailure(err error) error {
 }
 
 // classifyArchiveReadErr tags ZIP or deflate corruption as an invalid
-// archive. Anything else (a staged-chunk fetch failing or timing out)
-// is left untagged so it is reported as internal or timeout.
+// archive. Other errors retain their original causes and tags so the
+// coordinator can distinguish storage failures from invalid exports.
 func classifyArchiveReadErr(err error) error {
 	var corrupt flate.CorruptInputError
 	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) || errors.Is(err, zip.ErrAlgorithm) ||
@@ -91,27 +100,65 @@ func classifyArchiveReadErr(err error) error {
 	return err
 }
 
-// classifyImportFailure maps a job error to its user-safe reason. A
-// deadline anywhere in the chain is reported as a timeout before any
-// tag is consulted, so the user learns their archive was too large to
-// finish rather than seeing a generic failure; otherwise the tag set
-// closest to the cause wins.
+// classifyImportFailure maps a job error to its user-safe reason. Job
+// deadline expiry takes precedence, followed by request timeouts.
+// Specific source tags and typed service errors take precedence over
+// generic fallback tags.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return ImportFailureTimeout
-	}
-	var tagged *importFailureErr
-	if errors.As(err, &tagged) {
-		return tagged.reason
-	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ImportFailureTimeout
+	}
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkErr) && networkErr.Timeout()) {
+		return ImportFailureRequestTimeout
+	}
+	var tagged *importFailureErr
+	if errors.As(err, &tagged) && tagged.reason != ImportFailureInternal && tagged.reason != ImportFailureExistingChatCheck {
+		return safeImportFailureReason(tagged.reason)
 	}
 	var appErr *AppError
 	if errors.As(err, &appErr) && (appErr.Code == CodeStaleKey || appErr.Code == CodeUnknownKey) {
 		return ImportFailureKeyMismatch
 	}
+	var upstreamErr *controlplane.Error
+	var bucketErr *buckets.HTTPError
+	var statusCode int
+	switch {
+	case errors.As(err, &upstreamErr):
+		statusCode = upstreamErr.StatusCode
+	case errors.As(err, &bucketErr):
+		statusCode = bucketErr.StatusCode
+	}
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return ImportFailureRequestTimeout
+	case http.StatusTooManyRequests:
+		return ImportFailureRateLimited
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ImportFailureAuthorization
+	}
+	if statusCode >= http.StatusInternalServerError {
+		return ImportFailureServiceUnavailable
+	}
+	if networkErr != nil || (appErr != nil && appErr.Code == CodeNetwork) {
+		return ImportFailureServiceUnavailable
+	}
+	if tagged != nil {
+		return safeImportFailureReason(tagged.reason)
+	}
 	return ImportFailureInternal
+}
+
+func safeImportFailureReason(reason ImportFailureReason) ImportFailureReason {
+	switch reason {
+	case ImportFailureTimeout, ImportFailureInvalidArchive, ImportFailureLimitExceeded,
+		ImportFailureKeyMismatch, ImportFailureRequestTimeout, ImportFailureServiceUnavailable,
+		ImportFailureRateLimited, ImportFailureAuthorization, ImportFailureExistingChatCheck,
+		ImportFailureWorker:
+		return reason
+	default:
+		return ImportFailureInternal
+	}
 }
 
 // importFailureMessage is the status-response text for a reason. The
@@ -126,6 +173,18 @@ func importFailureMessage(reason ImportFailureReason) string {
 		return "import archive exceeds import limits"
 	case ImportFailureKeyMismatch:
 		return "import key is not the current key"
+	case ImportFailureRequestTimeout:
+		return "a request to Tinfoil storage timed out; please retry the import"
+	case ImportFailureServiceUnavailable:
+		return "Tinfoil could not communicate with its storage service; please retry the import"
+	case ImportFailureRateLimited:
+		return "Tinfoil storage is limiting requests; please wait and retry the import"
+	case ImportFailureAuthorization:
+		return "Tinfoil could not authorize access to cloud storage for the import; please retry from a signed-in device"
+	case ImportFailureExistingChatCheck:
+		return "Tinfoil could not check previously imported chats; the import stopped to avoid duplicates"
+	case ImportFailureWorker:
+		return "the import worker stopped unexpectedly; please retry the import"
 	default:
 		return "import failed"
 	}

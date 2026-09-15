@@ -260,10 +260,10 @@ func formattedDeterministicChatID(hashInput string, createdAt time.Time) string 
 func priorImportedChatExists(ctx context.Context, deps Deps, sess Session, cekB64, id string) (bool, error) {
 	resp, err := Pull(ctx, deps, sess, PullRequest{Scope: "chat", IDs: []string{id}, Keys: []PullKey{{Key: cekB64}}})
 	if err != nil {
-		return false, err
+		return false, importFailure(ImportFailureExistingChatCheck, err)
 	}
 	if len(resp.Items) != 1 {
-		return false, errors.New("import: invalid prior import probe response")
+		return false, importFailure(ImportFailureExistingChatCheck, errors.New("import: invalid prior import probe response"))
 	}
 	item := resp.Items[0]
 	if item.OK {
@@ -272,10 +272,10 @@ func priorImportedChatExists(ctx context.Context, deps Deps, sess Session, cekB6
 	if item.Code == "NOT_FOUND" {
 		return false, nil
 	}
-	if item.Code == CodeNetwork {
-		return false, errors.New("import: prior import probe failed")
+	if item.cause != nil {
+		return false, importFailure(ImportFailureExistingChatCheck, item.cause)
 	}
-	return false, fmt.Errorf("import: prior import probe returned %s", item.Code)
+	return false, importFailure(ImportFailureExistingChatCheck, &AppError{Code: item.Code})
 }
 
 func chatIdemKey(chatID string) string {
@@ -314,7 +314,7 @@ func notifyImportOutcome(ctx context.Context, deps Deps, outcome controlplane.Im
 	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importNotifyTimeout)
 	defer cancel()
 	if err := deps.Controlplane.NotifyImportOutcome(notifyCtx, outcome); err != nil {
-		deps.logError("import notify failed: user=%s job=%s status=%s err=%v", outcome.ClerkUserID, outcome.JobID, outcome.Status, err)
+		deps.logError("import notify failed: user=%s job=%s status=%s error_type=%T", outcome.ClerkUserID, outcome.JobID, outcome.Status, err)
 	}
 }
 

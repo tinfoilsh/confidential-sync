@@ -6,8 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"os"
 	"testing"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
@@ -38,6 +42,21 @@ func TestClassifyImportFailure(t *testing.T) {
 		{"truncated chunk fetch is not archive corruption", context.Background(), classifyArchiveReadErr(importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", io.ErrUnexpectedEOF))), ImportFailureInternal},
 		{"chunk fetch deadline wins over its internal tag", expired, importFailure(ImportFailureInternal, fmt.Errorf("import: fetch staged chunk: %w", context.DeadlineExceeded)), ImportFailureTimeout},
 		{"stale key", context.Background(), &AppError{Code: CodeStaleKey}, ImportFailureKeyMismatch},
+		{"request deadline without job expiry", context.Background(), fmt.Errorf("lookup: %w", context.DeadlineExceeded), ImportFailureRequestTimeout},
+		{"network deadline without job expiry", context.Background(), &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, ImportFailureRequestTimeout},
+		{"job expiry wins over lookup fallback", expired, importFailure(ImportFailureExistingChatCheck, errors.New("lookup failed")), ImportFailureTimeout},
+		{"request deadline survives lookup wrapper", context.Background(), importFailure(ImportFailureExistingChatCheck, context.DeadlineExceeded), ImportFailureRequestTimeout},
+		{"connection failure survives lookup wrapper", context.Background(), importFailure(ImportFailureExistingChatCheck, &net.OpError{Op: "dial", Err: errors.New("connection failed")}), ImportFailureServiceUnavailable},
+		{"service error survives internal wrapper", context.Background(), importFailure(ImportFailureInternal, &controlplane.Error{StatusCode: http.StatusServiceUnavailable}), ImportFailureServiceUnavailable},
+		{"rate limited", context.Background(), &controlplane.Error{StatusCode: http.StatusTooManyRequests}, ImportFailureRateLimited},
+		{"gateway timeout", context.Background(), &controlplane.Error{StatusCode: http.StatusGatewayTimeout}, ImportFailureRequestTimeout},
+		{"HTTP request timeout", context.Background(), &controlplane.Error{StatusCode: http.StatusRequestTimeout}, ImportFailureRequestTimeout},
+		{"unauthorized", context.Background(), &controlplane.Error{StatusCode: http.StatusUnauthorized}, ImportFailureAuthorization},
+		{"forbidden", context.Background(), &controlplane.Error{StatusCode: http.StatusForbidden}, ImportFailureAuthorization},
+		{"unreadable prior import", context.Background(), importFailure(ImportFailureExistingChatCheck, &AppError{Code: CodeBadRequest}), ImportFailureExistingChatCheck},
+		{"unknown prior key", context.Background(), importFailure(ImportFailureExistingChatCheck, &AppError{Code: CodeUnknownKey}), ImportFailureKeyMismatch},
+		{"unknown tag is not exposed", context.Background(), importFailure("private-title", errors.New("private-message")), ImportFailureInternal},
+		{"message text does not classify a timeout", context.Background(), errors.New("context deadline exceeded"), ImportFailureInternal},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
