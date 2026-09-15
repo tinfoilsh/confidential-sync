@@ -933,8 +933,7 @@ func Migrate(ctx context.Context, deps Deps, sess Session, req MigrateRequest) (
 			break
 		}
 		out.Blocked = append(out.Blocked, id)
-		if err := deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject); err != nil {
-		}
+		_ = deps.Controlplane.RecordMigrationFailure(ctx, req.Scope, id, sess.RawJWT, sess.Claims.Subject)
 	}
 
 	if len(req.IDs) == 0 {

@@ -320,7 +320,7 @@ func attachmentIdemKey(chatID, ref string, index int) string {
 }
 
 // notifyImportComplete tells the controlplane to email the user. It is
-// best-effort: a failure is logged but never fails the job.
+// best-effort: a failure never fails the job.
 func notifyImportComplete(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int) {
 	notifyImportOutcome(ctx, deps, controlplane.ImportOutcome{
 		ClerkUserID: clerkUserID, JobID: jobID, Source: source,

@@ -793,8 +793,7 @@ func cleanupNativeAttachments(ctx context.Context, deps Deps, sess Session, atta
 			continue
 		}
 		if deps.Buckets != nil && deps.Buckets.Configured() {
-			if err := deps.Buckets.Delete(cleanupCtx, sess.Claims.Subject, attachmentID); err != nil {
-			}
+			_ = deps.Buckets.Delete(cleanupCtx, sess.Claims.Subject, attachmentID)
 		}
 	}
 }

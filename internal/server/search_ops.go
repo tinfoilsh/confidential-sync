@@ -767,13 +767,12 @@ func removeDeletedChatFromSearch(ctx context.Context, deps Deps, sess Session, c
 
 // dropChatFromSearch is the best-effort delete-side hook: a stale
 // entry only means a deleted chat can still surface in results until
-// the next reindex, so failures are logged and swallowed.
+// the next reindex, so failures are swallowed.
 func dropChatFromSearch(ctx context.Context, deps Deps, sess Session, scope envelope.Scope, chatID string, cek []byte, sourceRevision int64) {
 	if scope != envelope.ScopeChat || !searchConfigured(deps) {
 		return
 	}
-	if err := removeDeletedChatFromSearch(ctx, deps, sess, cek, chatID, sourceRevision); err != nil {
-	}
+	_ = removeDeletedChatFromSearch(ctx, deps, sess, cek, chatID, sourceRevision)
 }
 
 func resetSearchForUser(ctx context.Context, deps Deps, coordinator *SearchReindexCoordinator, owner, oldObjectKey string) error {

@@ -253,9 +253,6 @@ func (c *MigrationCoordinator) run(parentCtx context.Context, deps Deps, sess Se
 	ctx, cancel := context.WithTimeout(ctx, c.budget)
 	defer cancel()
 	resp, err := c.runnerHook(ctx, deps, sess, req, job)
-	if err != nil {
-	} else if resp != nil {
-	}
 	job.finish(resp, err)
 
 	retention := c.retention

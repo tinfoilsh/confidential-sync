@@ -165,8 +165,6 @@ func rewrapChatAttachments(
 	// the next read can no longer satisfy.
 	var promoteErrs []error
 	fieldNormalized := false
-	candidates := 0
-	promoted := 0
 	for _, m := range rawMessages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -194,12 +192,10 @@ func rewrapChatAttachments(
 			if rawID == "" || rawKey == "" {
 				continue
 			}
-			candidates++
 			if err := promoteOneAttachment(ctx, deps, sess, chatID, rawID, rawKey); err != nil {
 				promoteErrs = append(promoteErrs, err)
 				continue
 			}
-			promoted++
 			if keyFromLegacyField {
 				att["encryptionKey"] = rawKey
 				fieldNormalized = true
@@ -299,12 +295,8 @@ func deleteBucketAttachments(ctx context.Context, deps Deps, owner string, ids [
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bucketsDeleteCleanupTimeout)
 	defer cancel()
-	deleted := 0
 	for _, attID := range ids {
-		if err := deps.Buckets.Delete(cleanupCtx, owner, attID); err != nil {
-			continue
-		}
-		deleted++
+		_ = deps.Buckets.Delete(cleanupCtx, owner, attID)
 	}
 }
 
