@@ -87,6 +87,7 @@ type cpStub struct {
 	beforePutBlob                 func(scope, id string)
 	putBlobFailures               map[string]int
 	postPutFailures               map[string]int
+	getBlobFailures               map[string][]int // transient statuses to return before answering normally
 	deleteAttachmentIndexFailures map[string]int
 	captureHeaders                func(r *http.Request)
 }
@@ -115,6 +116,7 @@ func newCPStub(t *testing.T) *cpStub {
 		migrationFailures:             map[string]int{},
 		putBlobFailures:               map[string]int{},
 		postPutFailures:               map[string]int{},
+		getBlobFailures:               map[string][]int{},
 		deleteAttachmentIndexFailures: map[string]int{},
 	}
 	st.mux = http.NewServeMux()
@@ -292,7 +294,13 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 func (s *cpStub) handleGetBlob(scope string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := s.extractID(scope, r)
-		blob, ok := s.blobs[s.putBlobKey(scope, id)]
+		key := s.putBlobKey(scope, id)
+		if pending := s.getBlobFailures[key]; len(pending) > 0 {
+			s.getBlobFailures[key] = pending[1:]
+			w.WriteHeader(pending[0])
+			return
+		}
+		blob, ok := s.blobs[key]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return

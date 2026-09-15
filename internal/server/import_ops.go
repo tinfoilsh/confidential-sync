@@ -78,9 +78,16 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
 			Kind: "chat", SourceID: chat.StableKey, Generation: 0,
 		}
-		priorImport, err := priorImportedChatExists(ctx, deps, sess, cekB64, priorIDs[chat.ID])
+		// A failed probe is not fatal: the push below is idempotent and
+		// reports an existing row as already imported, so the worst case
+		// of skipping the probe is one extra round trip, not a duplicate.
+		priorImport, err := priorImportedChatExistsWithRetry(ctx, deps, sess, cekB64, priorIDs[chat.ID])
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return err
+			}
+			job.addWarning("prior import check unavailable; relying on idempotent push")
+			priorImport = false
 		}
 		if priorImport {
 			skipped++
@@ -191,14 +198,19 @@ func sealImportedChat(
 		metadata["projectId"] = chat.ProjectID
 	}
 
-	_, err = Push(ctx, deps, sess, PushRequest{
-		Scope:          "chat",
-		ID:             chat.ID,
-		Key:            cekB64,
-		Plaintext:      base64.StdEncoding.EncodeToString(plaintext),
-		IfMatch:        nil,
-		IdempotencyKey: chatIdemKey(chat.ID),
-		Metadata:       metadata,
+	// The push carries a stable idempotency key and operation hash, so a
+	// retry after a lost response replays instead of duplicating.
+	err = retryTransientImportCall(ctx, func() error {
+		_, pushErr := Push(ctx, deps, sess, PushRequest{
+			Scope:          "chat",
+			ID:             chat.ID,
+			Key:            cekB64,
+			Plaintext:      base64.StdEncoding.EncodeToString(plaintext),
+			IfMatch:        nil,
+			IdempotencyKey: chatIdemKey(chat.ID),
+			Metadata:       metadata,
+		})
+		return pushErr
 	})
 	if err != nil && isAlreadyImported(err) && chat.Restore != nil {
 		match, _, verifyErr := inspectRestoreCandidate(ctx, deps, sess, cekB64, "chat", chat.ID, *chat.Restore)
@@ -255,6 +267,19 @@ func formattedDeterministicChatID(hashInput string, createdAt time.Time) string 
 	h := hex.EncodeToString(sum[:])
 	uuidish := fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 	return fmt.Sprintf("%013d_%s", rev, uuidish)
+}
+
+// priorImportedChatExistsWithRetry retries the read-only probe on
+// transient failures. A definitive answer or a non-transient error
+// returns immediately.
+func priorImportedChatExistsWithRetry(ctx context.Context, deps Deps, sess Session, cekB64, id string) (bool, error) {
+	var exists bool
+	err := retryTransientImportCall(ctx, func() error {
+		var probeErr error
+		exists, probeErr = priorImportedChatExists(ctx, deps, sess, cekB64, id)
+		return probeErr
+	})
+	return exists, err
 }
 
 func priorImportedChatExists(ctx context.Context, deps Deps, sess Session, cekB64, id string) (bool, error) {
