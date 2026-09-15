@@ -136,3 +136,26 @@ func TestPullItemDoesNotSerializeInternalCause(t *testing.T) {
 		t.Fatal("internal cause was serialized")
 	}
 }
+
+func TestPullResponseDoesNotExposeFetchErrorDetails(t *testing.T) {
+	f := newFixture(t)
+	f.handler.deps.Controlplane = controlplane.NewClient(f.cp.server.URL, &http.Client{
+		Transport: importProbeErrorTransport{cause: errors.New(privateImportTestText)},
+	})
+	resp, body := f.post("/v1/sync/pull", PullRequest{
+		Scope: "chat", IDs: []string{"prior-id"}, Keys: []PullKey{{Key: f.userKeyB64}},
+	}, f.jwt())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pull status=%d, want 200", resp.StatusCode)
+	}
+	var result PullResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].OK || result.Items[0].Code != CodeNetwork {
+		t.Fatal("expected a failed item with the structured network code")
+	}
+	if result.Items[0].Reason != "" || bytes.Contains(body, []byte(privateImportTestText)) {
+		t.Fatal("pull response exposed raw fetch error text")
+	}
+}
