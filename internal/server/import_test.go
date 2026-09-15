@@ -407,10 +407,10 @@ func TestImportJobPanicIsContainedAndReported(t *testing.T) {
 	}
 	snap := runCoordinatorJob(t, f, coord, job)
 
-	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureInternal {
-		t.Fatalf("status=%s reason=%q, want failed/internal", snap.Status, snap.FailureReason)
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureWorker {
+		t.Fatalf("status=%s reason=%q, want failed/worker_failed", snap.Status, snap.FailureReason)
 	}
-	if body := notified.single(t); body["failureReason"] != string(ImportFailureInternal) {
+	if body := notified.single(t); body["failureReason"] != string(ImportFailureWorker) {
 		t.Fatalf("unexpected panic notification: %v", body)
 	}
 }

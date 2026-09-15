@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/http"
 
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
@@ -31,7 +34,13 @@ const (
 	ImportFailureKeyMismatch ImportFailureReason = "key_mismatch"
 	// ImportFailureInternal covers everything else (storage, network,
 	// panics); the user is asked to retry.
-	ImportFailureInternal ImportFailureReason = "internal"
+	ImportFailureInternal           ImportFailureReason = "internal"
+	ImportFailureRequestTimeout     ImportFailureReason = "request_timeout"
+	ImportFailureServiceUnavailable ImportFailureReason = "service_unavailable"
+	ImportFailureRateLimited        ImportFailureReason = "rate_limited"
+	ImportFailureAuthorization      ImportFailureReason = "authorization_failed"
+	ImportFailureExistingChatCheck  ImportFailureReason = "existing_chat_check_failed"
+	ImportFailureWorker             ImportFailureReason = "worker_failed"
 )
 
 // importFailureErr tags an error with the reason a job failed. Code that
@@ -97,21 +106,54 @@ func classifyArchiveReadErr(err error) error {
 // finish rather than seeing a generic failure; otherwise the tag set
 // closest to the cause wins.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return ImportFailureTimeout
-	}
-	var tagged *importFailureErr
-	if errors.As(err, &tagged) {
-		return tagged.reason
-	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ImportFailureTimeout
+	}
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkErr) && networkErr.Timeout()) {
+		return ImportFailureRequestTimeout
+	}
+	var tagged *importFailureErr
+	if errors.As(err, &tagged) && tagged.reason != ImportFailureInternal && tagged.reason != ImportFailureExistingChatCheck {
+		return safeImportFailureReason(tagged.reason)
 	}
 	var appErr *AppError
 	if errors.As(err, &appErr) && (appErr.Code == CodeStaleKey || appErr.Code == CodeUnknownKey) {
 		return ImportFailureKeyMismatch
 	}
+	var upstreamErr *controlplane.Error
+	if errors.As(err, &upstreamErr) {
+		switch upstreamErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+			return ImportFailureRequestTimeout
+		case http.StatusTooManyRequests:
+			return ImportFailureRateLimited
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return ImportFailureAuthorization
+		}
+		if upstreamErr.StatusCode >= http.StatusInternalServerError {
+			return ImportFailureServiceUnavailable
+		}
+	}
+	if networkErr != nil || (appErr != nil && appErr.Code == CodeNetwork) {
+		return ImportFailureServiceUnavailable
+	}
+	if tagged != nil {
+		return safeImportFailureReason(tagged.reason)
+	}
 	return ImportFailureInternal
+}
+
+func safeImportFailureReason(reason ImportFailureReason) ImportFailureReason {
+	switch reason {
+	case ImportFailureTimeout, ImportFailureInvalidArchive, ImportFailureLimitExceeded,
+		ImportFailureKeyMismatch, ImportFailureRequestTimeout, ImportFailureServiceUnavailable,
+		ImportFailureRateLimited, ImportFailureAuthorization, ImportFailureExistingChatCheck,
+		ImportFailureWorker:
+		return reason
+	default:
+		return ImportFailureInternal
+	}
 }
 
 // importFailureMessage is the status-response text for a reason. The
@@ -126,6 +168,18 @@ func importFailureMessage(reason ImportFailureReason) string {
 		return "import archive exceeds import limits"
 	case ImportFailureKeyMismatch:
 		return "import key is not the current key"
+	case ImportFailureRequestTimeout:
+		return "a request to Tinfoil storage timed out; please retry the import"
+	case ImportFailureServiceUnavailable:
+		return "Tinfoil could not communicate with its storage service; please retry the import"
+	case ImportFailureRateLimited:
+		return "Tinfoil storage is limiting requests; please wait and retry the import"
+	case ImportFailureAuthorization:
+		return "Tinfoil could not authorize access to cloud storage for the import; please retry from a signed-in device"
+	case ImportFailureExistingChatCheck:
+		return "Tinfoil could not check previously imported chats; the import stopped to avoid duplicates"
+	case ImportFailureWorker:
+		return "the import worker stopped unexpectedly; please retry the import"
 	default:
 		return "import failed"
 	}

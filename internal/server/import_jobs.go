@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -400,9 +401,9 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 	err := c.runGuarded(ctx, deps, sess, job)
 	if err != nil {
 		reason := classifyImportFailure(ctx, err)
-		deps.logError("import job failed: user=%s job=%s reason=%s err=%v", job.UserID, job.ID, reason, err)
 		job.addError(importFailureMessage(reason))
 		snap := job.Snapshot()
+		deps.logError("import job failed: user=%s job=%s reason=%s imported=%d failed=%d error_type=%T", job.UserID, job.ID, reason, snap.Imported, snap.Failed, err)
 		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason)
 		job.fail(reason)
 	} else {
@@ -428,7 +429,7 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 func (c *ImportCoordinator) runGuarded(ctx context.Context, deps Deps, sess Session, job *ImportJobState) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("import: panic: %v", r)
+			err = importFailure(ImportFailureWorker, errors.New("import worker stopped unexpectedly"))
 		}
 	}()
 	return c.runner(ctx, deps, sess, job)

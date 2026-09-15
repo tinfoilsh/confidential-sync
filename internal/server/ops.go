@@ -391,7 +391,7 @@ func pullOne(
 		if controlplane.IsCode(err, controlplane.StatusLegacyBlobNotMigrated) {
 			return PullItem{ID: id, OK: false, Code: CodeLegacyBlobNotMigrated}
 		}
-		return PullItem{ID: id, OK: false, Code: CodeNetwork, Reason: err.Error()}
+		return PullItem{ID: id, OK: false, Code: CodeNetwork, Reason: err.Error(), cause: err}
 	}
 
 	switch envelope.Detect(blob.Ciphertext) {
