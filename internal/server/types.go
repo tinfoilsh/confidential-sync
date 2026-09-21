@@ -29,6 +29,36 @@ type PushResponse struct {
 	SearchIndexed *bool `json:"search_indexed,omitempty"`
 }
 
+// ForkRequest copies the first MessageCount messages of an existing
+// chat into a brand-new chat row. The enclave unseals the source under
+// the CEK, re-uploads every referenced image so the fork owns its own
+// attachment blobs, and seals the result under the same CEK. Only the
+// enclave sees plaintext, so the client never has to download and
+// re-upload attachment bytes to branch a conversation.
+type ForkRequest struct {
+	SourceID string `json:"source_id"`
+	TargetID string `json:"target_id"`
+	Key      string `json:"key"` // base64 32-byte raw key
+	// MessageCount is how many leading messages the fork keeps; it
+	// must be at least 1 and at most the source's message count.
+	MessageCount int    `json:"message_count"`
+	Title        string `json:"title"`
+	// CreatedAt (RFC 3339) becomes the fork's createdAt/updatedAt. The
+	// caller supplies it so a retried fork seals byte-identical
+	// plaintext and replays under its idempotency key instead of
+	// tripping an operation-hash mismatch.
+	CreatedAt      string `json:"created_at"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+type ForkResponse struct {
+	OK            bool   `json:"ok"`
+	ID            string `json:"id"`
+	ETag          string `json:"etag"`
+	KeyID         string `json:"key_id"`
+	SearchIndexed *bool  `json:"search_indexed,omitempty"`
+}
+
 type PullKey struct {
 	Key   string `json:"key"`    // base64 32-byte raw key
 	KeyID string `json:"key_id"` // optional; enclave verifies/derives

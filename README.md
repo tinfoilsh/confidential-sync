@@ -62,50 +62,51 @@ See [`LOCAL_TESTING.md`](./LOCAL_TESTING.md) for the full runbook, including the
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLERK_ISSUER` | - | Clerk issuer URL used to resolve the JWKS for JWT verification. Required. |
-| `CONTROLPLANE_URL` | - | Base URL of the Tinfoil controlplane that stores ciphertext. Required. |
-| `SYNC_ENCLAVE_SECRET` | - | Shared service secret used to authenticate the enclave to the controlplane. Required. |
-| `CLERK_AUDIENCE` | - | Expected `aud` claim on incoming JWTs. When unset, audience is not enforced. |
-| `BUCKETS_URL` | - | Base URL of the buckets sidecar used for attachment storage. When unset, attachment routes return 503 and rewrap / wipe paths skip bucket cleanup. |
-| `CHAT_ATTACHMENTS_BUCKET` | - | S3 bucket name sent in the sidecar's path-style request URL. The sidecar routes to whatever bucket the path names, so this must be set alongside `BUCKETS_URL`; when unset the buckets client is treated as unconfigured. |
-| `SEARCH_BUCKETS_URL` | - | Base URL of the buckets sidecar used for encrypted search indexes. When unset (or the embedding service is unconfigured), search routes return 503 and push/delete skip index upkeep. |
-| `SEARCH_INDEXES_BUCKET` | - | Name of the S3 bucket for search indexes. Required alongside `SEARCH_BUCKETS_URL`. |
-| `TINFOIL_API_KEY` | - | API key for the Tinfoil inference service. |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model identifier recorded in the search index. |
-| `LISTEN_ADDR` | `:8089` | Address the enclave HTTP server listens on. |
-| `GIT_SHA` | `unknown` | Build identifier reported by the health endpoint. Normally injected at build time via `-ldflags`. |
+| Variable                  | Default            | Description                                                                                                                                                                                                               |
+| ------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLERK_ISSUER`            | -                  | Clerk issuer URL used to resolve the JWKS for JWT verification. Required.                                                                                                                                                 |
+| `CONTROLPLANE_URL`        | -                  | Base URL of the Tinfoil controlplane that stores ciphertext. Required.                                                                                                                                                    |
+| `SYNC_ENCLAVE_SECRET`     | -                  | Shared service secret used to authenticate the enclave to the controlplane. Required.                                                                                                                                     |
+| `CLERK_AUDIENCE`          | -                  | Expected `aud` claim on incoming JWTs. When unset, audience is not enforced.                                                                                                                                              |
+| `BUCKETS_URL`             | -                  | Base URL of the buckets sidecar used for attachment storage. When unset, attachment routes return 503 and rewrap / wipe paths skip bucket cleanup.                                                                        |
+| `CHAT_ATTACHMENTS_BUCKET` | -                  | S3 bucket name sent in the sidecar's path-style request URL. The sidecar routes to whatever bucket the path names, so this must be set alongside `BUCKETS_URL`; when unset the buckets client is treated as unconfigured. |
+| `SEARCH_BUCKETS_URL`      | -                  | Base URL of the buckets sidecar used for encrypted search indexes. When unset (or the embedding service is unconfigured), search routes return 503 and push/delete skip index upkeep.                                     |
+| `SEARCH_INDEXES_BUCKET`   | -                  | Name of the S3 bucket for search indexes. Required alongside `SEARCH_BUCKETS_URL`.                                                                                                                                        |
+| `TINFOIL_API_KEY`         | -                  | API key for the Tinfoil inference service.                                                                                                                                                                                |
+| `EMBEDDING_MODEL`         | `nomic-embed-text` | Embedding model identifier recorded in the search index.                                                                                                                                                                  |
+| `LISTEN_ADDR`             | `:8089`            | Address the enclave HTTP server listens on.                                                                                                                                                                               |
+| `GIT_SHA`                 | `unknown`          | Build identifier reported by the health endpoint. Normally injected at build time via `-ldflags`.                                                                                                                         |
 
 ## Endpoints
 
 All authenticated `/v1` routes require a Clerk-issued Bearer JWT in the `Authorization` header and `X-Sync-Protocol: 2`. Missing or unsupported sync protocol headers receive HTTP 426 with code `SYNC_PROTOCOL_UPGRADE_REQUIRED`; there is no legacy fallback. Request and response bodies are JSON.
 
-| Method | Path | Auth | Purpose |
-|--------|------|------|---------|
-| `POST` | `/v1/sync/push` | yes | Seal a blob and store it via the controlplane, guarded by compare-and-set. |
-| `POST` | `/v1/sync/pull` | yes | Fetch and unseal a stored blob. |
-| `POST` | `/v1/sync/backup-inventory` | yes | Return key-free metadata for backup reconciliation. |
-| `POST` | `/v1/sync/list-status` | yes | List scoped sync metadata for profile, project, document, and chat pagination. |
-| `POST` | `/v1/sync/revision-summary` | yes | Report the current and oldest replayable metadata revisions. |
-| `POST` | `/v1/sync/revision-events` | yes | Replay paginated metadata changes across a bounded revision window. |
-| `POST` | `/v1/sync/revision-snapshot` | yes | Read a paginated metadata snapshot at a stable revision. |
-| `POST` | `/v1/sync/delete` | yes | Delete a stored blob, guarded by compare-and-set. |
-| `POST` | `/v1/sync/delete-all-projects` | yes | Atomically delete all projects and their documents. |
-| `POST` | `/v1/key/register` | yes | Register the per-account content encryption key. |
-| `POST` | `/v1/key/add-bundle` | yes | Add a passkey-wrapped key bundle to the account. |
-| `POST` | `/v1/key/remove-bundle` | yes | Remove a key bundle from the account. |
-| `POST` | `/v1/key/current` | yes | Report the current key id and whether data exists under it. |
-| `POST` | `/v1/blobs/migrate` | yes | Rewrap a single legacy blob into the current envelope format. |
-| `POST` | `/v1/blobs/migrate-all` | yes | Kick off a detached background job that rewraps every legacy blob. |
-| `POST` | `/v1/blobs/migrate-status` | yes | Poll the status of the background migration job. |
-| `POST` | `/v1/attachment/put` | yes | Encrypt and store an attachment via the buckets sidecar. |
-| `POST` | `/v1/attachment/get` | yes | Fetch and decrypt an attachment. |
-| `POST` | `/v1/attachment/delete` | yes | Delete a stored attachment. |
-| `POST` | `/v1/attachment/get-public` | no | Fetch a shared attachment using the per-attachment key as the access proof. |
-| `POST` | `/v1/share/seal` | yes | Seal a chat for sharing and return a share key. |
-| `POST` | `/v1/share/open` | no | Open a shared chat using the share key as the access proof. |
-| `GET` | `/health`, `/v1/health` | no | Liveness and build-version check. |
+| Method | Path                           | Auth | Purpose                                                                                                  |
+| ------ | ------------------------------ | ---- | -------------------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/sync/push`                | yes  | Seal a blob and store it via the controlplane, guarded by compare-and-set.                               |
+| `POST` | `/v1/sync/pull`                | yes  | Fetch and unseal a stored blob.                                                                          |
+| `POST` | `/v1/sync/backup-inventory`    | yes  | Return key-free metadata for backup reconciliation.                                                      |
+| `POST` | `/v1/sync/list-status`         | yes  | List scoped sync metadata for profile, project, document, and chat pagination.                           |
+| `POST` | `/v1/sync/revision-summary`    | yes  | Report the current and oldest replayable metadata revisions.                                             |
+| `POST` | `/v1/sync/revision-events`     | yes  | Replay paginated metadata changes across a bounded revision window.                                      |
+| `POST` | `/v1/sync/revision-snapshot`   | yes  | Read a paginated metadata snapshot at a stable revision.                                                 |
+| `POST` | `/v1/sync/delete`              | yes  | Delete a stored blob, guarded by compare-and-set.                                                        |
+| `POST` | `/v1/sync/delete-all-projects` | yes  | Atomically delete all projects and their documents.                                                      |
+| `POST` | `/v1/sync/fork`                | yes  | Copy the leading messages of a chat into a new chat, re-uploading its attachments so the fork owns them. |
+| `POST` | `/v1/key/register`             | yes  | Register the per-account content encryption key.                                                         |
+| `POST` | `/v1/key/add-bundle`           | yes  | Add a passkey-wrapped key bundle to the account.                                                         |
+| `POST` | `/v1/key/remove-bundle`        | yes  | Remove a key bundle from the account.                                                                    |
+| `POST` | `/v1/key/current`              | yes  | Report the current key id and whether data exists under it.                                              |
+| `POST` | `/v1/blobs/migrate`            | yes  | Rewrap a single legacy blob into the current envelope format.                                            |
+| `POST` | `/v1/blobs/migrate-all`        | yes  | Kick off a detached background job that rewraps every legacy blob.                                       |
+| `POST` | `/v1/blobs/migrate-status`     | yes  | Poll the status of the background migration job.                                                         |
+| `POST` | `/v1/attachment/put`           | yes  | Encrypt and store an attachment via the buckets sidecar.                                                 |
+| `POST` | `/v1/attachment/get`           | yes  | Fetch and decrypt an attachment.                                                                         |
+| `POST` | `/v1/attachment/delete`        | yes  | Delete a stored attachment.                                                                              |
+| `POST` | `/v1/attachment/get-public`    | no   | Fetch a shared attachment using the per-attachment key as the access proof.                              |
+| `POST` | `/v1/share/seal`               | yes  | Seal a chat for sharing and return a share key.                                                          |
+| `POST` | `/v1/share/open`               | no   | Open a shared chat using the share key as the access proof.                                              |
+| `GET`  | `/health`, `/v1/health`        | no   | Liveness and build-version check.                                                                        |
 
 `/v1/sync/backup-inventory` accepts only `{}` and returns bounded, validated metadata with `Cache-Control: no-store`; it never returns keys, content, key IDs, or user IDs.
 

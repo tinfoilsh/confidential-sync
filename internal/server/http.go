@@ -83,6 +83,11 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/sync/revision-snapshot", func(h *Handler) http.Handler { return h.authMiddleware(h.revisionSnapshot) }},
 		{"POST", "/v1/sync/delete", func(h *Handler) http.Handler { return h.authMiddleware(h.delete) }},
 		{"POST", "/v1/sync/delete-all-projects", func(h *Handler) http.Handler { return h.authMiddleware(h.deleteAllProjects) }},
+		// Fork copies every image in the branched prefix through the
+		// buckets hop, so it runs under the attachment-style timeout.
+		{"POST", "/v1/sync/fork", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.fork, AttachmentRequestTimeout)
+		}},
 
 		{"POST", "/v1/key/register", func(h *Handler) http.Handler { return h.authMiddleware(h.registerKey) }},
 		{"POST", "/v1/key/add-bundle", func(h *Handler) http.Handler { return h.authMiddleware(h.addBundle) }},
@@ -428,6 +433,20 @@ func (h *Handler) deleteAllProjects(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 	resp, err := DeleteAllProjects(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) fork(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req ForkRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := Fork(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return
