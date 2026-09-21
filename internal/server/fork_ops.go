@@ -23,9 +23,11 @@ const (
 	// so a single request cannot pin the buckets hop for an unbounded
 	// number of round trips.
 	maxForkAttachments = 200
-	// maxForkAttachmentBytes caps a single copied image, matching the
-	// per-attachment ceiling the import path enforces.
-	maxForkAttachmentBytes = MaxImportAttachmentBytes
+	// maxForkAttachmentBytes caps a single copied image. Uploads are
+	// only bounded by the request body limit, so anything stored must
+	// fit under it; the cap exists to fail fast on a corrupt object
+	// rather than to enforce a tighter policy than upload does.
+	maxForkAttachmentBytes = MaxRequestBytes
 	// maxForkTitleBytes bounds the caller-supplied title so a fork
 	// cannot smuggle an oversized field into the sealed chat JSON.
 	maxForkTitleBytes = 4096
@@ -96,7 +98,7 @@ func Fork(ctx context.Context, deps Deps, sess Session, req ForkRequest) (*ForkR
 		return nil, err
 	}
 
-	source, err := readForkSource(ctx, deps, sess, req.SourceID, envelope.Key{Bytes: key, KeyIDHex: kidHex})
+	source, projectID, err := readForkSource(ctx, deps, sess, req.SourceID, envelope.Key{Bytes: key, KeyIDHex: kidHex})
 	if err != nil {
 		return nil, err
 	}
@@ -110,15 +112,15 @@ func Fork(ctx context.Context, deps Deps, sess Session, req ForkRequest) (*ForkR
 		return nil, badRequest(fmt.Sprintf("message_count %d exceeds source message count %d", req.MessageCount, len(chat.Messages)))
 	}
 
-	plaintext, attachmentIDs, err := buildForkPayload(ctx, deps, sess, req, chat, createdAt)
+	plaintext, attachmentIDs, err := buildForkPayload(ctx, deps, sess, req, chat, createdAt, projectID)
 	if err != nil {
 		cleanupNativeAttachments(ctx, deps, sess, attachmentIDs)
 		return nil, err
 	}
 
 	metadata := map[string]any{"messageCount": req.MessageCount}
-	if chat.ProjectID != "" {
-		metadata["projectId"] = chat.ProjectID
+	if projectID != "" {
+		metadata["projectId"] = projectID
 	}
 	pushResp, err := Push(ctx, deps, sess, PushRequest{
 		Scope:          "chat",
@@ -150,22 +152,29 @@ func Fork(ctx context.Context, deps Deps, sess Session, req ForkRequest) (*ForkR
 	}, nil
 }
 
-// readForkSource fetches and unseals the source chat. The caller owns
-// the returned plaintext and must zeroize it.
-func readForkSource(ctx context.Context, deps Deps, sess Session, sourceID string, key envelope.Key) ([]byte, error) {
+// readForkSource fetches and unseals the source chat, returning the
+// plaintext and the project the controlplane has the chat filed under
+// (empty when unassigned). The controlplane column is authoritative
+// for project membership because moves update it without re-sealing
+// the row. The caller owns the returned plaintext and must zeroize it.
+func readForkSource(ctx context.Context, deps Deps, sess Session, sourceID string, key envelope.Key) ([]byte, string, error) {
 	blob, err := deps.Controlplane.GetBlob(ctx, string(envelope.ScopeChat), sourceID, sess.RawJWT, sess.Claims.Subject)
 	if err != nil {
 		var cpe *controlplane.Error
 		if errors.As(err, &cpe) && cpe.StatusCode == http.StatusNotFound {
-			return nil, &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "source chat not found"}
+			return nil, "", &AppError{Status: http.StatusNotFound, Code: CodeNotFound, Message: "source chat not found"}
 		}
-		return nil, err
+		return nil, "", err
 	}
 	plaintext, ok := decryptAnyVersion(blob.Ciphertext, []envelope.Key{key}, envelope.ScopeChat, sourceID, sess.Claims.Subject)
 	if !ok {
-		return nil, &AppError{Status: http.StatusConflict, Code: CodeUnknownKey, Reason: "source_not_decryptable"}
+		return nil, "", &AppError{Status: http.StatusConflict, Code: CodeUnknownKey, Reason: "source_not_decryptable"}
 	}
-	return plaintext, nil
+	projectID := ""
+	if blob.ProjectIDSet && blob.ProjectID != nil {
+		projectID = *blob.ProjectID
+	}
+	return plaintext, projectID, nil
 }
 
 // buildForkPayload assembles the fork's chat JSON from the source. Every
@@ -174,7 +183,7 @@ func readForkSource(ctx context.Context, deps Deps, sess Session, sourceID strin
 // chat, messages, and attachments are carried through untouched. The
 // returned attachment ids are the fork's freshly created blobs, which
 // the caller must clean up if the fork does not commit.
-func buildForkPayload(ctx context.Context, deps Deps, sess Session, req ForkRequest, chat nativeChatPayload, createdAt time.Time) ([]byte, []string, error) {
+func buildForkPayload(ctx context.Context, deps Deps, sess Session, req ForkRequest, chat nativeChatPayload, createdAt time.Time, projectID string) ([]byte, []string, error) {
 	messages := make([]map[string]json.RawMessage, 0, req.MessageCount)
 	var attachmentIDs []string
 	copied := 0
@@ -223,6 +232,11 @@ func buildForkPayload(ctx context.Context, deps Deps, sess Session, req ForkRequ
 	setRawString(payload, "createdAt", timestamp)
 	setRawString(payload, "updatedAt", timestamp)
 	payload["isLocalOnly"] = json.RawMessage("false")
+	if projectID != "" {
+		setRawString(payload, "projectId", projectID)
+	} else {
+		delete(payload, "projectId")
+	}
 	if err := setRawJSON(payload, "messages", messages); err != nil {
 		return nil, attachmentIDs, err
 	}

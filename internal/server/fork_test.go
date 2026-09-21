@@ -90,8 +90,16 @@ func seedForkSource(t *testing.T, f *fixture, tok, sourceID string) forkTestSour
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("seed push: %d %s", resp.StatusCode, body)
 	}
+	// A project move updates the controlplane column without
+	// re-sealing the row, so the stored plaintext can lag behind it.
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/"+sourceID].ProjectIDSet = true
+	f.cp.blobs["chat/"+sourceID].ProjectID = &forkSourceProjectID
+	f.cp.mu.Unlock()
 	return src
 }
+
+var forkSourceProjectID = "project-2"
 
 func pullChatJSON(t *testing.T, f *fixture, tok, id string) map[string]any {
 	t.Helper()
@@ -151,10 +159,19 @@ func TestForkCopiesPrefixAndReuploadsAttachments(t *testing.T) {
 	if fork["id"] != "chat_fork" || fork["title"] != "Trip planning (fork)" || fork["titleState"] != "manual" {
 		t.Fatalf("fork identity: id=%v title=%v titleState=%v", fork["id"], fork["title"], fork["titleState"])
 	}
-	for _, field := range []string{"model", "presetId", "projectId", "webSearchEnabled", "customField"} {
+	for _, field := range []string{"model", "presetId", "webSearchEnabled", "customField"} {
 		if fork[field] == nil {
 			t.Fatalf("fork dropped %s", field)
 		}
+	}
+	if fork["projectId"] != forkSourceProjectID {
+		t.Fatalf("fork projectId = %v, want controlplane value %q", fork["projectId"], forkSourceProjectID)
+	}
+	f.cp.mu.Lock()
+	forkBlob := f.cp.blobs["chat/chat_fork"]
+	f.cp.mu.Unlock()
+	if !forkBlob.ProjectIDSet || forkBlob.ProjectID == nil || *forkBlob.ProjectID != forkSourceProjectID {
+		t.Fatalf("fork project metadata = %+v", forkBlob)
 	}
 	for _, field := range forkStrippedFields {
 		if _, present := fork[field]; present {
@@ -346,7 +363,7 @@ func TestForkPayloadIsDeterministicForRetries(t *testing.T) {
 	key := envelope.Key{Bytes: f.userKey, KeyIDHex: f.userKeyID}
 
 	build := func() ([]byte, []string) {
-		source, err := readForkSource(context.Background(), f.handler.deps, sess, req.SourceID, key)
+		source, projectID, err := readForkSource(context.Background(), f.handler.deps, sess, req.SourceID, key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -354,7 +371,7 @@ func TestForkPayloadIsDeterministicForRetries(t *testing.T) {
 		if err := json.Unmarshal(source, &chat); err != nil {
 			t.Fatal(err)
 		}
-		payload, ids, err := buildForkPayload(context.Background(), f.handler.deps, sess, req, chat, createdAt)
+		payload, ids, err := buildForkPayload(context.Background(), f.handler.deps, sess, req, chat, createdAt, projectID)
 		if err != nil {
 			t.Fatal(err)
 		}
