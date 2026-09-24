@@ -1092,6 +1092,40 @@ func TestDeleteCleanupPreservesRecreatedChat(t *testing.T) {
 	}
 }
 
+// TestPushIndexingSkipsBlobProbeAtCurrentRevision pins the fast path:
+// when no chat write landed after the push, the inline indexer trusts
+// the push's etag and never re-reads the blob it just wrote.
+func TestPushIndexingSkipsBlobProbeAtCurrentRevision(t *testing.T) {
+	f := newSearchFixture(t)
+	tok := f.jwt()
+
+	target, err := url.Parse(f.cp.server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodHead || r.Method == http.MethodGet) && strings.HasPrefix(r.URL.Path, "/api/sync/blob/chat/") {
+			probes.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	f.handler.deps.Controlplane = controlplane.NewClient(srv.URL, nil)
+
+	out := f.pushChat(t, tok, "chat_probe", "Pond", "a duck swam by")
+	if out.SearchIndexed == nil || !*out.SearchIndexed {
+		t.Fatalf("push was not indexed: %+v", out)
+	}
+	if n := probes.Load(); n != 0 {
+		t.Fatalf("inline indexing re-read the blob %d times after the push", n)
+	}
+	if got := f.query(t, tok, "duck"); len(got.Results) == 0 || got.Results[0].ID != "chat_probe" {
+		t.Fatalf("pushed chat is not searchable: %+v", got)
+	}
+}
+
 func TestDelayedPushIndexingDoesNotResurrectDeletedChat(t *testing.T) {
 	f := newSearchFixture(t)
 	ctx := context.Background()
