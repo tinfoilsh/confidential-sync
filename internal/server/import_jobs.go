@@ -14,9 +14,18 @@ import (
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 )
 
-// ImportJobBudget caps how long a detached import job may run before it
-// self-cancels, sized like the migration job budget.
-const ImportJobBudget = MigrateAllBudget + 1*time.Minute
+// ImportStallTimeout is how long a running import may go without
+// recording progress before it is canceled. Progress is any job state
+// change (an entity imported, skipped, or failed, a phase change, or a
+// recorded warning), so a large archive is bounded by its own size
+// rather than by a wall clock, while a wedged dependency still ends the
+// job. Every controlplane and bucket call the loop makes is itself
+// bounded by a request timeout well inside this window.
+const ImportStallTimeout = 10 * time.Minute
+
+// errImportStalled is the cancellation cause the stall watchdog sets so
+// the failure classifier can report the job as timed out.
+var errImportStalled = errors.New("import: no progress within the stall timeout")
 
 // ImportJobRetention keeps a finished job addressable for late status
 // polls before it is reaped.
@@ -221,6 +230,14 @@ func (j *ImportJobState) setProgress(imported, failed, total int) {
 	j.updatedAt = time.Now().UTC()
 }
 
+// lastProgress is the time of the job's most recent state change. The
+// stall watchdog compares it against ImportStallTimeout.
+func (j *ImportJobState) lastProgress() time.Time {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.updatedAt
+}
+
 func (j *ImportJobState) finish(status ImportJobStatus) {
 	j.finishWithReason(status, "")
 }
@@ -270,7 +287,7 @@ type ImportCoordinator struct {
 	jobs             map[string]*ImportJobState
 	retention        time.Duration
 	stagingRetention time.Duration
-	budget           time.Duration
+	stallTimeout     time.Duration
 	runner           func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error
 }
 
@@ -279,7 +296,7 @@ func NewImportCoordinator() *ImportCoordinator {
 		jobs:             map[string]*ImportJobState{},
 		retention:        ImportJobRetention,
 		stagingRetention: ImportStagingRetention,
-		budget:           ImportJobBudget,
+		stallTimeout:     ImportStallTimeout,
 		runner:           runImportJob,
 	}
 }
@@ -394,9 +411,11 @@ func (c *ImportCoordinator) reapStaleStaging(parentCtx context.Context, deps Dep
 
 func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Session, job *ImportJobState) {
 	ctx := context.WithoutCancel(parentCtx)
-	ctx, cancel := context.WithTimeout(ctx, c.budget)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stopWatchdog := c.watchStall(ctx, job, cancel)
 	err := c.runGuarded(ctx, deps, sess, job)
+	stopWatchdog()
 	if err != nil {
 		reason := classifyImportFailure(ctx, err)
 		job.addError(importFailureMessage(reason))
@@ -415,6 +434,39 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 		return
 	}
 	time.AfterFunc(retention, func() { c.deleteIfSame(job) })
+}
+
+// watchStall cancels ctx with errImportStalled once the job has gone
+// stallTimeout without recording progress. The timer re-arms from the
+// last progress timestamp instead of polling, so a job that keeps
+// moving is never interrupted and a wedged one is caught within one
+// timeout of its last update. The returned func stops the watchdog.
+func (c *ImportCoordinator) watchStall(ctx context.Context, job *ImportJobState, cancel context.CancelCauseFunc) func() {
+	timeout := c.stallTimeout
+	if timeout <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				remaining := timeout - time.Since(job.lastProgress())
+				if remaining <= 0 {
+					cancel(errImportStalled)
+					return
+				}
+				timer.Reset(remaining)
+			}
+		}
+	}()
+	return func() { close(stop) }
 }
 
 // runGuarded converts a panic in the detached job into an ordinary

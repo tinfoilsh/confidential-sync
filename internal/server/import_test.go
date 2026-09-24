@@ -371,7 +371,10 @@ func TestImportJobFailureNotifiesControlplaneWithReason(t *testing.T) {
 	}
 }
 
-func TestImportJobBudgetExpiryReportsTimeout(t *testing.T) {
+// TestImportJobStallReportsTimeout pins the watchdog contract: a job
+// that keeps recording progress outlives the stall timeout many times
+// over, and is only canceled once it stops moving.
+func TestImportJobStallReportsTimeout(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 	notified := captureImportNotifications(t, f)
@@ -379,17 +382,29 @@ func TestImportJobBudgetExpiryReportsTimeout(t *testing.T) {
 	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	coord := NewImportCoordinator()
+	coord.stallTimeout = 50 * time.Millisecond
+	const progressSteps = 8
 	coord.runner = func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error {
+		for i := 1; i <= progressSteps; i++ {
+			time.Sleep(coord.stallTimeout / 2)
+			if ctx.Err() != nil {
+				return fmt.Errorf("import: canceled while progressing at step %d: %w", i, ctx.Err())
+			}
+			job.setProgress(i, 0, progressSteps)
+		}
 		<-ctx.Done()
 		return fmt.Errorf("import: push chat: %w", ctx.Err())
 	}
-	coord.budget = time.Millisecond
 	snap := runCoordinatorJob(t, f, coord, job)
 
 	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureTimeout {
 		t.Fatalf("status=%s reason=%q, want failed/timeout", snap.Status, snap.FailureReason)
 	}
-	if body := notified.single(t); body["failureReason"] != string(ImportFailureTimeout) {
+	if snap.Imported != progressSteps {
+		t.Fatalf("imported=%d, want %d: the watchdog interrupted a job that was still making progress", snap.Imported, progressSteps)
+	}
+	body := notified.single(t)
+	if body["failureReason"] != string(ImportFailureTimeout) || body["importedCount"] != float64(progressSteps) {
 		t.Fatalf("unexpected timeout notification: %v", body)
 	}
 }
