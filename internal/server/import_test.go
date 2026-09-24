@@ -259,6 +259,107 @@ func TestImportJobSkipsTinfoilDocumentsWithoutContent(t *testing.T) {
 	}
 }
 
+func tinfoilArchiveWithChats(n int) []byte {
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"uuid":"conv-%d","name":"Chat %d","created_at":"2024-01-01T00:00:%02dZ","chat_messages":[{"sender":"human","text":"hi %d","created_at":"2024-01-01T00:00:00Z"}]}`, i, i, i%60, i)
+	}
+	sb.WriteString("]")
+	return []byte(sb.String())
+}
+
+// TestImportJobPushesChatsConcurrently holds every chat write open
+// until several are in flight, so a serial loop would deadlock here
+// while the pool proceeds.
+func TestImportJobPushesChatsConcurrently(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	f.cp.mux.HandleFunc("POST /api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	const chats = 12
+	var inFlight, peak atomic.Int32
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	f.cp.beforePutBlob = func(scope, id string) {
+		if scope != "chat" {
+			return
+		}
+		cur := inFlight.Add(1)
+		for {
+			prev := peak.Load()
+			if cur <= prev || peak.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		if cur >= importChatConcurrency {
+			releaseOnce.Do(func() { close(release) })
+		}
+		f.cp.mu.Unlock()
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+			t.Errorf("chat writes never overlapped: peak in-flight %d", peak.Load())
+		}
+		f.cp.mu.Lock()
+		inFlight.Add(-1)
+	}
+
+	job := stageArchive(t, f, "tinfoil", tinfoilArchiveWithChats(chats))
+	job.cek = append([]byte(nil), f.userKey...)
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	snap := job.Snapshot()
+	if snap.Imported != chats || snap.Failed != 0 || snap.Total != chats {
+		t.Fatalf("imported=%d failed=%d total=%d, want %d/0/%d (errors=%v)", snap.Imported, snap.Failed, snap.Total, chats, chats, snap.Errors)
+	}
+	if got := peak.Load(); got < importChatConcurrency {
+		t.Fatalf("peak concurrent chat writes = %d, want at least %d", got, importChatConcurrency)
+	}
+	if got := peak.Load(); got > importChatConcurrency {
+		t.Fatalf("peak concurrent chat writes = %d exceeds the pool limit %d", got, importChatConcurrency)
+	}
+	if len(f.cp.blobs) != chats {
+		t.Fatalf("expected %d chat blobs, got %d", chats, len(f.cp.blobs))
+	}
+}
+
+// TestImportJobWorkerFailureStopsRemainingChats pins that a definitive
+// error on one worker aborts the job rather than being tallied as a
+// per-chat failure while the rest of the archive keeps importing.
+func TestImportJobWorkerFailureStopsRemainingChats(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	notified := captureImportNotifications(t, f)
+
+	const chats = 40
+	const failAt = 2
+	createdAt := time.Date(2024, time.January, 1, 0, 0, failAt, 0, time.UTC)
+	priorID := priorDeterministicChatID(importer.SourceTinfoil, fmt.Sprintf("conv-%d", failAt), createdAt)
+	f.cp.getBlobFailures["chat/"+priorID] = []int{http.StatusForbidden}
+
+	job := stageArchive(t, f, "tinfoil", tinfoilArchiveWithChats(chats))
+	coord := NewImportCoordinator()
+	snap := runCoordinatorJob(t, f, coord, job)
+
+	if snap.Status != ImportJobFailed || snap.FailureReason != ImportFailureAuthorization {
+		t.Fatalf("status=%s reason=%q, want failed/authorization_failed (errors=%v)", snap.Status, snap.FailureReason, snap.Errors)
+	}
+	if snap.Imported+snap.Failed >= chats {
+		t.Fatalf("job processed every chat (%d imported, %d failed) after a definitive failure", snap.Imported, snap.Failed)
+	}
+	if body := notified.single(t); body["failureReason"] != string(ImportFailureAuthorization) {
+		t.Fatalf("unexpected failure notification: %v", body)
+	}
+}
+
 func TestImportJobEnforcesMessageLimit(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID

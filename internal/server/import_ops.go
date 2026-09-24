@@ -10,16 +10,25 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
+	"golang.org/x/sync/errgroup"
 )
 
 // maxReverseTimestamp mirrors the webapp's reverse-id family so imported
 // chats sort into the sidebar alongside natively-created ones.
 const maxReverseTimestamp int64 = 9999999999999
+
+// importChatConcurrency is how many chats a legacy import seals and
+// pushes at once. Each chat costs a few sequential controlplane round
+// trips, so a serial loop is latency-bound; a small pool hides that
+// latency without letting one import monopolize the controlplane's
+// per-user write lock or the staged-chunk cache.
+const importChatConcurrency = 4
 
 // runImportJob is the detached job body: validate the CEK, open the
 // staged archive safely, stream-parse conversations, seal each chat and
@@ -58,8 +67,19 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 		},
 	}
 
-	var imported, skipped, failed, conversations, messages, parsedAttachments, uploadedAttachments int
+	// The parser runs on this goroutine and owns the archive-wide
+	// limits; each emitted chat is handed to the pool for its network
+	// round trips. Counters are shared between workers, so the tally
+	// guards them, and the parser stops handing out work once any
+	// worker reports a definitive failure.
+	tally := &importChatTally{job: job}
+	workers, workCtx := errgroup.WithContext(ctx)
+	workers.SetLimit(importChatConcurrency)
+	var conversations, messages, parsedAttachments int
 	emit := func(chat *importer.Chat) error {
+		if err := workCtx.Err(); err != nil {
+			return err
+		}
 		conversations++
 		if conversations > MaxImportConversations {
 			return limitExceededErr("import: conversation limit exceeded")
@@ -78,50 +98,147 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
 			Kind: "chat", SourceID: chat.StableKey, Generation: 0,
 		}
-		// The probe looks up the pre-release id family, which differs
-		// from the id the push writes under, so the push's idempotency
-		// cannot dedupe against a legacy row. If the probe is still
-		// unavailable after retries, count this chat as failed and move
-		// on rather than risk a duplicate; a re-run picks it up once the
-		// probe recovers. Definitive probe errors still abort the job.
-		priorImport, err := priorImportedChatExistsWithRetry(ctx, deps, sess, cekB64, priorIDs[chat.ID])
-		if err != nil {
-			if ctx.Err() != nil || !isTransientImportFailure(ctx, err) {
-				return err
-			}
-			failed++
-			job.addError("chat skipped: prior import check unavailable")
-			job.setProgress(imported, failed, conversations)
-			job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
-			return nil
-		}
-		if priorImport {
-			skipped++
-			job.setProgress(imported, failed, conversations)
-			job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
-			return nil
-		}
-		if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, &uploadedAttachments); err != nil {
-			failed++
-			job.addError("chat failed")
-		} else {
-			imported++
-		}
-		job.setProgress(imported, failed, conversations)
-		job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
+		priorID := priorIDs[chat.ID]
+		tally.setTotal(conversations)
+		workers.Go(func() (err error) {
+			// runGuarded only covers the parser goroutine; a panic on a
+			// worker would otherwise unwind past the job entirely.
+			defer func() {
+				if r := recover(); r != nil {
+					err = importFailure(ImportFailureWorker, errors.New("import worker stopped unexpectedly"))
+				}
+			}()
+			return importOneChat(workCtx, deps, sess, arch, chat, priorID, cekB64, job, tally)
+		})
 		return nil
 	}
 
-	if _, err := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit); err != nil {
-		return classifyParseFailure(err)
+	_, parseErr := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit)
+	workErr := workers.Wait()
+	if workErr != nil {
+		return workErr
+	}
+	if parseErr != nil {
+		return classifyParseFailure(parseErr)
 	}
 
-	job.setProgress(imported, failed, conversations)
-	job.setKindCount("chat", ImportKindCounts{Imported: imported, Skipped: skipped, Failed: failed})
+	imported, _, failed := tally.counts()
 	job.setPhase("complete")
 	notifyImportComplete(ctx, deps, sess.Claims.Subject, job.ID, job.Source, imported, failed)
 	return nil
 }
+
+// importChatTally is the shared outcome counter for the legacy import
+// pool. It publishes job progress after every change so the status
+// endpoint and the stall watchdog see each chat as it completes.
+type importChatTally struct {
+	job *ImportJobState
+
+	mu                  sync.Mutex
+	imported            int
+	skipped             int
+	failed              int
+	total               int
+	uploadedAttachments int
+}
+
+func (t *importChatTally) setTotal(total int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.total = total
+	t.publishLocked()
+}
+
+func (t *importChatTally) recordImported() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.imported++
+	t.publishLocked()
+}
+
+func (t *importChatTally) recordSkipped() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.skipped++
+	t.publishLocked()
+}
+
+func (t *importChatTally) recordFailed(msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failed++
+	t.job.addError(msg)
+	t.publishLocked()
+}
+
+// reserveAttachment claims one slot against MaxImportAttachments and
+// reports whether the cap was already reached. A slot whose upload then
+// fails is handed back with releaseAttachment so the cap counts stored
+// attachments only.
+func (t *importChatTally) reserveAttachment() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.uploadedAttachments >= MaxImportAttachments {
+		return false
+	}
+	t.uploadedAttachments++
+	return true
+}
+
+func (t *importChatTally) releaseAttachment() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.uploadedAttachments--
+}
+
+func (t *importChatTally) counts() (imported, skipped, failed int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.imported, t.skipped, t.failed
+}
+
+func (t *importChatTally) publishLocked() {
+	t.job.setProgress(t.imported, t.failed, t.total)
+	t.job.setKindCount("chat", ImportKindCounts{Imported: t.imported, Skipped: t.skipped, Failed: t.failed})
+}
+
+// importOneChat is the pool body for one parsed chat: probe for a
+// pre-release import of the same conversation, then seal and push. A
+// per-chat failure is tallied and returns nil so the rest of the
+// archive proceeds; only definitive errors abort the job.
+func importOneChat(ctx context.Context, deps Deps, sess Session, arch *importArchive, chat *importer.Chat, priorID, cekB64 string, job *ImportJobState, tally *importChatTally) error {
+	// The probe looks up the pre-release id family, which differs
+	// from the id the push writes under, so the push's idempotency
+	// cannot dedupe against a legacy row. If the probe is still
+	// unavailable after retries, count this chat as failed and move
+	// on rather than risk a duplicate; a re-run picks it up once the
+	// probe recovers. Definitive probe errors still abort the job.
+	priorImport, err := priorImportedChatExistsWithRetry(ctx, deps, sess, cekB64, priorID)
+	if err != nil {
+		if ctx.Err() != nil || !isTransientImportFailure(ctx, err) {
+			return err
+		}
+		tally.recordFailed("chat skipped: prior import check unavailable")
+		return nil
+	}
+	if priorImport {
+		tally.recordSkipped()
+		return nil
+	}
+	if err := sealImportedChat(ctx, deps, sess, arch, chat, cekB64, job, tally); err != nil {
+		if errors.Is(err, errImportAttachmentLimit) {
+			return err
+		}
+		tally.recordFailed("chat failed")
+		return nil
+	}
+	tally.recordImported()
+	return nil
+}
+
+// errImportAttachmentLimit is the only sealImportedChat failure that
+// ends the whole job rather than just the current chat.
+var errImportAttachmentLimit = limitExceededErr("import: attachment limit exceeded")
 
 // sealImportedChat uploads each binary attachment, seals the chat under
 // the CEK, and pushes it to the controlplane. Per-attachment failures
@@ -134,7 +251,7 @@ func sealImportedChat(
 	chat *importer.Chat,
 	cekB64 string,
 	job *ImportJobState,
-	attachments *int,
+	tally *importChatTally,
 ) error {
 	attIndex := 0
 	for mi := range chat.Messages {
@@ -170,8 +287,8 @@ func sealImportedChat(
 				job.addWarning("attachment type rejected")
 				continue
 			}
-			if *attachments >= MaxImportAttachments {
-				return limitExceededErr("import: attachment limit exceeded")
+			if !tally.reserveAttachment() {
+				return errImportAttachmentLimit
 			}
 
 			idem := attachmentIdemKey(chat.ID, att.BinaryRef, idx)
@@ -181,6 +298,7 @@ func sealImportedChat(
 				IdempotencyKey: idem,
 			})
 			if err != nil {
+				tally.releaseAttachment()
 				job.addWarning("attachment upload failed")
 				continue
 			}
@@ -189,7 +307,6 @@ func sealImportedChat(
 			att.MimeType = contentType
 			att.BinaryRef = ""
 			kept = append(kept, att)
-			*attachments++
 		}
 		msg.Attachments = kept
 	}
