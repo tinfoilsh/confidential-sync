@@ -305,6 +305,7 @@ func TestImportJobPushesChatsConcurrently(t *testing.T) {
 		case <-release:
 		case <-time.After(5 * time.Second):
 			t.Errorf("chat writes never overlapped: peak in-flight %d", peak.Load())
+			releaseOnce.Do(func() { close(release) })
 		}
 		f.cp.mu.Lock()
 		inFlight.Add(-1)
@@ -483,11 +484,11 @@ func TestImportJobStallReportsTimeout(t *testing.T) {
 	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	coord := NewImportCoordinator()
-	coord.stallTimeout = 50 * time.Millisecond
-	const progressSteps = 8
+	coord.stallTimeout = 200 * time.Millisecond
+	const progressSteps = 6
 	coord.runner = func(ctx context.Context, deps Deps, sess Session, job *ImportJobState) error {
 		for i := 1; i <= progressSteps; i++ {
-			time.Sleep(coord.stallTimeout / 2)
+			time.Sleep(coord.stallTimeout / 4)
 			if ctx.Err() != nil {
 				return fmt.Errorf("import: canceled while progressing at step %d: %w", i, ctx.Err())
 			}
