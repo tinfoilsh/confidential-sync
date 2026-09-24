@@ -21,7 +21,8 @@ import (
 type ImportFailureReason string
 
 const (
-	// ImportFailureTimeout means the job exceeded ImportJobBudget.
+	// ImportFailureTimeout means the job made no progress for
+	// ImportStallTimeout and was canceled.
 	ImportFailureTimeout ImportFailureReason = "timeout"
 	// ImportFailureInvalidArchive means the upload could not be read as
 	// a supported export (hash mismatch, unsafe ZIP, missing files, or
@@ -105,7 +106,7 @@ func classifyArchiveReadErr(err error) error {
 // Specific source tags and typed service errors take precedence over
 // generic fallback tags.
 func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(context.Cause(ctx), errImportStalled) {
 		return ImportFailureTimeout
 	}
 	var networkErr net.Error

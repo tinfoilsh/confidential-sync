@@ -316,7 +316,7 @@ func searchChatSnapshotState(ctx context.Context, deps Deps, sess Session, chatI
 	return searchSnapshotCurrent, nil
 }
 
-type searchWriteHook func(ctx context.Context, ix *searchindex.Index, state searchLoadState) (cont bool, mutated bool, err error)
+type searchWriteHook func(ctx context.Context, ix *searchindex.Index, state searchLoadState, publication *controlplane.SearchIndexState) (cont bool, mutated bool, err error)
 
 // saveSearchIndex gzips the index JSON before handing it to the
 // sidecar: token text compresses well, and compression must happen
@@ -583,13 +583,23 @@ var errSearchIndexPanic = errors.New("search index update panicked")
 // already committed, so nothing here may fail the push: an error only
 // degrades search until the next reindex, and a panic is contained the
 // same way rather than unwinding into the request or import worker.
+//
+// The hook decides whether the etag from the push is still the live
+// one. The push response carries the user's source revision at commit
+// time, and the publication state read under the search lock carries
+// the current one; while they match no later chat write exists, so the
+// blob cannot have been overwritten or deleted and no probe is needed.
+// Only a revision gap costs a metadata read of the blob.
 func indexCurrentChatForSearch(ctx context.Context, deps Deps, sess Session, cek []byte, chatID string, plaintext []byte, etag string, committedAt time.Time, sourceRevision int64) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = errSearchIndexPanic
 		}
 	}()
-	hook := func(ctx context.Context, ix *searchindex.Index, state searchLoadState) (bool, bool, error) {
+	hook := func(ctx context.Context, ix *searchindex.Index, state searchLoadState, publication *controlplane.SearchIndexState) (bool, bool, error) {
+		if sourceRevision > 0 && publication.SourceRevision == sourceRevision {
+			return true, false, nil
+		}
 		snapshotState, err := searchChatSnapshotState(ctx, deps, sess, chatID, etag)
 		if err != nil {
 			return false, false, err
@@ -660,7 +670,7 @@ func indexChatForSearchWithHook(ctx context.Context, deps Deps, sess Session, ce
 			state = searchLoadUnreadable
 		}
 		if hook != nil {
-			cont, mutated, err := hook(ctx, ix, state)
+			cont, mutated, err := hook(ctx, ix, state, publication)
 			if err != nil {
 				return err
 			}
