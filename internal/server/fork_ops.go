@@ -15,7 +15,6 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
 	cryptopkg "github.com/tinfoilsh/confidential-sync-enclave/internal/crypto"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
-	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
 const (
@@ -178,8 +177,8 @@ func readForkSource(ctx context.Context, deps Deps, sess Session, sourceID strin
 }
 
 // buildForkPayload assembles the fork's chat JSON from the source. Every
-// image attachment with a server key is re-uploaded under the target
-// chat id so the fork gets its own (id, key) pair; unknown fields on the
+// attachment with a server key is re-uploaded under the target chat id
+// so the fork gets its own (id, key) pair; unknown fields on the
 // chat, messages, and attachments are carried through untouched. The
 // returned attachment ids are the fork's freshly created blobs, which
 // the caller must clean up if the fork does not commit.
@@ -196,8 +195,12 @@ func buildForkPayload(ctx context.Context, deps Deps, sess Session, req ForkRequ
 		attachments := make([]map[string]json.RawMessage, 0, len(message.Attachments))
 		for _, attachment := range message.Attachments {
 			stored := cloneRawMap(attachment.Raw)
+			// Any attachment with a server key owns a buckets blob:
+			// image bytes, or a document whose text/pages were
+			// offloaded by the client. Both must be copied so the
+			// fork survives deletion of the source chat.
 			sourceKey := attachmentServerKey(attachment.Raw)
-			if attachment.Type != importer.AttachmentImage || attachment.ID == "" || sourceKey == "" {
+			if attachment.ID == "" || sourceKey == "" {
 				attachments = append(attachments, stored)
 				continue
 			}
