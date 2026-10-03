@@ -753,3 +753,23 @@ func TestEncryptRejectsBadInputs(t *testing.T) {
 		t.Fatalf("expected kid error")
 	}
 }
+
+func TestEncryptRejectsOversizePlaintextWithDistinctSentinel(t *testing.T) {
+	k := newKey(t)
+	aad := AAD{
+		KeyIDHex:    k.KeyIDHex,
+		Scope:       ScopeChat,
+		ID:          "chat_1",
+		ClerkUserID: "user_a",
+	}
+	_, err := Encrypt(k.Bytes, make([]byte, MaxPlaintextBytes+1), aad)
+	if !errors.Is(err, ErrPlaintextTooLarge) {
+		t.Fatalf("expected ErrPlaintextTooLarge, got %v", err)
+	}
+	if !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("ErrPlaintextTooLarge must still satisfy ErrInvalidEnvelope, got %v", err)
+	}
+	if _, err := Encrypt(k.Bytes, make([]byte, MaxPlaintextBytes), aad); err != nil {
+		t.Fatalf("plaintext at the cap must be accepted: %v", err)
+	}
+}

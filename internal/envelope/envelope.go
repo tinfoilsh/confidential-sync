@@ -45,10 +45,13 @@ type legacyV0 struct {
 }
 
 const (
-	// Upper bound on decompressed plaintext. Applies to v1 legacy blobs
-	// (the original cap) and v2 envelopes now that v2 carries gzipped
-	// plaintext as well.
-	maxDecompressedBytes = 32 * 1024 * 1024
+	// MaxPlaintextBytes is the upper bound on decompressed plaintext.
+	// Applies to v1 legacy blobs (the original cap) and v2 envelopes
+	// now that v2 carries gzipped plaintext as well. Exported so the
+	// HTTP layer can report the limit alongside a rejection.
+	MaxPlaintextBytes = 32 * 1024 * 1024
+
+	maxDecompressedBytes = MaxPlaintextBytes
 )
 
 var (
@@ -60,6 +63,11 @@ var (
 	ErrLegacyDecrypt   = errors.New("envelope: no provided key decrypted legacy blob")
 	ErrUnsupportedAlg  = errors.New("envelope: unsupported algorithm")
 	ErrInvalidEnvelope = errors.New("envelope: invalid envelope")
+	// ErrPlaintextTooLarge wraps ErrInvalidEnvelope so existing
+	// errors.Is(err, ErrInvalidEnvelope) checks keep matching while
+	// callers that care can distinguish an oversize input from a
+	// malformed one and surface a client-actionable status.
+	ErrPlaintextTooLarge = fmt.Errorf("%w: plaintext exceeds %d bytes", ErrInvalidEnvelope, MaxPlaintextBytes)
 )
 
 // Detect classifies a ciphertext blob by attempting strict parses
@@ -189,7 +197,7 @@ func Encrypt(key []byte, plaintext []byte, aad AAD) ([]byte, error) {
 	// fail every subsequent decrypt — turning oversized inputs into
 	// silent data loss instead of an immediate, actionable error.
 	if len(plaintext) > maxDecompressedBytes {
-		return nil, ErrInvalidEnvelope
+		return nil, ErrPlaintextTooLarge
 	}
 	compressed, err := gzipBytes(plaintext)
 	if err != nil {

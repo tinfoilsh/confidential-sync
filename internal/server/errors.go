@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 )
 
 // Application error codes returned in JSON envelopes. These match the
@@ -29,6 +31,7 @@ const (
 	CodeNetwork                    = "NETWORK"
 	CodeUpstream                   = "UPSTREAM"
 	CodeRateLimited                = "RATE_LIMITED"
+	CodePayloadTooLarge            = "PAYLOAD_TOO_LARGE"
 	CodeInternal                   = "INTERNAL"
 )
 
@@ -109,6 +112,17 @@ func translate(err error) *AppError {
 		}
 		return a
 	}
+	// Oversize inputs are a deterministic client error, not an
+	// enclave fault. A 5xx here makes clients retry forever (and
+	// re-upload any attachments that preceded the push each time);
+	// a 413 with a stable code lets them stop and tell the user.
+	if errors.Is(err, envelope.ErrPlaintextTooLarge) {
+		return payloadTooLarge(fmt.Sprintf("plaintext exceeds %d bytes", envelope.MaxPlaintextBytes))
+	}
+	var maxBytes *http.MaxBytesError
+	if errors.As(err, &maxBytes) {
+		return payloadTooLarge(fmt.Sprintf("request body exceeds %d bytes", maxBytes.Limit))
+	}
 	var outcomeUnknown *controlplane.PutBlobOutcomeUnknownError
 	if errors.As(err, &outcomeUnknown) {
 		return &AppError{
@@ -156,6 +170,10 @@ func normalizeCode(code string, status int) string {
 
 func badRequest(message string) *AppError {
 	return &AppError{Status: http.StatusBadRequest, Code: CodeBadRequest, Message: message}
+}
+
+func payloadTooLarge(message string) *AppError {
+	return &AppError{Status: http.StatusRequestEntityTooLarge, Code: CodePayloadTooLarge, Message: message}
 }
 
 func unauthorized(message string) *AppError {
