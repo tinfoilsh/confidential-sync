@@ -109,4 +109,8 @@ func TestAttachmentGCRejectsMissingChatAndBadKey(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown chat: %d", resp.StatusCode)
 	}
+	resp, _ = f.post("/v1/attachment/gc", AttachmentGCRequest{ChatID: "nope", Key: "not-base64!"}, tok)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed key: %d", resp.StatusCode)
+	}
 }
