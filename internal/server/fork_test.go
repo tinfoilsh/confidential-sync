@@ -464,6 +464,12 @@ func TestForkCopiesOffloadedDocumentBlobs(t *testing.T) {
 	if !bytes.Equal(item.Value, docPayload) {
 		t.Fatalf("fork document bytes = %q, want %q", item.Value, docPayload)
 	}
+	if len(item.EncryptionKeys) != 1 || !bytes.Equal(item.EncryptionKeys[0], newKey) {
+		t.Fatalf("fork document blob sealed under wrong key")
+	}
+	if !f.bk.items.Has(docID) {
+		t.Fatalf("source document blob was removed by the fork")
+	}
 	f.cp.mu.Lock()
 	defer f.cp.mu.Unlock()
 	if f.cp.attachmentIndex[newID] != "chat_doc_fork" {
