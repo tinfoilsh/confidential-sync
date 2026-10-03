@@ -143,6 +143,8 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("POST /api/sync/keys/{kid}/bundles", s.addBundle)
 	mux.HandleFunc("DELETE /api/sync/keys/{kid}/bundles/{cid}", s.removeBundle)
 	mux.HandleFunc("GET /api/storage/attachment/{aid}", s.getLegacyAttachment)
+	mux.HandleFunc("GET /api/sync/attachment-index", s.listAttachmentIndex)
+	mux.HandleFunc("DELETE /api/sync/attachment-index", s.deleteAttachmentIndexBatch)
 	mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.registerAttachmentIndex)
 	mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.deleteAttachmentIndex)
 	mux.HandleFunc("GET /api/sync/attachment-owner/{aid}", s.attachmentOwner)
@@ -1066,6 +1068,55 @@ func (s *StubCP) registerAttachmentIndex(w http.ResponseWriter, r *http.Request)
 	delete(s.legacyAttachments, aid)
 	delete(s.pendingAttachments, aid)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// listAttachmentIndex mirrors GET /api/sync/attachment-index?chat_id=
+// scoped to the authenticated user.
+func (s *StubCP) listAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	chatID := r.URL.Query().Get("chat_id")
+	if chatID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	user := stubClerkUserIDFromAuth(r.Header.Get("Authorization"))
+	ids := []string{}
+	for aid, meta := range s.attachmentIndex {
+		if meta.chatID == chatID && meta.clerkUserID == user {
+			ids = append(ids, aid)
+		}
+	}
+	sort.Strings(ids)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ids": ids})
+}
+
+// deleteAttachmentIndexBatch mirrors DELETE /api/sync/attachment-index
+// with {chat_id, ids}; rows under another chat or user are skipped.
+func (s *StubCP) deleteAttachmentIndexBatch(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var body struct {
+		ChatID string   `json:"chat_id"`
+		IDs    []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ChatID == "" || len(body.IDs) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	user := stubClerkUserIDFromAuth(r.Header.Get("Authorization"))
+	deleted := []string{}
+	for _, aid := range body.IDs {
+		meta, ok := s.attachmentIndex[aid]
+		if !ok || meta.chatID != body.ChatID || meta.clerkUserID != user {
+			continue
+		}
+		delete(s.attachmentIndex, aid)
+		deleted = append(deleted, aid)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"deleted": deleted})
 }
 
 // attachmentOwner answers the enclave's ResolveAttachmentOwner lookup

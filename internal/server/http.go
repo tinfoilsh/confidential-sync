@@ -112,6 +112,9 @@ func (h *Handler) routeSpecs() []routeSpec {
 		{"POST", "/v1/attachment/delete", func(h *Handler) http.Handler {
 			return h.authMiddlewareWithTimeout(h.attachmentDelete, AttachmentRequestTimeout)
 		}},
+		{"POST", "/v1/attachment/gc", func(h *Handler) http.Handler {
+			return h.authMiddlewareWithTimeout(h.attachmentGC, AttachmentRequestTimeout)
+		}},
 		// /v1/attachment/get-public is intentionally unauthenticated.
 		// Knowing the attachment id + per-attachment key is the access
 		// proof — the same trust model the legacy public attachment
@@ -620,6 +623,20 @@ func (h *Handler) attachmentDelete(w http.ResponseWriter, r *http.Request, sess 
 		return
 	}
 	resp, err := AttachmentDelete(r.Context(), h.deps, sess, req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	encode(w, http.StatusOK, resp)
+}
+
+func (h *Handler) attachmentGC(w http.ResponseWriter, r *http.Request, sess Session) {
+	var req AttachmentGCRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	resp, err := AttachmentGC(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return

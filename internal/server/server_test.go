@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -174,6 +175,8 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("GET /api/sync/keys/current", s.handleCurrentKey)
 	// legacy attachment fetch + new attachment ownership index
 	s.mux.HandleFunc("GET /api/storage/attachment/{aid}", s.handleLegacyAttachment)
+	s.mux.HandleFunc("GET /api/sync/attachment-index", s.handleListAttachmentIndex)
+	s.mux.HandleFunc("DELETE /api/sync/attachment-index", s.handleDeleteAttachmentIndexBatch)
 	s.mux.HandleFunc("POST /api/sync/attachment-index/{aid}", s.handleRegisterAttachmentIndex)
 	s.mux.HandleFunc("DELETE /api/sync/attachment-index/{aid}", s.handleDeleteAttachmentIndex)
 	s.mux.HandleFunc("GET /api/sync/attachment-owner/{aid}", s.handleAttachmentOwner)
@@ -764,6 +767,49 @@ func (s *cpStub) handleDeleteAttachmentIndex(w http.ResponseWriter, r *http.Requ
 	}
 	delete(s.attachmentIndex, aid)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListAttachmentIndex mirrors GET /api/sync/attachment-index?chat_id=
+// and returns every indexed attachment id under that chat.
+func (s *cpStub) handleListAttachmentIndex(w http.ResponseWriter, r *http.Request) {
+	chatID := r.URL.Query().Get("chat_id")
+	if chatID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ids := []string{}
+	for aid, cid := range s.attachmentIndex {
+		if cid == chatID {
+			ids = append(ids, aid)
+		}
+	}
+	sort.Strings(ids)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ids": ids})
+}
+
+// handleDeleteAttachmentIndexBatch mirrors DELETE /api/sync/attachment-index
+// with {chat_id, ids}: only ids indexed under that chat are removed and
+// echoed back, the rest are skipped like the real ownership filter.
+func (s *cpStub) handleDeleteAttachmentIndexBatch(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ChatID string   `json:"chat_id"`
+		IDs    []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ChatID == "" || len(body.IDs) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	deleted := []string{}
+	for _, aid := range body.IDs {
+		if s.attachmentIndex[aid] != body.ChatID {
+			continue
+		}
+		delete(s.attachmentIndex, aid)
+		deleted = append(deleted, aid)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"deleted": deleted})
 }
 
 // handleAttachmentOwner mirrors GET /api/sync/attachment-owner/{id}:
