@@ -65,6 +65,9 @@ func TestAttachmentGCRetriesPreserveUnreferencedStorage(t *testing.T) {
 	if !indexed || !f.bk.has(id) {
 		t.Fatal("canceled GC discarded storage")
 	}
+	if bucketDeletes.Load() != 0 {
+		t.Fatal("canceled GC attempted a bucket delete")
+	}
 }
 
 func TestAttachmentGCForwardsDeferredWorkAndCannotBeEnabledByControlplane(t *testing.T) {

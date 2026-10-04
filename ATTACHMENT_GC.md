@@ -9,7 +9,8 @@ For a valid, decryptable chat and successful controlplane read it returns HTTP 4
 
 - `referenced`: distinct attachment IDs carrying a server key in the chat snapshot.
 - `indexed`: IDs returned by controlplane after its 15-minute age filter.
-- `remaining`: returned IDs absent from the chat snapshot, excluding deferred rows.
+- `remaining`: returned IDs absent from the server-keyed `referenced` set above,
+  excluding deferred rows.
 - `deferred`: count of same-owner, same-chat v2 rows still inside the grace interval,
   whether referenced or not. Forwarded from controlplane #863.
 - `retry_after`: conservative age-based diagnostic delay in **seconds**, 900 when
