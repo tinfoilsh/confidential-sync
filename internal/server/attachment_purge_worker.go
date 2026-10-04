@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -47,7 +48,10 @@ func StartAttachmentPurgeWorker(ctx context.Context, deps Deps) {
 }
 
 func runAttachmentPurgeSweep(ctx context.Context, deps Deps) {
-	_, _ = sweepAttachmentPurges(ctx, deps)
+	deleted, err := sweepAttachmentPurges(ctx, deps)
+	if err != nil && ctx.Err() == nil {
+		log.Printf("attachment purge sweep: deleted=%d err=%v", deleted, err)
+	}
 }
 
 func sweepAttachmentPurges(ctx context.Context, deps Deps) (int, error) {
@@ -76,15 +80,16 @@ func sweepAttachmentPurges(ctx context.Context, deps Deps) (int, error) {
 		leaseDeadline := time.Now().Add(attachmentPurgeLeaseBudget)
 		ackIDs := make([]string, 0, len(claim.Purges))
 		for _, purge := range claim.Purges {
-			// Never ack past the lease: a reclaim by another enclave
-			// after expiry hands out a fresh token and our ack would be
-			// rejected anyway, but stopping here avoids a bucket delete
-			// racing a re-upload that the controlplane has, by then,
-			// allowed because it saw our claim expire.
-			if time.Now().After(leaseDeadline) {
+			// Every delete is bounded by the remaining lease budget, not
+			// just started inside it: once the controlplane's lease
+			// expires it may hand the id to another claimant or let a
+			// re-registration through, and a delete still in flight
+			// here would race that.
+			remaining := time.Until(leaseDeadline)
+			if remaining <= 0 {
 				break
 			}
-			deleteCtx, cancelDelete := context.WithTimeout(ctx, AttachmentRequestTimeout)
+			deleteCtx, cancelDelete := context.WithTimeout(ctx, remaining)
 			err := deps.Buckets.Delete(deleteCtx, purge.ClerkUserID, purge.AttachmentID)
 			cancelDelete()
 			if err != nil {
@@ -110,6 +115,7 @@ func sweepAttachmentPurges(ctx context.Context, deps Deps) (int, error) {
 }
 
 // attachmentPurgeLeaseBudget is how long after a claim the worker keeps
-// deleting. It stays well inside the controlplane's lease so a slow
-// batch cannot outlive the claim that authorizes it.
+// deleting, and the hard bound on every delete it starts. It stays
+// well inside the controlplane's 5-minute lease so no delete can
+// outlive the claim that authorizes it.
 const attachmentPurgeLeaseBudget = 3 * time.Minute

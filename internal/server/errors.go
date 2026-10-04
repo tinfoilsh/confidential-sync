@@ -155,6 +155,8 @@ func translate(err error) *AppError {
 			CurrentRevision:          cpe.CurrentRevision,
 			OldestReplayableRevision: cpe.OldestReplayableRevision,
 			MinimumProtocol:          cpe.MinimumProtocol,
+			MissingAttachments:       cpe.MissingAttachments,
+			RetryAfterSeconds:        cpe.RetryAfterSeconds,
 		}
 	}
 	return &AppError{

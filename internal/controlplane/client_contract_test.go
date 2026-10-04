@@ -33,6 +33,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"HeaderMessageCount":        {HeaderMessageCount, "X-Message-Count"},
 			"HeaderProjectID":           {HeaderProjectID, "X-Project-Id"},
 			"HeaderProjectIDSet":        {HeaderProjectIDSet, "X-Project-Id-Set"},
+			"HeaderAttachmentRefs":      {HeaderAttachmentRefs, "X-Attachment-Refs"},
 			"HeaderETag":                {HeaderETag, "ETag"},
 			"HeaderRequestID":           {HeaderRequestID, "X-Request-ID"},
 			"HeaderSearchIndexFenced":   {HeaderSearchIndexFenced, "X-Search-Index-Fenced"},
@@ -73,6 +74,8 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"StatusSearchIndexConflict":        {StatusSearchIndexConflict, "SEARCH_INDEX_CONFLICT"},
 			"StatusProfileSyncUpgradeRequired": {StatusProfileSyncUpgradeRequired, "PROFILE_SYNC_UPGRADE_REQUIRED"},
 			"StatusSyncSnapshotRequired":       {StatusSyncSnapshotRequired, "SYNC_SNAPSHOT_REQUIRED"},
+			"StatusMissingAttachment":          {StatusMissingAttachment, "MISSING_ATTACHMENT"},
+			"StatusAttachmentPurgeInProgress":  {StatusAttachmentPurgeInProgress, "ATTACHMENT_PURGE_IN_PROGRESS"},
 		}
 		for name, c := range cases {
 			if c.have != c.want {
