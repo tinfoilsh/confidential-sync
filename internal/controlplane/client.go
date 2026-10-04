@@ -75,6 +75,7 @@ const (
 	HeaderMessageCount        = "X-Message-Count"
 	HeaderProjectID           = "X-Project-Id"
 	HeaderProjectIDSet        = "X-Project-Id-Set"
+	HeaderAttachmentRefs      = "X-Attachment-Refs"
 	HeaderETag                = "ETag"
 	HeaderRequestID           = "X-Request-ID"
 	HeaderSearchIndexFenced   = "X-Search-Index-Fenced"
@@ -99,6 +100,8 @@ const (
 	StatusPreconditionRequired       = "PRECONDITION_REQUIRED"
 	StatusStaleKey                   = "STALE_KEY"
 	StatusStaleBlob                  = "STALE_BLOB"
+	StatusMissingAttachment          = "MISSING_ATTACHMENT"
+	StatusAttachmentPurgeInProgress  = "ATTACHMENT_PURGE_IN_PROGRESS"
 	StatusExistingDataUnderOtherKey  = "EXISTING_DATA_UNDER_OTHER_KEY"
 	StatusIdempotencyConflict        = "IDEMPOTENCY_CONFLICT"
 	StatusSearchIndexConflict        = "SEARCH_INDEX_CONFLICT"
@@ -135,8 +138,12 @@ type Error struct {
 	// MinimumProtocol accompanies upgrade-required errors (e.g.
 	// PROFILE_SYNC_UPGRADE_REQUIRED) and names the lowest protocol
 	// version the controlplane still accepts.
-	MinimumProtocol int             `json:"minimum_protocol,omitempty"`
-	Raw             json.RawMessage `json:"-"`
+	MinimumProtocol int `json:"minimum_protocol,omitempty"`
+	// MissingAttachments accompanies MISSING_ATTACHMENT: the ids the
+	// pushed chat referenced that the controlplane does not hold.
+	MissingAttachments []string        `json:"missing_attachments,omitempty"`
+	RetryAfterSeconds  int64           `json:"retry_after_seconds,omitempty"`
+	Raw                json.RawMessage `json:"-"`
 }
 
 func (e *Error) Error() string {
@@ -246,6 +253,12 @@ type PutBlobRequest struct {
 	// the column. Only meaningful for chat scope.
 	ProjectIDSet bool
 	ProjectID    *string
+	// AttachmentRefs lists the buckets-backed attachment ids the chat
+	// plaintext references. Sent as X-Attachment-Refs on every chat
+	// push (empty list included) so the controlplane can track which
+	// index rows are live and purge the rest. Nil means "do not send
+	// the header", which is only correct for non-chat scopes.
+	AttachmentRefs []string
 }
 
 type PutBlobResponse struct {
@@ -430,6 +443,9 @@ func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobR
 		if req.ProjectID != nil {
 			httpReq.Header.Set(HeaderProjectID, *req.ProjectID)
 		}
+	}
+	if req.AttachmentRefs != nil {
+		httpReq.Header.Set(HeaderAttachmentRefs, strings.Join(req.AttachmentRefs, ","))
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
@@ -1619,6 +1635,82 @@ func (c *Client) AckSearchIndexDeletions(ctx context.Context, claimToken string,
 		return fmt.Errorf("controlplane: read search index deletion ack: %w", readErr)
 	}
 	return nil
+}
+
+type AttachmentPurge struct {
+	AttachmentID string `json:"attachment_id"`
+	ClerkUserID  string `json:"clerk_user_id"`
+	ChatID       string `json:"chat_id"`
+}
+
+type AttachmentPurgeClaim struct {
+	ClaimToken string            `json:"claim_token"`
+	Purges     []AttachmentPurge `json:"purges"`
+}
+
+// postJSON is the shared shape of the small control-channel calls the
+// background workers make: JSON in, JSON (or nothing) out, controlplane
+// error envelope on 4xx/5xx.
+func (c *Client) postJSON(ctx context.Context, path string, in any, out any) error {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return parseError(resp.StatusCode, raw)
+	}
+	if readErr != nil {
+		return fmt.Errorf("controlplane: read %s: %w", path, readErr)
+	}
+	if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("controlplane: decode %s: %w", path, err)
+	}
+	return nil
+}
+
+// PurgeUnreferencedAttachments asks the controlplane to move index rows
+// that have been unreferenced past its grace window into the purge
+// queue. Returns how many were queued this call.
+func (c *Client) PurgeUnreferencedAttachments(ctx context.Context, batchSize int) (int, error) {
+	var out struct {
+		Queued int `json:"queued"`
+	}
+	err := c.postJSON(ctx, "/api/sync/attachment-purges/purge", struct {
+		BatchSize int `json:"batch_size"`
+	}{BatchSize: batchSize}, &out)
+	return out.Queued, err
+}
+
+func (c *Client) ClaimAttachmentPurges(ctx context.Context, batchSize int) (*AttachmentPurgeClaim, error) {
+	var out AttachmentPurgeClaim
+	err := c.postJSON(ctx, "/api/sync/attachment-purges/claim", struct {
+		BatchSize int `json:"batch_size"`
+	}{BatchSize: batchSize}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) AckAttachmentPurges(ctx context.Context, claimToken string, attachmentIDs []string) error {
+	return c.postJSON(ctx, "/api/sync/attachment-purges/ack", struct {
+		ClaimToken    string   `json:"claim_token"`
+		AttachmentIDs []string `json:"attachment_ids"`
+	}{ClaimToken: claimToken, AttachmentIDs: attachmentIDs}, nil)
 }
 
 func (c *Client) DeleteOrphanedV2Attachments(ctx context.Context, limit int) ([]OrphanAttachmentRow, error) {
