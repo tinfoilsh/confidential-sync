@@ -641,7 +641,7 @@ func (h *Handler) attachmentGC(w http.ResponseWriter, r *http.Request, sess Sess
 		writeError(w, err)
 		return
 	}
-	encode(w, http.StatusOK, resp)
+	encode(w, http.StatusConflict, resp)
 }
 
 func (h *Handler) importCreate(w http.ResponseWriter, r *http.Request, sess Session) {

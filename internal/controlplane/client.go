@@ -1430,11 +1430,16 @@ func (c *Client) DeleteAttachmentIndex(ctx context.Context, jwt, clerkUserID, at
 	return nil
 }
 
-// ListAttachmentIndex returns every v2 attachment id the controlplane
-// has registered under chatID for the authenticated user. The enclave
-// diffs this against the ids the decrypted chat still references to
-// find blobs nothing points at.
-func (c *Client) ListAttachmentIndex(ctx context.Context, jwt, clerkUserID, chatID string) ([]string, error) {
+type AttachmentIndex struct {
+	IDs        []string `json:"ids"`
+	Deferred   int64    `json:"deferred"`
+	RetryAfter int64    `json:"retry_after"`
+	Disabled   bool     `json:"disabled"`
+}
+
+// ListAttachmentIndex returns an age-filtered diagnostic snapshot, not
+// authorization to delete. Deferred counts rows omitted by the grace interval.
+func (c *Client) ListAttachmentIndex(ctx context.Context, jwt, clerkUserID, chatID string) (*AttachmentIndex, error) {
 	if chatID == "" {
 		return nil, fmt.Errorf("controlplane: chat id is required")
 	}
@@ -1453,54 +1458,11 @@ func (c *Client) ListAttachmentIndex(ctx context.Context, jwt, clerkUserID, chat
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, parseError(resp.StatusCode, raw)
 	}
-	var out struct {
-		IDs []string `json:"ids"`
-	}
+	var out AttachmentIndex
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("controlplane: decode attachment index: %w", err)
 	}
-	return out.IDs, nil
-}
-
-// DeleteAttachmentIndexBatch removes the given v2 index rows under
-// chatID and returns the ids the controlplane actually deleted. Rows
-// the caller does not own, or that belong to another chat, are
-// skipped server-side; only the returned ids may be wiped from
-// buckets.
-func (c *Client) DeleteAttachmentIndexBatch(ctx context.Context, jwt, clerkUserID, chatID string, ids []string) ([]string, error) {
-	if chatID == "" {
-		return nil, fmt.Errorf("controlplane: chat id is required")
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	body, err := json.Marshal(map[string]any{"chat_id": chatID, "ids": ids})
-	if err != nil {
-		return nil, err
-	}
-	endpoint := c.baseURL + "/api/sync/attachment-index"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	c.addAuth(httpReq, jwt, clerkUserID)
-	resp, err := c.doRequest(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, parseError(resp.StatusCode, raw)
-	}
-	var out struct {
-		Deleted []string `json:"deleted"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("controlplane: decode attachment index delete: %w", err)
-	}
-	return out.Deleted, nil
+	return &out, nil
 }
 
 // ReservePendingAttachmentWrite asks controlplane to stamp a guard

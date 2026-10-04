@@ -9,12 +9,9 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
 )
 
-// TestAttachmentGCRemovesOnlyUnreferencedBlobs seeds a chat whose
-// stored content references one image, then registers three further
-// index rows under the same chat (the shape a client re-uploading the
-// same bytes on every failed sync cycle leaves behind), one row under
-// a different chat, and runs a GC pass.
-func TestAttachmentGCRemovesOnlyUnreferencedBlobs(t *testing.T) {
+// The legacy controlplane stub permits deletes, so this also checks
+// that the enclave's safety gate is independent of controlplane rollout.
+func TestAttachmentGCReportsCandidatesWithoutDeleting(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 	tok := f.jwt()
@@ -41,14 +38,14 @@ func TestAttachmentGCRemovesOnlyUnreferencedBlobs(t *testing.T) {
 	f.cp.mu.Unlock()
 
 	resp, body := f.post("/v1/attachment/gc", AttachmentGCRequest{ChatID: chatID, Key: f.userKeyB64}, tok)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("gc: %d %s", resp.StatusCode, body)
 	}
 	var out AttachmentGCResponse
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Referenced != 1 || out.Indexed != 4 || out.Deleted != 3 || out.Remaining != 0 {
+	if out.OK || !out.Disabled || out.Code != CodeAttachmentGCDisabled || out.Referenced != 1 || out.Indexed != 4 || out.Deleted != 0 || out.Remaining != 3 {
 		t.Fatalf("unexpected gc summary: %+v", out)
 	}
 
@@ -61,11 +58,11 @@ func TestAttachmentGCRemovesOnlyUnreferencedBlobs(t *testing.T) {
 		t.Fatalf("referenced attachment blob was removed")
 	}
 	for _, id := range orphans {
-		if _, ok := f.cp.attachmentIndex[id]; ok {
-			t.Fatalf("orphan %s still indexed", id)
+		if _, ok := f.cp.attachmentIndex[id]; !ok {
+			t.Fatalf("candidate %s lost its index row", id)
 		}
-		if f.bk.items.Has(id) {
-			t.Fatalf("orphan %s still in buckets", id)
+		if !f.bk.items.Has(id) {
+			t.Fatalf("candidate %s lost its bucket object", id)
 		}
 	}
 	if _, ok := f.cp.attachmentIndex[otherChatAttachment]; !ok {
@@ -84,14 +81,14 @@ func TestAttachmentGCIsNoOpWhenIndexMatchesChat(t *testing.T) {
 	seedForkSource(t, f, tok, chatID)
 
 	resp, body := f.post("/v1/attachment/gc", AttachmentGCRequest{ChatID: chatID, Key: f.userKeyB64}, tok)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("gc: %d %s", resp.StatusCode, body)
 	}
 	var out AttachmentGCResponse
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.Referenced != 1 || out.Indexed != 1 || out.Deleted != 0 || out.Remaining != 0 {
+	if out.OK || !out.Disabled || out.Code != CodeAttachmentGCDisabled || out.Referenced != 1 || out.Indexed != 1 || out.Deleted != 0 || out.Remaining != 0 {
 		t.Fatalf("unexpected gc summary: %+v", out)
 	}
 }

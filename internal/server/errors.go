@@ -13,6 +13,7 @@ import (
 // codes so the client sees a consistent vocabulary regardless of which
 // service rejected the request.
 const (
+	CodeAttachmentGCDisabled       = "ATTACHMENT_GC_DISABLED"
 	CodeStaleKey                   = controlplane.StatusStaleKey
 	CodeStaleBlob                  = controlplane.StatusStaleBlob
 	CodeSyncConflict               = "SYNC_CONFLICT"
