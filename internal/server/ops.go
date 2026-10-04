@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -134,6 +135,15 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// it controls whether an overwrite is accepted, so it is bound
 	// into the operation hash above.
 	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
+	// Chat pushes report which buckets-backed attachments the plaintext
+	// still references so the controlplane can mark the rest for
+	// purging. The ids come from the plaintext, but the controlplane
+	// only ever uses them to decide what to KEEP under this chat and
+	// user; a crafted id cannot make it delete anyone else's blob.
+	var attachmentRefs []string
+	if scope == envelope.ScopeChat {
+		attachmentRefs = chatAttachmentRefs(plaintext)
+	}
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:               req.Scope,
 		ID:                  req.ID,
@@ -149,6 +159,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		MessageCount:        messageCountFromMetadata(req.Scope, req.Metadata),
 		ProjectIDSet:        projectIDSet,
 		ProjectID:           projectID,
+		AttachmentRefs:      attachmentRefs,
 	})
 	if err == nil {
 		committedAt := time.Now()
@@ -180,7 +191,49 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 			CurrentETag: currentETag,
 		}
 	}
+	if controlplane.IsCode(err, controlplane.StatusMissingAttachment) {
+		var cpe *controlplane.Error
+		var missing []string
+		if errors.As(err, &cpe) {
+			missing = cpe.MissingAttachments
+		}
+		return nil, &AppError{
+			Status:             http.StatusConflict,
+			Code:               CodeMissingAttachment,
+			Message:            "chat references attachments the server no longer holds",
+			MissingAttachments: missing,
+		}
+	}
 	return nil, err
+}
+
+// chatAttachmentRefs returns the distinct buckets-backed attachment ids
+// a chat plaintext references: every attachment carrying a server key.
+// Attachments without a key have never been uploaded and so have no
+// index row to keep alive. Plaintext that does not parse as a chat
+// document references nothing; the enclave stays agnostic to payload
+// shape and the controlplane simply treats every blob under that chat
+// as unreferenced.
+func chatAttachmentRefs(plaintext []byte) []string {
+	refs := []string{}
+	var chat nativeChatPayload
+	if err := json.Unmarshal(plaintext, &chat); err != nil {
+		return refs
+	}
+	seen := make(map[string]struct{})
+	for _, message := range chat.Messages {
+		for _, attachment := range message.Attachments {
+			if attachment.ID == "" || attachmentServerKey(attachment.Raw) == "" {
+				continue
+			}
+			if _, dup := seen[attachment.ID]; dup {
+				continue
+			}
+			seen[attachment.ID] = struct{}{}
+			refs = append(refs, attachment.ID)
+		}
+	}
+	return refs
 }
 
 // operationHashForBlob derives X-Operation-Hash for a blob mutation

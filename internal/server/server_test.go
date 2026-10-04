@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,6 +91,12 @@ type cpStub struct {
 	getBlobFailures               map[string][]int // transient statuses to return before answering normally
 	deleteAttachmentIndexFailures map[string]int
 	captureHeaders                func(r *http.Request)
+	// purgeQueue simulates the controlplane's attachment purge queue:
+	// tests seed it; the stub's claim/ack handlers lease and drain it.
+	purgeQueue     map[string]controlplane.AttachmentPurge
+	purgeClaims    map[string]string // attachmentID → claim token
+	purgeRequests  int
+	bucketsDeletes map[string]int
 }
 
 type cpNeedsMigration struct {
@@ -165,6 +172,9 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("GET "+controlplane.RevisionSnapshotPath, s.handleRevisionSnapshot)
 	s.mux.HandleFunc("GET /api/sync/search-index", s.handleGetSearchIndex)
 	s.mux.HandleFunc("PUT /api/sync/search-index", s.handlePublishSearchIndex)
+	s.mux.HandleFunc("POST /api/sync/attachment-purges/purge", s.handlePurgeUnreferenced)
+	s.mux.HandleFunc("POST /api/sync/attachment-purges/claim", s.handleClaimPurges)
+	s.mux.HandleFunc("POST /api/sync/attachment-purges/ack", s.handleAckPurges)
 	s.mux.HandleFunc("GET /api/sync/needs-migration", s.handleNeedsMigration)
 	s.mux.HandleFunc("POST /api/sync/migration-failure", s.handleMigrationFailure)
 	// key registry
@@ -763,6 +773,61 @@ func (s *cpStub) handleDeleteAttachmentIndex(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	delete(s.attachmentIndex, aid)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// The purge handlers run under s.mu like every other stub handler (the
+// server wrapper takes the lock before dispatching to the mux).
+func (s *cpStub) handlePurgeUnreferenced(w http.ResponseWriter, r *http.Request) {
+	s.purgeRequests++
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"queued": 0})
+}
+
+func (s *cpStub) handleClaimPurges(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BatchSize int `json:"batch_size"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if s.purgeClaims == nil {
+		s.purgeClaims = map[string]string{}
+	}
+	token := fmt.Sprintf("claim-%d", len(s.purgeClaims)+1)
+	ids := make([]string, 0, len(s.purgeQueue))
+	for id := range s.purgeQueue {
+		if _, claimed := s.purgeClaims[id]; !claimed {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if req.BatchSize > 0 && len(ids) > req.BatchSize {
+		ids = ids[:req.BatchSize]
+	}
+	purges := make([]controlplane.AttachmentPurge, 0, len(ids))
+	for _, id := range ids {
+		s.purgeClaims[id] = token
+		purges = append(purges, s.purgeQueue[id])
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(controlplane.AttachmentPurgeClaim{ClaimToken: token, Purges: purges})
+}
+
+func (s *cpStub) handleAckPurges(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ClaimToken    string   `json:"claim_token"`
+		AttachmentIDs []string `json:"attachment_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ClaimToken == "" || len(req.AttachmentIDs) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	for _, id := range req.AttachmentIDs {
+		if s.purgeClaims[id] != req.ClaimToken {
+			continue
+		}
+		delete(s.purgeQueue, id)
+		delete(s.purgeClaims, id)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

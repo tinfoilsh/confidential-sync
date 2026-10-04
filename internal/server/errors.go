@@ -32,6 +32,8 @@ const (
 	CodeUpstream                   = "UPSTREAM"
 	CodeRateLimited                = "RATE_LIMITED"
 	CodePayloadTooLarge            = "PAYLOAD_TOO_LARGE"
+	CodeMissingAttachment          = controlplane.StatusMissingAttachment
+	CodeAttachmentPurgeInProgress  = controlplane.StatusAttachmentPurgeInProgress
 	CodeInternal                   = "INTERNAL"
 )
 
@@ -54,6 +56,11 @@ type AppError struct {
 	// MinimumProtocol is forwarded from controlplane upgrade-required
 	// responses that name the lowest accepted protocol version.
 	MinimumProtocol int `json:"minimum_protocol,omitempty"`
+	// MissingAttachments accompanies MISSING_ATTACHMENT: ids the pushed
+	// chat referenced that the controlplane no longer holds. The client
+	// re-uploads those bytes and pushes again.
+	MissingAttachments []string `json:"missing_attachments,omitempty"`
+	RetryAfterSeconds  int64    `json:"retry_after_seconds,omitempty"`
 }
 
 func (a *AppError) Error() string {
@@ -97,6 +104,12 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 	if a.MinimumProtocol > 0 {
 		payload["minimum_protocol"] = a.MinimumProtocol
+	}
+	if len(a.MissingAttachments) > 0 {
+		payload["missing_attachments"] = a.MissingAttachments
+	}
+	if a.RetryAfterSeconds > 0 {
+		payload["retry_after_seconds"] = a.RetryAfterSeconds
 	}
 	_ = json.NewEncoder(w).Encode(payload)
 }
