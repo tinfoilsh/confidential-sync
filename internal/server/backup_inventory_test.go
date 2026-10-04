@@ -21,10 +21,11 @@ func TestBackupInventoryRequiresAuthenticationAndProtocol(t *testing.T) {
 		protocol   string
 		wantStatus int
 	}{
-		{name: "missing bearer", protocol: "2", wantStatus: http.StatusUnauthorized},
-		{name: "invalid bearer", token: "invalid", protocol: "2", wantStatus: http.StatusUnauthorized},
+		{name: "missing bearer", protocol: "3", wantStatus: http.StatusUnauthorized},
+		{name: "invalid bearer", token: "invalid", protocol: "3", wantStatus: http.StatusUnauthorized},
 		{name: "missing protocol", token: f.jwt(), wantStatus: http.StatusUpgradeRequired},
 		{name: "old protocol", token: f.jwt(), protocol: "1", wantStatus: http.StatusUpgradeRequired},
+		{name: "inline document protocol", token: f.jwt(), protocol: "2", wantStatus: http.StatusUpgradeRequired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			response, _ := postRawBackupInventory(t, f, `{}`, tc.token, tc.protocol)
@@ -51,7 +52,7 @@ func TestBackupInventoryAcceptsOnlyEmptyJSONObject(t *testing.T) {
 		`{"plaintext":"secret"}`, `{"ciphertext":"secret"}`, `{"key_id":"secret"}`,
 		`{"user_id":"secret"}`, `{"cek":"secret"}`, `{"attachment_key":"secret"}`,
 	} {
-		response, responseBody := postRawBackupInventory(t, f, body, f.jwt(), "2")
+		response, responseBody := postRawBackupInventory(t, f, body, f.jwt(), "3")
 		if response.StatusCode != http.StatusBadRequest {
 			t.Fatalf("body %q: status=%d response=%s", body, response.StatusCode, responseBody)
 		}
@@ -73,7 +74,7 @@ func TestBackupInventoryUpstreamErrorsAreNoStoreAndSanitized(t *testing.T) {
 	t.Cleanup(upstream.Close)
 	f.handler.deps.Controlplane = controlplane.NewClient(upstream.URL, nil)
 
-	response, body := postRawBackupInventory(t, f, `{}`, f.jwt(), "2")
+	response, body := postRawBackupInventory(t, f, `{}`, f.jwt(), "3")
 	if response.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", response.StatusCode, body)
 	}
@@ -104,7 +105,7 @@ func TestBackupInventorySecurityBoundaryReturnsKeyFreeNoStoreMetadata(t *testing
 			upstreamRequest = r.Clone(r.Context())
 		}
 	}
-	response, body := postRawBackupInventory(t, f, `{ }`, token, "2")
+	response, body := postRawBackupInventory(t, f, `{ }`, token, "3")
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.StatusCode, body)
 	}

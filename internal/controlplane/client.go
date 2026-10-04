@@ -92,7 +92,7 @@ const (
 const (
 	IfMatchCreateOnly     = "0"
 	IfMatchAnyKey         = "*"
-	SyncProtocolV2        = 2
+	SyncProtocolV3        = 3
 	ProfileSyncProtocolV2 = 2
 )
 
