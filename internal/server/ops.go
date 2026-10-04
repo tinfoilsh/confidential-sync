@@ -143,6 +143,9 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	var attachmentRefs []string
 	if scope == envelope.ScopeChat {
 		attachmentRefs = chatAttachmentRefs(plaintext)
+		if len(attachmentRefs) > maxAttachmentRefsPerChat {
+			return nil, badRequest(fmt.Sprintf("chat references more than %d attachments", maxAttachmentRefsPerChat))
+		}
 	}
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
 		Scope:               req.Scope,
@@ -206,6 +209,11 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	}
 	return nil, err
 }
+
+// maxAttachmentRefsPerChat mirrors the controlplane's cap on the
+// X-Attachment-Refs header so an oversized list fails here with a clear
+// message instead of a transport-level rejection downstream.
+const maxAttachmentRefsPerChat = 500
 
 // chatAttachmentRefs returns the distinct buckets-backed attachment ids
 // a chat plaintext references: every attachment carrying a server key.
