@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -298,6 +299,10 @@ func decode(r *http.Request, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
 			return badRequest("empty body")
+		}
+		var maxBytes *http.MaxBytesError
+		if errors.As(err, &maxBytes) {
+			return payloadTooLarge(fmt.Sprintf("request body exceeds %d bytes", maxBytes.Limit))
 		}
 		return badRequest("invalid json: " + err.Error())
 	}
