@@ -386,3 +386,93 @@ func TestForkPayloadIsDeterministicForRetries(t *testing.T) {
 		t.Fatalf("retried fork derived different attachment ids: %v vs %v", firstIDs, secondIDs)
 	}
 }
+
+// A document whose text was offloaded to buckets carries only its
+// server key in the chat. The fork must copy that blob like an image so
+// deleting the source chat cannot take the fork's document with it.
+func TestForkCopiesOffloadedDocumentBlobs(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	tok := f.jwt()
+
+	const docID = "fedcba9876543210fedcba9876543210fedc"
+	docKey := bytes.Repeat([]byte{9}, 32)
+	docPayload := []byte(`{"textContent":"quarterly numbers"}`)
+	tenant, err := buckets.TenantForUser(f.userSub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.bk.items.Put(docID, bucketsItem{Tenant: tenant, Value: docPayload, EncryptionKeys: [][]byte{docKey}})
+	f.cp.mu.Lock()
+	f.cp.attachmentIndex = map[string]string{docID: "chat_doc_source"}
+	f.cp.mu.Unlock()
+
+	chat := map[string]any{
+		"id":        "chat_doc_source",
+		"title":     "Report",
+		"createdAt": "2026-01-01T00:00:00.000Z",
+		"updatedAt": "2026-01-01T00:00:00.000Z",
+		"messages": []any{
+			map[string]any{
+				"role": "user", "content": "Summarize", "timestamp": "2026-01-01T00:00:00.000Z",
+				"attachments": []any{
+					map[string]any{
+						"id": docID, "type": "document", "fileName": "q3.pdf", "mimeType": "application/pdf",
+						"encryptionKey": base64.StdEncoding.EncodeToString(docKey),
+					},
+				},
+			},
+		},
+	}
+	plaintext, _ := json.Marshal(chat)
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope: "chat", ID: "chat_doc_source", Key: f.userKeyB64,
+		Plaintext: base64.StdEncoding.EncodeToString(plaintext), IdempotencyKey: "idem-doc-source",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed push: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = f.post("/v1/sync/fork", ForkRequest{
+		SourceID: "chat_doc_source", TargetID: "chat_doc_fork", Key: f.userKeyB64,
+		MessageCount: 1, Title: "Report (fork)", CreatedAt: "2026-03-04T05:06:07.123Z", IdempotencyKey: "idem-doc-fork",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fork: %d %s", resp.StatusCode, body)
+	}
+
+	fork := pullChatJSON(t, f, tok, "chat_doc_fork")
+	messages, _ := fork["messages"].([]any)
+	attachments, _ := messages[0].(map[string]any)["attachments"].([]any)
+	document := attachments[0].(map[string]any)
+	newID, _ := document["id"].(string)
+	newKeyB64, _ := document["encryptionKey"].(string)
+	if newID == "" || newID == docID {
+		t.Fatalf("document id not rewritten: %v", document["id"])
+	}
+	newKey, err := base64.StdEncoding.DecodeString(newKeyB64)
+	if err != nil || bytes.Equal(newKey, docKey) {
+		t.Fatalf("document key not rewritten: %v %v", newKeyB64, err)
+	}
+	if document["fileName"] != "q3.pdf" || document["type"] != "document" {
+		t.Fatalf("document metadata not carried through: %+v", document)
+	}
+	item, ok := f.bk.item(newID)
+	if !ok {
+		t.Fatalf("fork document blob %s missing from buckets", newID)
+	}
+	if !bytes.Equal(item.Value, docPayload) {
+		t.Fatalf("fork document bytes = %q, want %q", item.Value, docPayload)
+	}
+	if len(item.EncryptionKeys) != 1 || !bytes.Equal(item.EncryptionKeys[0], newKey) {
+		t.Fatalf("fork document blob sealed under wrong key")
+	}
+	if !f.bk.items.Has(docID) {
+		t.Fatalf("source document blob was removed by the fork")
+	}
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	if f.cp.attachmentIndex[newID] != "chat_doc_fork" {
+		t.Fatalf("fork document not indexed under fork chat: %q", f.cp.attachmentIndex[newID])
+	}
+}
