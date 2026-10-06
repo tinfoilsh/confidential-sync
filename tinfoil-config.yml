@@ -8,7 +8,7 @@ networks:
 
 containers:
   - name: "sync-enclave"
-    image: "ghcr.io/tinfoilsh/confidential-sync@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    image: "ghcr.io/tinfoilsh/confidential-sync@sha256:263a228ebcd4f456453ffb1f526594ec75cfcbc2642559cc2f8cd2505c12755a" # v0.1.13
     restart: always
     networks: [web]
     env:
