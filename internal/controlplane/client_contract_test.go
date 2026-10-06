@@ -55,8 +55,8 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 		if IfMatchAnyKey != "*" {
 			t.Errorf("IfMatchAnyKey = %q, want %q", IfMatchAnyKey, "*")
 		}
-		if SyncProtocolV2 != 2 {
-			t.Errorf("SyncProtocolV2 = %d, want 2", SyncProtocolV2)
+		if SyncProtocolV3 != 3 {
+			t.Errorf("SyncProtocolV3 = %d, want 3", SyncProtocolV3)
 		}
 		if ProfileSyncProtocolV2 != 2 {
 			t.Errorf("ProfileSyncProtocolV2 = %d, want 2", ProfileSyncProtocolV2)

@@ -189,7 +189,7 @@ func TestConcurrentPushesAllIndexed(t *testing.T) {
 			})
 			req, _ := http.NewRequest(http.MethodPost, f.server.URL+"/v1/sync/push", bytes.NewReader(body))
 			req.Header.Set("Authorization", "Bearer "+tok)
-			req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+			req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
@@ -406,7 +406,7 @@ func TestSearchQueryRejectsTrailingJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+f.jwt())
-	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

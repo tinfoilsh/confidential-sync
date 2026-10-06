@@ -29,7 +29,7 @@ func rawPost(f *searchFixture, tok, path string, payload any) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

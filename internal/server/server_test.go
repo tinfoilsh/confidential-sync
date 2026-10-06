@@ -1034,7 +1034,7 @@ func (f *fixture) post(path string, body any, token string) (*http.Response, []b
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1137,7 +1137,7 @@ func TestPushPropagatesRequestIDAndReturnsOutcomeUnknown(t *testing.T) {
 				t.Fatal(err)
 			}
 			req.Header.Set("Authorization", "Bearer "+f.jwt())
-			req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+			req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 			req.Header.Set("Content-Type", "application/json")
 			if tc.requestID != "" {
 				req.Header.Set(controlplane.HeaderRequestID, tc.requestID)
@@ -1418,39 +1418,46 @@ func TestAuthenticationPrecedesProtocolEnforcement(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedRoutesRequireSyncProtocolV2(t *testing.T) {
+func TestAuthenticatedRoutesRequireSyncProtocolV3(t *testing.T) {
 	f := newFixture(t)
-	for _, protocols := range [][]string{nil, {"1"}, {"3"}, {"2", "1"}} {
-		req, err := http.NewRequest(http.MethodPost, f.server.URL+"/v1/key/current", strings.NewReader(`{}`))
-		if err != nil {
-			t.Fatal(err)
+	upstreamCalls := 0
+	f.cp.captureHeaders = func(*http.Request) { upstreamCalls++ }
+	for _, path := range []string{"/v1/key/current", "/v1/sync/push", "/v1/sync/pull", "/v1/attachment/put", "/v1/sync/fork", "/v1/import/start"} {
+		for _, protocols := range [][]string{nil, {"1"}, {"2"}, {"4"}, {"3", "2"}, {"3", "3"}} {
+			req, err := http.NewRequest(http.MethodPost, f.server.URL+path, strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(controlplane.HeaderAuth, "Bearer "+f.jwt())
+			for _, protocol := range protocols {
+				req.Header.Add(controlplane.HeaderSyncProtocol, protocol)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if resp.StatusCode != http.StatusUpgradeRequired {
+				t.Fatalf("protocols %q: status=%d body=%s", protocols, resp.StatusCode, body)
+			}
+			var appErr AppError
+			if err := json.Unmarshal(body, &appErr); err != nil {
+				t.Fatal(err)
+			}
+			if appErr.Code != CodeSyncProtocolUpgradeRequired {
+				t.Fatalf("protocols %q: error=%+v", protocols, appErr)
+			}
+			if appErr.MinimumProtocol != controlplane.SyncProtocolV3 {
+				t.Fatalf("protocols %q: minimum_protocol=%d, want %d", protocols, appErr.MinimumProtocol, controlplane.SyncProtocolV3)
+			}
 		}
-		req.Header.Set(controlplane.HeaderAuth, "Bearer "+f.jwt())
-		for _, protocol := range protocols {
-			req.Header.Add(controlplane.HeaderSyncProtocol, protocol)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if resp.StatusCode != http.StatusUpgradeRequired {
-			t.Fatalf("protocols %q: status=%d body=%s", protocols, resp.StatusCode, body)
-		}
-		var appErr AppError
-		if err := json.Unmarshal(body, &appErr); err != nil {
-			t.Fatal(err)
-		}
-		if appErr.Code != CodeSyncProtocolUpgradeRequired {
-			t.Fatalf("protocols %q: error=%+v", protocols, appErr)
-		}
-		if appErr.MinimumProtocol != controlplane.SyncProtocolV2 {
-			t.Fatalf("protocols %q: minimum_protocol=%d, want %d", protocols, appErr.MinimumProtocol, controlplane.SyncProtocolV2)
-		}
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("rejected clients reached controlplane %d times", upstreamCalls)
 	}
 }
 
@@ -1967,7 +1974,7 @@ func TestDeleteAllProjectsRejectsInvalidRequests(t *testing.T) {
 
 	httpReq, _ := http.NewRequest(http.MethodPost, f.server.URL+"/v1/sync/delete-all-projects", strings.NewReader(`{"key":`))
 	httpReq.Header.Set(controlplane.HeaderAuth, "Bearer "+token)
-	httpReq.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV2))
+	httpReq.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		t.Fatal(err)

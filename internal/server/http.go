@@ -212,12 +212,12 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			return
 		}
 		protocolHeaders := r.Header.Values(controlplane.HeaderSyncProtocol)
-		if len(protocolHeaders) != 1 || protocolHeaders[0] != strconv.Itoa(controlplane.SyncProtocolV2) {
+		if len(protocolHeaders) != 1 || protocolHeaders[0] != strconv.Itoa(controlplane.SyncProtocolV3) {
 			writeError(w, &AppError{
 				Status:          http.StatusUpgradeRequired,
 				Code:            CodeSyncProtocolUpgradeRequired,
-				Message:         "sync protocol 2 is required",
-				MinimumProtocol: controlplane.SyncProtocolV2,
+				Message:         "sync protocol 3 is required for document attachments",
+				MinimumProtocol: controlplane.SyncProtocolV3,
 			})
 			return
 		}
