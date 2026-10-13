@@ -198,15 +198,13 @@ func (h *Handler) authMiddleware(fn func(http.ResponseWriter, *http.Request, Ses
 }
 
 func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.Request, Session), timeout time.Duration) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return withRequestTimeout(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok, err := auth.BearerToken(r.Header.Get("Authorization"))
 		if err != nil {
 			writeError(w, unauthorized("missing bearer token"))
 			return
 		}
-		ctx, cancel := withRouteBudget(w, r, timeout)
-		defer cancel()
-		claims, err := h.verifier.Verify(ctx, tok)
+		claims, err := h.verifier.Verify(r.Context(), tok)
 		if err != nil {
 			writeError(w, unauthorized("invalid token"))
 			return
@@ -221,8 +219,8 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			})
 			return
 		}
-		fn(w, r.WithContext(ctx), Session{RawJWT: tok, Claims: claims})
-	})
+		fn(w, r, Session{RawJWT: tok, Claims: claims})
+	}), timeout)
 }
 
 type requestIDContextKey struct{}
@@ -268,24 +266,18 @@ func requestIDFromContext(ctx context.Context) string {
 	return requestID
 }
 
-// withRequestTimeout attaches a context deadline to the request so
-// unauthenticated handlers (which don't run through authMiddleware)
-// still get a bounded per-request lifetime.
+// withRequestTimeout gives body reads and handler work the same deadline.
+// Context cancellation alone does not interrupt a blocked body read. The
+// effective context deadline also preserves any shorter parent budget.
 func withRequestTimeout(next http.Handler, timeout time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := withRouteBudget(w, r, timeout)
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
+		deadline, _ := ctx.Deadline()
+		// net/http supports read deadlines; in-memory response recorders may not.
+		_ = http.NewResponseController(w).SetReadDeadline(deadline)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-// withRouteBudget bounds a request by its route budget: the context
-// deadline for the work and the read deadline for the body. Without the
-// read deadline the server-wide ReadTimeout would cut slow uploads to
-// long-budget routes (attachments, import chunks) off early.
-func withRouteBudget(w http.ResponseWriter, r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(timeout))
-	return context.WithTimeout(r.Context(), timeout)
 }
 
 // commonMiddleware wraps every request in panic recovery and a request-size

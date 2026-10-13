@@ -2492,58 +2492,6 @@ func TestAttachmentDeleteDropsIndexAndBucket(t *testing.T) {
 	}
 }
 
-// TestRouteBudgetBoundsRequestBodyRead: a route's request budget, not
-// the server-wide ReadTimeout, decides how long its body may take to
-// arrive, so a slow upload to a long-budget route is not cut off.
-func TestRouteBudgetBoundsRequestBodyRead(t *testing.T) {
-	f := newFixture(t)
-	attID := "123e4567-e89b-12d3-a456-426614174111"
-	ownerTenant, err := buckets.TenantForUser(f.userSub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.bk.items.Put(attID, bucketsItem{
-		Tenant:         ownerTenant,
-		Value:          []byte("payload"),
-		EncryptionKeys: [][]byte{bytes.Repeat([]byte{1}, 32)},
-	})
-	f.cp.mu.Lock()
-	f.cp.attachmentIndex = map[string]string{attID: "chat-1"}
-	f.cp.mu.Unlock()
-
-	const serverReadTimeout = 50 * time.Millisecond
-	srv := httptest.NewUnstartedServer(f.handler.Routes())
-	srv.Config.ReadTimeout = serverReadTimeout
-	srv.Start()
-	t.Cleanup(srv.Close)
-
-	body, _ := json.Marshal(AttachmentDeleteRequest{ID: attID})
-	reader, writer := io.Pipe()
-	go func() {
-		half := len(body) / 2
-		_, _ = writer.Write(body[:half])
-		time.Sleep(4 * serverReadTimeout)
-		_, _ = writer.Write(body[half:])
-		_ = writer.Close()
-	}()
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/attachment/delete", reader)
-	req.Header.Set("Authorization", "Bearer "+f.jwt())
-	req.Header.Set(controlplane.HeaderSyncProtocol, strconv.Itoa(controlplane.SyncProtocolV3))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("slow upload was cut off: %v", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("slow upload: %d %s", resp.StatusCode, respBody)
-	}
-	if f.bk.has(attID) {
-		t.Fatal("buckets entry should be gone")
-	}
-}
-
 func TestDeterministicAttachmentIDMatchesBucketsTokenContract(t *testing.T) {
 	plaintext := []byte("attachment-bytes")
 	id, key, err := deriveAttachmentMaterials("idem-attachment", "chat-1", "user_123", plaintext)

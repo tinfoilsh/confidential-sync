@@ -104,14 +104,10 @@ func main() {
 	server.StartAttachmentPurgeWorker(ctx, deps)
 	server.StartSearchIndexDeletionWorker(ctx, deps)
 
-	// WriteTimeout is sized for /v1/blobs/migrate-all, which drains
-	// every legacy blob scope under a wall-clock budget capped to
-	// server.MigrateAllBudget (10m). MigrateAllRequestTimeout gives
-	// the handler 2m of margin to finalize its response. All
-	// other routes complete in well under a second; ReadHeaderTimeout
-	// stays strict so slowloris cannot exploit the longer write side.
-	// Routes with a request budget read their body under that budget
-	// instead of ReadTimeout.
+	// ReadTimeout is the fallback for routes without a request budget;
+	// budgeted routes set their own body-read deadline. ReadHeaderTimeout
+	// applies before routing. WriteTimeout remains the outer write bound;
+	// request contexts bound upstream work per route.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler.Routes(),
