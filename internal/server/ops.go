@@ -218,27 +218,33 @@ const maxAttachmentRefsPerChat = 500
 // chatAttachmentRefs returns the distinct buckets-backed attachment ids
 // a chat plaintext references: every attachment carrying a server key.
 // Attachments without a key have never been uploaded and so have no
-// index row to keep alive. Plaintext that does not parse as a chat
-// document references nothing; the enclave stays agnostic to payload
-// shape and the controlplane simply treats every blob under that chat
-// as unreferenced.
+// index row to keep alive. Only the fields liveness needs are read, so
+// a chat field of an unexpected type cannot hide a live attachment. A
+// plaintext without that shape returns nil: its references are
+// unknown, the header is omitted, and the controlplane keeps every blob
+// under the chat.
 func chatAttachmentRefs(plaintext []byte) []string {
-	refs := []string{}
-	var chat nativeChatPayload
-	if err := json.Unmarshal(plaintext, &chat); err != nil {
-		return refs
+	var chat struct {
+		Messages []struct {
+			Attachments []map[string]json.RawMessage `json:"attachments"`
+		} `json:"messages"`
 	}
+	if err := json.Unmarshal(plaintext, &chat); err != nil {
+		return nil
+	}
+	refs := []string{}
 	seen := make(map[string]struct{})
 	for _, message := range chat.Messages {
 		for _, attachment := range message.Attachments {
-			if attachment.ID == "" || attachmentServerKey(attachment.Raw) == "" {
+			var id string
+			if json.Unmarshal(attachment["id"], &id) != nil || id == "" || attachmentServerKey(attachment) == "" {
 				continue
 			}
-			if _, dup := seen[attachment.ID]; dup {
+			if _, dup := seen[id]; dup {
 				continue
 			}
-			seen[attachment.ID] = struct{}{}
-			refs = append(refs, attachment.ID)
+			seen[id] = struct{}{}
+			refs = append(refs, id)
 		}
 	}
 	return refs
