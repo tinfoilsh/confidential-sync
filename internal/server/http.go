@@ -204,7 +204,7 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			writeError(w, unauthorized("missing bearer token"))
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		ctx, cancel := withRouteBudget(w, r, timeout)
 		defer cancel()
 		claims, err := h.verifier.Verify(ctx, tok)
 		if err != nil {
@@ -273,10 +273,19 @@ func requestIDFromContext(ctx context.Context) string {
 // still get a bounded per-request lifetime.
 func withRequestTimeout(next http.Handler, timeout time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		ctx, cancel := withRouteBudget(w, r, timeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// withRouteBudget bounds a request by its route budget: the context
+// deadline for the work and the read deadline for the body. Without the
+// read deadline the server-wide ReadTimeout would cut slow uploads to
+// long-budget routes (attachments, import chunks) off early.
+func withRouteBudget(w http.ResponseWriter, r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(timeout))
+	return context.WithTimeout(r.Context(), timeout)
 }
 
 // commonMiddleware wraps every request in panic recovery and a request-size

@@ -110,6 +110,8 @@ func main() {
 	// the handler 2m of margin to finalize its response. All
 	// other routes complete in well under a second; ReadHeaderTimeout
 	// stays strict so slowloris cannot exploit the longer write side.
+	// Routes with a request budget read their body under that budget
+	// instead of ReadTimeout.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler.Routes(),
