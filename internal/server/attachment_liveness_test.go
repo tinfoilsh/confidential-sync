@@ -113,19 +113,22 @@ func TestPushRefsIgnoreFieldsLivenessDoesNotRead(t *testing.T) {
 	f.cp.currentKID = f.userKeyID
 	tok := f.jwt()
 
-	var header []string
-	var seen bool
+	var captured []string
+	var captureSeen bool
 	f.cp.captureHeaders = func(r *http.Request) {
 		if r.Method != http.MethodPut || !strings.HasPrefix(r.URL.Path, "/api/sync/blob/chat/") {
 			return
 		}
 		f.cp.mu.Lock()
 		defer f.cp.mu.Unlock()
-		header, seen = r.Header[controlplane.HeaderAttachmentRefs]
+		captured, captureSeen = r.Header[controlplane.HeaderAttachmentRefs]
 	}
-	push := func(id string, plaintext []byte) {
+	// push returns the X-Attachment-Refs header the controlplane received.
+	push := func(id string, plaintext []byte) (header []string, seen bool) {
 		t.Helper()
-		seen, header = false, nil
+		f.cp.mu.Lock()
+		captured, captureSeen = nil, false
+		f.cp.mu.Unlock()
 		resp, body := f.post("/v1/sync/push", PushRequest{
 			Scope: "chat", ID: id, Key: f.userKeyB64,
 			Plaintext: base64.StdEncoding.EncodeToString(plaintext), IdempotencyKey: "idem-" + id,
@@ -133,17 +136,20 @@ func TestPushRefsIgnoreFieldsLivenessDoesNotRead(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("push %s: %d %s", id, resp.StatusCode, body)
 		}
+		f.cp.mu.Lock()
+		defer f.cp.mu.Unlock()
+		return captured, captureSeen
 	}
 
 	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
 	drifted := []byte(`{"id":"chat-drift","title":null,"messages":[{"role":"assistant","content":"a","thinkingDuration":null,` +
 		`"attachments":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","type":"document","fileName":"a.pdf","fileSize":1.5,"encryptionKey":"` + key + `"}]}]}`)
-	push("chat-drift", drifted)
+	header, seen := push("chat-drift", drifted)
 	if !seen || len(header) != 1 || header[0] != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("drifted chat: seen=%v header=%v", seen, header)
 	}
 
-	push("chat-unreadable", []byte(`{"id":"chat-unreadable","messages":{"attachments":[]}}`))
+	header, seen = push("chat-unreadable", []byte(`{"id":"chat-unreadable","messages":{"attachments":[]}}`))
 	if seen {
 		t.Fatalf("unreadable references must omit X-Attachment-Refs, got %v", header)
 	}
