@@ -16,10 +16,35 @@ import (
 )
 
 func TestImportFailureKeepsInnermostTag(t *testing.T) {
-	inner := limitExceededErr("import: native backup count limit exceeded")
+	inner := limitExceededErr(ImportDetailTooManyConversations, "import: native backup count limit exceeded")
 	wrapped := importFailure(ImportFailureInvalidArchive, fmt.Errorf("import: validate: %w", inner))
 	if got := classifyImportFailure(context.Background(), wrapped); got != ImportFailureLimitExceeded {
 		t.Fatalf("outer wrap masked the limit tag: got %q", got)
+	}
+}
+
+func TestImportFailureDetailOnlyReportsKnownChecksForTheFinalReason(t *testing.T) {
+	expired, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	<-expired.Done()
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want ImportFailureDetail
+	}{
+		{"known check", context.Background(), invalidArchiveErr(ImportDetailMissingConversations, "import: missing"), ImportDetailMissingConversations},
+		{"unknown detail is not exposed", context.Background(), importFailureWithDetail(ImportFailureInvalidArchive, "private-title", errors.New("private-message")), ""},
+		{"timeout that overrides the tag carries no detail", expired, limitExceededErr(ImportDetailTooManyMessages, "import: message limit exceeded"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := classifyImportFailure(tc.ctx, tc.err)
+			if got := importFailureDetail(tc.err, reason); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

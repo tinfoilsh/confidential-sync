@@ -1366,8 +1366,9 @@ const (
 )
 
 // ImportOutcome is the payload for the import notification callback.
-// FailureReason is only set when Status is ImportOutcomeFailed and
-// carries the enclave's user-safe classification, never raw error text.
+// FailureReason and FailureDetail are only set when Status is
+// ImportOutcomeFailed and carry the enclave's user-safe classification
+// and the check that fired, never raw error text.
 type ImportOutcome struct {
 	ClerkUserID   string
 	JobID         string
@@ -1376,6 +1377,7 @@ type ImportOutcome struct {
 	Imported      int
 	Failed        int
 	FailureReason string
+	FailureDetail string
 }
 
 // NotifyImportOutcome asks the controlplane to email the user that an
@@ -1396,6 +1398,9 @@ func (c *Client) NotifyImportOutcome(ctx context.Context, outcome ImportOutcome)
 	}
 	if outcome.Status == ImportOutcomeFailed && outcome.FailureReason != "" {
 		payload["failureReason"] = outcome.FailureReason
+		if outcome.FailureDetail != "" {
+			payload["failureDetail"] = outcome.FailureDetail
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

@@ -51,12 +51,6 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 		return runNativeBackupImport(ctx, deps, sess, job, arch, cekB64)
 	}
 
-	conversationsJSON, err := arch.readConversations()
-	if err != nil {
-		return err
-	}
-	job.setPhase("chats")
-
 	priorIDs := make(map[string]string)
 	opts := importer.Options{
 		Index: arch.entryIndex(),
@@ -76,23 +70,31 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	workers, workCtx := errgroup.WithContext(ctx)
 	workers.SetLimit(importChatConcurrency)
 	var conversations, messages, parsedAttachments int
+	// A conversation can be listed in more than one file of a split
+	// export, possibly with different timestamps and so a different chat
+	// id. Import the first copy only.
+	emitted := make(map[string]struct{})
 	emit := func(chat *importer.Chat) error {
 		if err := workCtx.Err(); err != nil {
 			return err
 		}
+		if _, dup := emitted[chat.StableKey]; dup {
+			return nil
+		}
+		emitted[chat.StableKey] = struct{}{}
 		conversations++
 		if conversations > MaxImportConversations {
-			return limitExceededErr("import: conversation limit exceeded")
+			return limitExceededErr(ImportDetailTooManyConversations, "import: conversation limit exceeded")
 		}
 		messages += len(chat.Messages)
 		if messages > maxImportMessages {
-			return limitExceededErr("import: message limit exceeded")
+			return limitExceededErr(ImportDetailTooManyMessages, "import: message limit exceeded")
 		}
 		for _, msg := range chat.Messages {
 			parsedAttachments += len(msg.Attachments)
 		}
 		if parsedAttachments > MaxImportAttachments {
-			return limitExceededErr("import: attachment limit exceeded")
+			return limitExceededErr(ImportDetailTooManyAttachments, "import: attachment limit exceeded")
 		}
 		chat.Restore = &importer.RestoreMarker{
 			Format: "legacy-import-v1", SourceBackupID: job.Source,
@@ -113,7 +115,11 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 		return nil
 	}
 
-	_, parseErr := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit)
+	parseErr := arch.eachConversationsFile(func(conversationsJSON []byte) error {
+		job.setPhase("chats")
+		_, err := importer.ParseEach(importer.Source(job.Source), conversationsJSON, opts, emit)
+		return err
+	})
 	workErr := workers.Wait()
 	if workErr != nil {
 		return workErr
@@ -238,7 +244,7 @@ func importOneChat(ctx context.Context, deps Deps, sess Session, arch *importArc
 
 // errImportAttachmentLimit is the only sealImportedChat failure that
 // ends the whole job rather than just the current chat.
-var errImportAttachmentLimit = limitExceededErr("import: attachment limit exceeded")
+var errImportAttachmentLimit = limitExceededErr(ImportDetailTooManyAttachments, "import: attachment limit exceeded")
 
 // sealImportedChat uploads each binary attachment, seals the chat under
 // the CEK, and pushes it to the controlplane. Per-attachment failures
@@ -447,11 +453,11 @@ func notifyImportComplete(ctx context.Context, deps Deps, clerkUserID, jobID, so
 
 // notifyImportFailed tells the controlplane why the job did not finish
 // so the user is emailed instead of left polling a job that has gone.
-func notifyImportFailed(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int, reason ImportFailureReason) {
+func notifyImportFailed(ctx context.Context, deps Deps, clerkUserID, jobID, source string, imported, failed int, reason ImportFailureReason, detail ImportFailureDetail) {
 	notifyImportOutcome(ctx, deps, controlplane.ImportOutcome{
 		ClerkUserID: clerkUserID, JobID: jobID, Source: source,
 		Status: controlplane.ImportOutcomeFailed, Imported: imported, Failed: failed,
-		FailureReason: string(reason),
+		FailureReason: string(reason), FailureDetail: string(detail),
 	})
 }
 

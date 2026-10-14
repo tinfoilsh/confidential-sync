@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -202,6 +204,207 @@ func TestImportJobSkipsUnsupportedBinaryDocument(t *testing.T) {
 	}
 }
 
+func chatgptConversation(id string, createTime int64) string {
+	return fmt.Sprintf(`{"id":%q,"title":%q,"create_time":%d,"mapping":{"root":{"id":"root","children":["msg"]},"msg":{"id":"msg","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["hello"]}}}}}`, id, "Chat "+id, createTime)
+}
+
+func zipArchive(t *testing.T, entries ...[2]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, entry := range entries {
+		writeZipEntry(t, zw, entry[0], []byte(entry[1]))
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func chatgptChatKey(f *fixture, id string, createTime int64) string {
+	return "chat/" + deterministicChatID(f.userSub, importer.SourceChatGPT, id, time.Unix(createTime, 0).UTC())
+}
+
+func importedChatKeys(f *fixture) map[string]bool {
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	keys := make(map[string]bool, len(f.cp.blobs))
+	for key := range f.cp.blobs {
+		if strings.HasPrefix(key, "chat/") {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+// requireImportedChats checks that exactly the wanted chats were stored
+// and that each decrypts under the user's key to its conversation.
+func requireImportedChats(t *testing.T, f *fixture, wantTitles map[string]string) {
+	t.Helper()
+	wantKeys := make(map[string]bool, len(wantTitles))
+	for key := range wantTitles {
+		wantKeys[key] = true
+	}
+	if got := importedChatKeys(f); !maps.Equal(got, wantKeys) {
+		t.Fatalf("imported chats = %v, want %v", got, wantKeys)
+	}
+	for key, title := range wantTitles {
+		payload := decryptNativeTestBlob(t, f, "chat", strings.TrimPrefix(key, "chat/"))
+		messages, _ := payload["messages"].([]any)
+		if payload["title"] != title || len(messages) != 1 {
+			t.Fatalf("%s decrypted to title=%v with %d messages, want %q with 1", key, payload["title"], len(messages), title)
+		}
+	}
+}
+
+// TestImportJobReadsSplitChatGPTExport pins the layout ChatGPT uses for
+// large accounts: numbered conversation parts and a manifest instead of
+// one conversations.json. A nested copy deeper in the archive is not
+// part of the export and must not be imported.
+func TestImportJobReadsSplitChatGPTExport(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	captureImportNotifications(t, f)
+
+	archive := zipArchive(t,
+		[2]string{"conversations-000.json", "[" + chatgptConversation("conv-a", 1706832000) + "]"},
+		[2]string{"conversations-001.json", "[" + chatgptConversation("conv-b", 1706832100) + "," + chatgptConversation("conv-c", 1706832200) + "]"},
+		[2]string{"export_manifest.json", `{"files":["conversations-000.json","conversations-001.json"]}`},
+		[2]string{"user.json", `{"id":"user-1"}`},
+		[2]string{"old/conversations.json", "[" + chatgptConversation("conv-old", 1600000000) + "]"},
+	)
+	job := stageArchive(t, f, "chatgpt", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	snap := job.Snapshot()
+	if snap.Imported != 3 || snap.Failed != 0 {
+		t.Fatalf("imported=%d failed=%d, want 3/0 (errors=%v)", snap.Imported, snap.Failed, snap.Errors)
+	}
+	requireImportedChats(t, f, map[string]string{
+		chatgptChatKey(f, "conv-a", 1706832000): "Chat conv-a",
+		chatgptChatKey(f, "conv-b", 1706832100): "Chat conv-b",
+		chatgptChatKey(f, "conv-c", 1706832200): "Chat conv-c",
+	})
+}
+
+// TestImportJobImportsConversationListedTwiceOnce covers an archive with
+// both conversations.json and split parts that repeat a conversation,
+// here with a different timestamp and so a different chat id. Each
+// conversation must be pushed and counted once.
+func TestImportJobImportsConversationListedTwiceOnce(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	captureImportNotifications(t, f)
+
+	archive := zipArchive(t,
+		[2]string{"conversations.json", "[" + chatgptConversation("conv-a", 1706832000) + "," + chatgptConversation("conv-b", 1706832100) + "]"},
+		[2]string{"conversations-000.json", "[" + chatgptConversation("conv-b", 1706832160) + "]"},
+	)
+	job := stageArchive(t, f, "chatgpt", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	snap := job.Snapshot()
+	if snap.Imported != 2 || snap.Failed != 0 || snap.Total != 2 {
+		t.Fatalf("imported=%d failed=%d total=%d, want 2/0/2 (errors=%v)", snap.Imported, snap.Failed, snap.Total, snap.Errors)
+	}
+	requireImportedChats(t, f, map[string]string{
+		chatgptChatKey(f, "conv-a", 1706832000): "Chat conv-a",
+		chatgptChatKey(f, "conv-b", 1706832100): "Chat conv-b",
+	})
+}
+
+func TestReadEntryReportsUnreadableCompression(t *testing.T) {
+	archive := deflate64Archive(t)
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch := &importArchive{zr: zr, files: map[string]*zip.File{"conversations.json": zr.File[0]}}
+
+	_, err = arch.readEntry("conversations.json", MaxImportJSONBytes)
+	reason := classifyImportFailure(context.Background(), err)
+	if reason != ImportFailureInvalidArchive || importFailureDetail(err, reason) != ImportDetailUnsupportedCompression {
+		t.Fatalf("reason=%q detail=%q, want invalid_archive/unsupported_compression", reason, importFailureDetail(err, reason))
+	}
+}
+
+// deflate64Archive stores conversations.json under ZIP method 9, which
+// archivers such as 7-Zip and Windows Explorer write for large files
+// and Go cannot decompress.
+func deflate64Archive(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	zw.RegisterCompressor(9, func(w io.Writer) (io.WriteCloser, error) { return nopWriteCloser{w}, nil })
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: "conversations.json", Method: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("[]")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+func TestImportJobFailureReportsWhichCheckRejectedTheArchive(t *testing.T) {
+	validZip := zipArchive(t, [2]string{"conversations.json", "[" + chatgptConversation("conv-a", 1706832000) + "]"})
+	cases := []struct {
+		name        string
+		source      string
+		archive     []byte
+		corruptHash bool
+		wantReason  ImportFailureReason
+		wantDetail  ImportFailureDetail
+	}{
+		{"zip without a conversations file", "chatgpt", zipArchive(t, [2]string{"user.json", `{}`}), false, ImportFailureInvalidArchive, ImportDetailMissingConversations},
+		{"zip cut short before its directory", "chatgpt", validZip[:len(validZip)/2], false, ImportFailureInvalidArchive, ImportDetailCorruptZip},
+		{"zip re-compressed with deflate64", "chatgpt", deflate64Archive(t), false, ImportFailureInvalidArchive, ImportDetailUnsupportedCompression},
+		{"file that is not JSON", "chatgpt", []byte("<html>chat</html>"), false, ImportFailureInvalidArchive, ImportDetailInvalidJSON},
+		{"JSON that is not a conversation list", "chatgpt", []byte(`{"email":"user@example.com"}`), false, ImportFailureInvalidArchive, ImportDetailUnexpectedJSON},
+		{"upload that does not match its hash", "chatgpt", validZip, true, ImportFailureInvalidArchive, ImportDetailHashMismatch},
+		{"tinfoil backup cut short", "tinfoil_backup", validZip[:len(validZip)/2], false, ImportFailureInvalidArchive, ImportDetailCorruptZip},
+		{"tinfoil backup that is not a ZIP", "tinfoil_backup", []byte(`{"format":"backup"}`), false, ImportFailureInvalidArchive, ImportDetailNotZip},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.cp.currentKID = f.userKeyID
+			notified := captureImportNotifications(t, f)
+			job := stageArchive(t, f, tc.source, tc.archive)
+			if tc.corruptHash {
+				job.ArchiveSHA256 = hashOf([]byte("different"))
+			}
+
+			snap := runCoordinatorJob(t, f, NewImportCoordinator(), job)
+			if snap.Status != ImportJobFailed || snap.FailureReason != tc.wantReason || snap.FailureDetail != tc.wantDetail {
+				t.Fatalf("status=%s reason=%q detail=%q, want failed/%s/%s", snap.Status, snap.FailureReason, snap.FailureDetail, tc.wantReason, tc.wantDetail)
+			}
+			if got := importStatusResponse(snap).FailureDetail; got != string(tc.wantDetail) {
+				t.Fatalf("status response failure_detail=%q, want %q", got, tc.wantDetail)
+			}
+			body := notified.single(t)
+			if body["failureReason"] != string(tc.wantReason) || body["failureDetail"] != string(tc.wantDetail) {
+				t.Fatalf("unexpected failure notification: %v", body)
+			}
+		})
+	}
+}
+
 func TestImportJobSkipsUnresolvedTinfoilImages(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
@@ -377,8 +580,12 @@ func TestImportJobEnforcesMessageLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected message-limit error")
 	}
-	if got := classifyImportFailure(context.Background(), err); got != ImportFailureLimitExceeded {
+	got := classifyImportFailure(context.Background(), err)
+	if got != ImportFailureLimitExceeded {
 		t.Fatalf("message limit classified as %q, want %q", got, ImportFailureLimitExceeded)
+	}
+	if detail := importFailureDetail(err, got); detail != ImportDetailTooManyMessages {
+		t.Fatalf("message limit detail = %q, want %q", detail, ImportDetailTooManyMessages)
 	}
 }
 

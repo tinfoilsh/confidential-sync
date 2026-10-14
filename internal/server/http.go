@@ -730,6 +730,7 @@ func importStatusResponse(snap ImportJobSnapshot) ImportStatusResponse {
 		ProjectMappings: snap.ProjectMappings,
 		JobID:           snap.ID,
 		FailureReason:   string(snap.FailureReason),
+		FailureDetail:   string(snap.FailureDetail),
 	}
 }
 
