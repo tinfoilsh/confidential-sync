@@ -237,6 +237,26 @@ func importedChatKeys(f *fixture) map[string]bool {
 	return keys
 }
 
+// requireImportedChats checks that exactly the wanted chats were stored
+// and that each decrypts under the user's key to its conversation.
+func requireImportedChats(t *testing.T, f *fixture, wantTitles map[string]string) {
+	t.Helper()
+	wantKeys := make(map[string]bool, len(wantTitles))
+	for key := range wantTitles {
+		wantKeys[key] = true
+	}
+	if got := importedChatKeys(f); !maps.Equal(got, wantKeys) {
+		t.Fatalf("imported chats = %v, want %v", got, wantKeys)
+	}
+	for key, title := range wantTitles {
+		payload := decryptNativeTestBlob(t, f, "chat", strings.TrimPrefix(key, "chat/"))
+		messages, _ := payload["messages"].([]any)
+		if payload["title"] != title || len(messages) != 1 {
+			t.Fatalf("%s decrypted to title=%v with %d messages, want %q with 1", key, payload["title"], len(messages), title)
+		}
+	}
+}
+
 // TestImportJobReadsSplitChatGPTExport pins the layout ChatGPT uses for
 // large accounts: numbered conversation parts and a manifest instead of
 // one conversations.json. A nested copy deeper in the archive is not
@@ -264,14 +284,11 @@ func TestImportJobReadsSplitChatGPTExport(t *testing.T) {
 	if snap.Imported != 3 || snap.Failed != 0 {
 		t.Fatalf("imported=%d failed=%d, want 3/0 (errors=%v)", snap.Imported, snap.Failed, snap.Errors)
 	}
-	want := map[string]bool{
-		chatgptChatKey(f, "conv-a", 1706832000): true,
-		chatgptChatKey(f, "conv-b", 1706832100): true,
-		chatgptChatKey(f, "conv-c", 1706832200): true,
-	}
-	if got := importedChatKeys(f); !maps.Equal(got, want) {
-		t.Fatalf("imported chats = %v, want %v", got, want)
-	}
+	requireImportedChats(t, f, map[string]string{
+		chatgptChatKey(f, "conv-a", 1706832000): "Chat conv-a",
+		chatgptChatKey(f, "conv-b", 1706832100): "Chat conv-b",
+		chatgptChatKey(f, "conv-c", 1706832200): "Chat conv-c",
+	})
 }
 
 // TestImportJobImportsConversationListedTwiceOnce covers an archive with
@@ -298,13 +315,10 @@ func TestImportJobImportsConversationListedTwiceOnce(t *testing.T) {
 	if snap.Imported != 2 || snap.Failed != 0 || snap.Total != 2 {
 		t.Fatalf("imported=%d failed=%d total=%d, want 2/0/2 (errors=%v)", snap.Imported, snap.Failed, snap.Total, snap.Errors)
 	}
-	want := map[string]bool{
-		chatgptChatKey(f, "conv-a", 1706832000): true,
-		chatgptChatKey(f, "conv-b", 1706832100): true,
-	}
-	if got := importedChatKeys(f); !maps.Equal(got, want) {
-		t.Fatalf("imported chats = %v, want %v", got, want)
-	}
+	requireImportedChats(t, f, map[string]string{
+		chatgptChatKey(f, "conv-a", 1706832000): "Chat conv-a",
+		chatgptChatKey(f, "conv-b", 1706832100): "Chat conv-b",
+	})
 }
 
 func TestReadEntryReportsUnreadableCompression(t *testing.T) {
