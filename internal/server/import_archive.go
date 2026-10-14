@@ -166,15 +166,15 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 	zr, err := zip.NewReader(reader, job.TotalBytes)
 	if err != nil {
 		if errors.Is(err, zip.ErrFormat) {
-			if job.Source == string(importer.SourceTinfoilBackup) {
-				return nil, invalidArchiveErr(ImportDetailNotZip, "import: tinfoil backup must be a ZIP archive")
-			}
 			truncated, terr := hasZipLocalHeader(reader)
 			if terr != nil {
 				return nil, terr
 			}
 			if truncated {
 				return nil, invalidArchiveErr(ImportDetailCorruptZip, "import: archive is a truncated ZIP")
+			}
+			if job.Source == string(importer.SourceTinfoilBackup) {
+				return nil, invalidArchiveErr(ImportDetailNotZip, "import: tinfoil backup must be a ZIP archive")
 			}
 			plain, perr := readAllStaged(reader, MaxImportJSONBytes)
 			if perr != nil {
@@ -294,12 +294,12 @@ func (a *importArchive) readEntry(name string, maxBytes int64) ([]byte, error) {
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return nil, fmt.Errorf("import: open archive entry: %w", err)
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open archive entry: %w", err))
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, maxBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("import: read archive entry: %w", err)
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: read archive entry: %w", err))
 	}
 	if int64(len(data)) > maxBytes {
 		return nil, limitExceededErr(ImportDetailTooLarge, "import: archive entry exceeds size limit")

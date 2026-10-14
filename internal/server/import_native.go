@@ -217,8 +217,11 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 	if manifest.Counts != nil && (manifest.Counts.Projects < 0 || manifest.Counts.Documents < 0 || manifest.Counts.Chats < 0 || manifest.Counts.Blobs < 0) {
 		return nil, errors.New("import: invalid manifest counts")
 	}
-	if len(manifest.Entities) > MaxImportConversations || len(manifest.Blobs) > MaxImportAttachments {
-		return nil, limitExceededErr(ImportDetailTooManyConversations, "import: native backup count limit exceeded")
+	if len(manifest.Entities) > MaxImportConversations {
+		return nil, limitExceededErr(ImportDetailTooManyConversations, "import: native backup entity limit exceeded")
+	}
+	if len(manifest.Blobs) > MaxImportAttachments {
+		return nil, limitExceededErr(ImportDetailTooManyAttachments, "import: native backup blob limit exceeded")
 	}
 
 	out := &validatedNativeBackup{manifest: manifest, blobs: make(map[string]nativeBlobManifest)}
@@ -316,8 +319,11 @@ func validateNativeBackup(arch *importArchive) (*validatedNativeBackup, error) {
 					}
 				}
 			}
-			if messages > MaxImportMessages || attachments > MaxImportAttachments {
-				return nil, limitExceededErr(ImportDetailTooManyMessages, "import: native chat aggregate limit exceeded")
+			if messages > MaxImportMessages {
+				return nil, limitExceededErr(ImportDetailTooManyMessages, "import: native chat message limit exceeded")
+			}
+			if attachments > MaxImportAttachments {
+				return nil, limitExceededErr(ImportDetailTooManyAttachments, "import: native chat attachment limit exceeded")
 			}
 			if !validJSONTime(payload.CreatedAt) {
 				return nil, errors.New("import: invalid chat createdAt")

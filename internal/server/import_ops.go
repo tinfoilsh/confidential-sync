@@ -70,17 +70,18 @@ func runImportJob(ctx context.Context, deps Deps, sess Session, job *ImportJobSt
 	workers, workCtx := errgroup.WithContext(ctx)
 	workers.SetLimit(importChatConcurrency)
 	var conversations, messages, parsedAttachments int
-	// A conversation listed in more than one file of a split export maps
-	// to the same chat id; importing it twice would race two pushes.
+	// A conversation can be listed in more than one file of a split
+	// export, possibly with different timestamps and so a different chat
+	// id. Import the first copy only.
 	emitted := make(map[string]struct{})
 	emit := func(chat *importer.Chat) error {
 		if err := workCtx.Err(); err != nil {
 			return err
 		}
-		if _, dup := emitted[chat.ID]; dup {
+		if _, dup := emitted[chat.StableKey]; dup {
 			return nil
 		}
-		emitted[chat.ID] = struct{}{}
+		emitted[chat.StableKey] = struct{}{}
 		conversations++
 		if conversations > MaxImportConversations {
 			return limitExceededErr(ImportDetailTooManyConversations, "import: conversation limit exceeded")

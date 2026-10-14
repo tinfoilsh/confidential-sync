@@ -275,8 +275,9 @@ func TestImportJobReadsSplitChatGPTExport(t *testing.T) {
 }
 
 // TestImportJobImportsConversationListedTwiceOnce covers an archive with
-// both conversations.json and split parts that repeat a conversation.
-// Each conversation must be pushed and counted once.
+// both conversations.json and split parts that repeat a conversation,
+// here with a different timestamp and so a different chat id. Each
+// conversation must be pushed and counted once.
 func TestImportJobImportsConversationListedTwiceOnce(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
@@ -284,7 +285,7 @@ func TestImportJobImportsConversationListedTwiceOnce(t *testing.T) {
 
 	archive := zipArchive(t,
 		[2]string{"conversations.json", "[" + chatgptConversation("conv-a", 1706832000) + "," + chatgptConversation("conv-b", 1706832100) + "]"},
-		[2]string{"conversations-000.json", "[" + chatgptConversation("conv-b", 1706832100) + "]"},
+		[2]string{"conversations-000.json", "[" + chatgptConversation("conv-b", 1706832160) + "]"},
 	)
 	job := stageArchive(t, f, "chatgpt", archive)
 	job.cek = append([]byte(nil), f.userKey...)
@@ -297,8 +298,27 @@ func TestImportJobImportsConversationListedTwiceOnce(t *testing.T) {
 	if snap.Imported != 2 || snap.Failed != 0 || snap.Total != 2 {
 		t.Fatalf("imported=%d failed=%d total=%d, want 2/0/2 (errors=%v)", snap.Imported, snap.Failed, snap.Total, snap.Errors)
 	}
-	if got := len(importedChatKeys(f)); got != 2 {
-		t.Fatalf("expected 2 chat blobs, got %d", got)
+	want := map[string]bool{
+		chatgptChatKey(f, "conv-a", 1706832000): true,
+		chatgptChatKey(f, "conv-b", 1706832100): true,
+	}
+	if got := importedChatKeys(f); !maps.Equal(got, want) {
+		t.Fatalf("imported chats = %v, want %v", got, want)
+	}
+}
+
+func TestReadEntryReportsUnreadableCompression(t *testing.T) {
+	archive := deflate64Archive(t)
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	arch := &importArchive{zr: zr, files: map[string]*zip.File{"conversations.json": zr.File[0]}}
+
+	_, err = arch.readEntry("conversations.json", MaxImportJSONBytes)
+	reason := classifyImportFailure(context.Background(), err)
+	if reason != ImportFailureInvalidArchive || importFailureDetail(err, reason) != ImportDetailUnsupportedCompression {
+		t.Fatalf("reason=%q detail=%q, want invalid_archive/unsupported_compression", reason, importFailureDetail(err, reason))
 	}
 }
 
@@ -331,24 +351,27 @@ func TestImportJobFailureReportsWhichCheckRejectedTheArchive(t *testing.T) {
 	validZip := zipArchive(t, [2]string{"conversations.json", "[" + chatgptConversation("conv-a", 1706832000) + "]"})
 	cases := []struct {
 		name        string
+		source      string
 		archive     []byte
 		corruptHash bool
 		wantReason  ImportFailureReason
 		wantDetail  ImportFailureDetail
 	}{
-		{"zip without a conversations file", zipArchive(t, [2]string{"user.json", `{}`}), false, ImportFailureInvalidArchive, ImportDetailMissingConversations},
-		{"zip cut short before its directory", validZip[:len(validZip)/2], false, ImportFailureInvalidArchive, ImportDetailCorruptZip},
-		{"zip re-compressed with deflate64", deflate64Archive(t), false, ImportFailureInvalidArchive, ImportDetailUnsupportedCompression},
-		{"file that is not JSON", []byte("<html>chat</html>"), false, ImportFailureInvalidArchive, ImportDetailInvalidJSON},
-		{"JSON that is not a conversation list", []byte(`{"email":"user@example.com"}`), false, ImportFailureInvalidArchive, ImportDetailUnexpectedJSON},
-		{"upload that does not match its hash", validZip, true, ImportFailureInvalidArchive, ImportDetailHashMismatch},
+		{"zip without a conversations file", "chatgpt", zipArchive(t, [2]string{"user.json", `{}`}), false, ImportFailureInvalidArchive, ImportDetailMissingConversations},
+		{"zip cut short before its directory", "chatgpt", validZip[:len(validZip)/2], false, ImportFailureInvalidArchive, ImportDetailCorruptZip},
+		{"zip re-compressed with deflate64", "chatgpt", deflate64Archive(t), false, ImportFailureInvalidArchive, ImportDetailUnsupportedCompression},
+		{"file that is not JSON", "chatgpt", []byte("<html>chat</html>"), false, ImportFailureInvalidArchive, ImportDetailInvalidJSON},
+		{"JSON that is not a conversation list", "chatgpt", []byte(`{"email":"user@example.com"}`), false, ImportFailureInvalidArchive, ImportDetailUnexpectedJSON},
+		{"upload that does not match its hash", "chatgpt", validZip, true, ImportFailureInvalidArchive, ImportDetailHashMismatch},
+		{"tinfoil backup cut short", "tinfoil_backup", validZip[:len(validZip)/2], false, ImportFailureInvalidArchive, ImportDetailCorruptZip},
+		{"tinfoil backup that is not a ZIP", "tinfoil_backup", []byte(`{"format":"backup"}`), false, ImportFailureInvalidArchive, ImportDetailNotZip},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.cp.currentKID = f.userKeyID
 			notified := captureImportNotifications(t, f)
-			job := stageArchive(t, f, "chatgpt", tc.archive)
+			job := stageArchive(t, f, tc.source, tc.archive)
 			if tc.corruptHash {
 				job.ArchiveSHA256 = hashOf([]byte("different"))
 			}
