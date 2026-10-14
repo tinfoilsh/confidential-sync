@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"compress/flate"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -45,11 +46,41 @@ const (
 	ImportFailureWorker             ImportFailureReason = "worker_failed"
 )
 
+// ImportFailureDetail names the check that rejected an archive. Like the
+// reason, it is a fixed code that says which rule fired, never what the
+// archive contained, so support can tell a truncated download from a
+// wrong file without the enclave logging anything.
+type ImportFailureDetail string
+
+// Details for ImportFailureInvalidArchive.
+const (
+	ImportDetailHashMismatch           ImportFailureDetail = "hash_mismatch"
+	ImportDetailCorruptZip             ImportFailureDetail = "corrupt_zip"
+	ImportDetailUnsupportedCompression ImportFailureDetail = "unsupported_compression"
+	ImportDetailUnsafeEntry            ImportFailureDetail = "unsafe_entry"
+	ImportDetailMissingConversations   ImportFailureDetail = "missing_conversations"
+	ImportDetailInvalidJSON            ImportFailureDetail = "invalid_json"
+	ImportDetailUnexpectedJSON         ImportFailureDetail = "unexpected_json"
+	ImportDetailNotZip                 ImportFailureDetail = "not_zip"
+	ImportDetailMissingManifest        ImportFailureDetail = "missing_manifest"
+	ImportDetailInvalidBackup          ImportFailureDetail = "invalid_backup"
+)
+
+// Details for ImportFailureLimitExceeded.
+const (
+	ImportDetailTooManyEntries       ImportFailureDetail = "too_many_entries"
+	ImportDetailTooLarge             ImportFailureDetail = "too_large"
+	ImportDetailTooManyConversations ImportFailureDetail = "too_many_conversations"
+	ImportDetailTooManyMessages      ImportFailureDetail = "too_many_messages"
+	ImportDetailTooManyAttachments   ImportFailureDetail = "too_many_attachments"
+)
+
 // importFailureErr tags an error with the reason a job failed. Code that
 // knows why it is failing wraps its error so the coordinator does not
 // have to string-match.
 type importFailureErr struct {
 	reason ImportFailureReason
+	detail ImportFailureDetail
 	err    error
 }
 
@@ -60,6 +91,10 @@ func (e *importFailureErr) Unwrap() error { return e.err }
 // tag is returned unchanged so the most specific classification, made
 // closest to the cause, survives outer wrapping.
 func importFailure(reason ImportFailureReason, err error) error {
+	return importFailureWithDetail(reason, "", err)
+}
+
+func importFailureWithDetail(reason ImportFailureReason, detail ImportFailureDetail, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -67,15 +102,15 @@ func importFailure(reason ImportFailureReason, err error) error {
 	if errors.As(err, &tagged) {
 		return err
 	}
-	return &importFailureErr{reason: reason, err: err}
+	return &importFailureErr{reason: reason, detail: detail, err: err}
 }
 
-func invalidArchiveErr(msg string) error {
-	return importFailure(ImportFailureInvalidArchive, errors.New(msg))
+func invalidArchiveErr(detail ImportFailureDetail, msg string) error {
+	return importFailureWithDetail(ImportFailureInvalidArchive, detail, errors.New(msg))
 }
 
-func limitExceededErr(msg string) error {
-	return importFailure(ImportFailureLimitExceeded, errors.New(msg))
+func limitExceededErr(detail ImportFailureDetail, msg string) error {
+	return importFailureWithDetail(ImportFailureLimitExceeded, detail, errors.New(msg))
 }
 
 // classifyParseFailure tags a ParseEach error. Only a parser rejection
@@ -84,7 +119,14 @@ func limitExceededErr(msg string) error {
 // classified or a service error the coordinator classifies.
 func classifyParseFailure(err error) error {
 	if errors.Is(err, importer.ErrInvalidExport) {
-		return importFailure(ImportFailureInvalidArchive, err)
+		// A type error means the file is JSON but not a conversation
+		// list, such as user.json or an export manifest.
+		detail := ImportDetailInvalidJSON
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			detail = ImportDetailUnexpectedJSON
+		}
+		return importFailureWithDetail(ImportFailureInvalidArchive, detail, err)
 	}
 	return err
 }
@@ -93,10 +135,13 @@ func classifyParseFailure(err error) error {
 // archive. Other errors retain their original causes and tags so the
 // coordinator can distinguish storage failures from invalid exports.
 func classifyArchiveReadErr(err error) error {
+	if errors.Is(err, zip.ErrAlgorithm) {
+		return importFailureWithDetail(ImportFailureInvalidArchive, ImportDetailUnsupportedCompression, err)
+	}
 	var corrupt flate.CorruptInputError
-	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) || errors.Is(err, zip.ErrAlgorithm) ||
+	if errors.Is(err, zip.ErrFormat) || errors.Is(err, zip.ErrChecksum) ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &corrupt) {
-		return importFailure(ImportFailureInvalidArchive, err)
+		return importFailureWithDetail(ImportFailureInvalidArchive, ImportDetailCorruptZip, err)
 	}
 	return err
 }
@@ -148,6 +193,30 @@ func classifyImportFailure(ctx context.Context, err error) ImportFailureReason {
 		return safeImportFailureReason(tagged.reason)
 	}
 	return ImportFailureInternal
+}
+
+// importFailureDetail returns the check behind reason when the error was
+// tagged with that same reason. A reason that won over the tag, such as
+// a job timeout, has no detail.
+func importFailureDetail(err error, reason ImportFailureReason) ImportFailureDetail {
+	var tagged *importFailureErr
+	if !errors.As(err, &tagged) || tagged.reason != reason {
+		return ""
+	}
+	return safeImportFailureDetail(tagged.detail)
+}
+
+func safeImportFailureDetail(detail ImportFailureDetail) ImportFailureDetail {
+	switch detail {
+	case ImportDetailHashMismatch, ImportDetailCorruptZip, ImportDetailUnsupportedCompression,
+		ImportDetailUnsafeEntry, ImportDetailMissingConversations, ImportDetailInvalidJSON,
+		ImportDetailUnexpectedJSON, ImportDetailNotZip, ImportDetailMissingManifest,
+		ImportDetailInvalidBackup, ImportDetailTooManyEntries, ImportDetailTooLarge,
+		ImportDetailTooManyConversations, ImportDetailTooManyMessages, ImportDetailTooManyAttachments:
+		return detail
+	default:
+		return ""
+	}
 }
 
 func safeImportFailureReason(reason ImportFailureReason) ImportFailureReason {

@@ -1061,12 +1061,13 @@ func TestNotifyImportOutcomeSendsFailureReason(t *testing.T) {
 	c := NewClient(st.server.URL, nil, WithServiceSecret("sync-secret"))
 	err := c.NotifyImportOutcome(context.Background(), ImportOutcome{
 		ClerkUserID: "user_real", JobID: "job_1", Source: "claude",
-		Status: ImportOutcomeFailed, Imported: 12, Failed: 1, FailureReason: "timeout",
+		Status: ImportOutcomeFailed, Imported: 12, Failed: 1, FailureReason: "invalid_archive", FailureDetail: "missing_conversations",
 	})
 	if err != nil {
 		t.Fatalf("notify import outcome: %v", err)
 	}
-	if body["status"] != "failed" || body["failureReason"] != "timeout" || body["importedCount"] != float64(12) || body["failedCount"] != float64(1) {
+	if body["status"] != "failed" || body["failureReason"] != "invalid_archive" || body["failureDetail"] != "missing_conversations" ||
+		body["importedCount"] != float64(12) || body["failedCount"] != float64(1) {
 		t.Fatalf("unexpected failure body: %v", body)
 	}
 }

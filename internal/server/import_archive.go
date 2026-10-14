@@ -2,14 +2,19 @@ package server
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -126,12 +131,17 @@ func importChunkToken(uploadID string, idx int) string {
 // either a ZIP (with a safe entry index) or a bare conversations.json
 // when the upload was a plain JSON export with no attachments.
 type importArchive struct {
-	zr                *zip.Reader
-	index             *importer.Index
-	files             map[string]*zip.File
-	conversationsName string
-	plainJSON         []byte
+	zr                 *zip.Reader
+	index              *importer.Index
+	files              map[string]*zip.File
+	conversationsFiles []string
+	plainJSON          []byte
 }
+
+// zipLocalHeader is the signature every ZIP file starts with. A staged
+// upload that has it but no readable central directory is a ZIP that
+// was cut short, not a JSON export.
+var zipLocalHeader = []byte("PK\x03\x04")
 
 // openStagedArchive verifies the archive hash, then opens it as a ZIP
 // (enforcing the safety limits) or treats it as plain conversations.json
@@ -157,7 +167,14 @@ func openStagedArchive(ctx context.Context, deps Deps, owner string, job *Import
 	if err != nil {
 		if errors.Is(err, zip.ErrFormat) {
 			if job.Source == string(importer.SourceTinfoilBackup) {
-				return nil, invalidArchiveErr("import: tinfoil backup must be a ZIP archive")
+				return nil, invalidArchiveErr(ImportDetailNotZip, "import: tinfoil backup must be a ZIP archive")
+			}
+			truncated, terr := hasZipLocalHeader(reader)
+			if terr != nil {
+				return nil, terr
+			}
+			if truncated {
+				return nil, invalidArchiveErr(ImportDetailCorruptZip, "import: archive is a truncated ZIP")
 			}
 			plain, perr := readAllStaged(reader, MaxImportJSONBytes)
 			if perr != nil {
@@ -188,9 +205,20 @@ func verifyStagedArchiveHash(r *stagedArchiveReader, wantHex string) error {
 	}
 	got := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(got, wantHex) {
-		return invalidArchiveErr("import: archive hash mismatch")
+		return invalidArchiveErr(ImportDetailHashMismatch, "import: archive hash mismatch")
 	}
 	return nil
+}
+
+func hasZipLocalHeader(r *stagedArchiveReader) (bool, error) {
+	if r.totalBytes < int64(len(zipLocalHeader)) {
+		return false, nil
+	}
+	head := make([]byte, len(zipLocalHeader))
+	if _, err := r.ReadAt(head, 0); err != nil {
+		return false, fmt.Errorf("import: read archive header: %w", err)
+	}
+	return bytes.Equal(head, zipLocalHeader), nil
 }
 
 func readAllStaged(r *stagedArchiveReader, maxBytes int64) ([]byte, error) {
@@ -201,60 +229,60 @@ func readAllStaged(r *stagedArchiveReader, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("import: read archive: %w", err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, limitExceededErr("import: conversations.json exceeds size limit")
+		return nil, limitExceededErr(ImportDetailTooLarge, "import: conversations file exceeds size limit")
 	}
 	return data, nil
 }
 
 func (a *importArchive) validateAndIndex(source string) error {
 	if len(a.zr.File) > MaxImportEntries {
-		return limitExceededErr("import: archive has too many entries")
+		return limitExceededErr(ImportDetailTooManyEntries, "import: archive has too many entries")
 	}
 	var totalUncompressed uint64
 	names := make([]string, 0, len(a.zr.File))
+	var conversationsCandidates []string
 	for _, f := range a.zr.File {
 		info := f.FileInfo()
 		if info.IsDir() {
 			if source == string(importer.SourceTinfoilBackup) {
-				return invalidArchiveErr("import: native backup contains an unlisted directory entry")
+				return invalidArchiveErr(ImportDetailUnsafeEntry, "import: native backup contains an unlisted directory entry")
 			}
 			continue
 		}
 		mode := f.Mode()
 		if mode&os.ModeSymlink != 0 || !mode.IsRegular() {
-			return invalidArchiveErr("import: archive contains an unsafe entry")
+			return invalidArchiveErr(ImportDetailUnsafeEntry, "import: archive contains an unsafe entry")
 		}
 		name, ok := safeZipName(f.Name)
 		if !ok {
-			return invalidArchiveErr("import: archive contains an unsafe path")
+			return invalidArchiveErr(ImportDetailUnsafeEntry, "import: archive contains an unsafe path")
 		}
 		if _, dup := a.files[name]; dup {
-			return invalidArchiveErr("import: archive contains a duplicate path")
+			return invalidArchiveErr(ImportDetailUnsafeEntry, "import: archive contains a duplicate path")
 		}
 		if f.UncompressedSize64 > uint64(MaxImportJSONBytes) {
-			return limitExceededErr("import: archive entry exceeds size limit")
+			return limitExceededErr(ImportDetailTooLarge, "import: archive entry exceeds size limit")
 		}
 		totalUncompressed += f.UncompressedSize64
 		if totalUncompressed > uint64(MaxImportUncompressedBytes) {
-			return limitExceededErr("import: archive uncompressed size exceeds limit")
+			return limitExceededErr(ImportDetailTooLarge, "import: archive uncompressed size exceeds limit")
 		}
 		a.files[name] = f
 		names = append(names, name)
-		if a.conversationsName == "" || preferConversations(name, a.conversationsName) {
-			if path.Base(name) == "conversations.json" {
-				a.conversationsName = name
-			}
+		if isConversationsFile(name) {
+			conversationsCandidates = append(conversationsCandidates, name)
 		}
 	}
 	a.index = importer.NewIndex(names)
 	if source == string(importer.SourceTinfoilBackup) {
 		if _, ok := a.files[nativeManifestPath]; !ok {
-			return invalidArchiveErr("import: archive is missing manifest.json")
+			return invalidArchiveErr(ImportDetailMissingManifest, "import: archive is missing manifest.json")
 		}
 		return nil
 	}
-	if a.conversationsName == "" {
-		return invalidArchiveErr("import: archive is missing conversations.json")
+	a.conversationsFiles = selectConversationsFiles(conversationsCandidates)
+	if len(a.conversationsFiles) == 0 {
+		return invalidArchiveErr(ImportDetailMissingConversations, "import: archive is missing conversations.json")
 	}
 	return nil
 }
@@ -274,15 +302,59 @@ func (a *importArchive) readEntry(name string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("import: read archive entry: %w", err)
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, limitExceededErr("import: archive entry exceeds size limit")
+		return nil, limitExceededErr(ImportDetailTooLarge, "import: archive entry exceeds size limit")
 	}
 	return data, nil
 }
 
-// preferConversations prefers the shallowest conversations.json so a
-// root-level file wins over a nested one.
-func preferConversations(candidate, current string) bool {
-	return strings.Count(candidate, "/") < strings.Count(current, "/")
+// splitConversationsFile matches the parts of a split export. ChatGPT
+// writes conversations-000.json, conversations-001.json, ... instead of
+// one conversations.json once an account's history is large.
+var splitConversationsFile = regexp.MustCompile(`^conversations-([0-9]+)\.json$`)
+
+func isConversationsFile(name string) bool {
+	base := path.Base(name)
+	return base == "conversations.json" || splitConversationsFile.MatchString(base)
+}
+
+// selectConversationsFiles returns every conversations file in the
+// shallowest directory that has one, so a root-level export wins over a
+// nested copy. Split parts are read in numeric order.
+func selectConversationsFiles(candidates []string) []string {
+	if len(candidates) == 0 {
+		return nil
+	}
+	shallowest := candidates[0]
+	for _, name := range candidates[1:] {
+		if strings.Count(name, "/") < strings.Count(shallowest, "/") {
+			shallowest = name
+		}
+	}
+	dir := path.Dir(shallowest)
+	var selected []string
+	for _, name := range candidates {
+		if path.Dir(name) == dir {
+			selected = append(selected, name)
+		}
+	}
+	sort.SliceStable(selected, func(i, j int) bool {
+		return conversationsFileOrder(selected[i]) < conversationsFileOrder(selected[j])
+	})
+	return selected
+}
+
+// conversationsFileOrder sorts conversations.json first, then split
+// parts by their number.
+func conversationsFileOrder(name string) int64 {
+	m := splitConversationsFile.FindStringSubmatch(path.Base(name))
+	if m == nil {
+		return -1
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return math.MaxInt64
+	}
+	return n
 }
 
 // safeZipName normalizes a ZIP entry name and rejects absolute paths
@@ -306,25 +378,40 @@ func safeZipName(name string) (string, bool) {
 	return norm, true
 }
 
-func (a *importArchive) readConversations() ([]byte, error) {
+// eachConversationsFile hands fn one conversations document at a time,
+// so a split export never holds more than one part in memory.
+func (a *importArchive) eachConversationsFile(fn func([]byte) error) error {
 	if a.zr == nil {
-		return a.plainJSON, nil
+		return fn(a.plainJSON)
 	}
-	f, ok := a.files[a.conversationsName]
+	for _, name := range a.conversationsFiles {
+		data, err := a.readConversationsFile(name)
+		if err != nil {
+			return err
+		}
+		if err := fn(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *importArchive) readConversationsFile(name string) ([]byte, error) {
+	f, ok := a.files[name]
 	if !ok {
-		return nil, invalidArchiveErr("import: conversations.json not found")
+		return nil, invalidArchiveErr(ImportDetailMissingConversations, "import: conversations file not found")
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return nil, classifyArchiveReadErr(fmt.Errorf("import: open conversations.json: %w", err))
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: open conversations file: %w", err))
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, int64(MaxImportJSONBytes)+1))
 	if err != nil {
-		return nil, classifyArchiveReadErr(fmt.Errorf("import: read conversations.json: %w", err))
+		return nil, classifyArchiveReadErr(fmt.Errorf("import: read conversations file: %w", err))
 	}
 	if int64(len(data)) > int64(MaxImportJSONBytes) {
-		return nil, limitExceededErr("import: conversations.json exceeds size limit")
+		return nil, limitExceededErr(ImportDetailTooLarge, "import: conversations file exceeds size limit")
 	}
 	return data, nil
 }

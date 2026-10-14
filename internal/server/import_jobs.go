@@ -73,6 +73,7 @@ type ImportJobState struct {
 	warnings        []string
 	errs            []string
 	failureReason   ImportFailureReason
+	failureDetail   ImportFailureDetail
 	startedRun      bool
 	updatedAt       time.Time
 
@@ -91,6 +92,7 @@ type ImportJobSnapshot struct {
 	Errors          []string
 	ProjectMappings map[string]string
 	FailureReason   ImportFailureReason
+	FailureDetail   ImportFailureDetail
 }
 
 func (j *ImportJobState) Snapshot() ImportJobSnapshot {
@@ -118,6 +120,7 @@ func (j *ImportJobState) Snapshot() ImportJobSnapshot {
 		Errors:          errs,
 		ProjectMappings: projectMappings,
 		FailureReason:   j.failureReason,
+		FailureDetail:   j.failureDetail,
 	}
 }
 
@@ -239,16 +242,16 @@ func (j *ImportJobState) lastProgress() time.Time {
 }
 
 func (j *ImportJobState) finish(status ImportJobStatus) {
-	j.finishWithReason(status, "")
+	j.finishWithReason(status, "", "")
 }
 
 // fail records why the job ended so the status response and the
 // controlplane notification can tell the user what went wrong.
-func (j *ImportJobState) fail(reason ImportFailureReason) {
-	j.finishWithReason(ImportJobFailed, reason)
+func (j *ImportJobState) fail(reason ImportFailureReason, detail ImportFailureDetail) {
+	j.finishWithReason(ImportJobFailed, reason, detail)
 }
 
-func (j *ImportJobState) finishWithReason(status ImportJobStatus, reason ImportFailureReason) {
+func (j *ImportJobState) finishWithReason(status ImportJobStatus, reason ImportFailureReason, detail ImportFailureDetail) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.status == ImportJobCompleted || j.status == ImportJobFailed {
@@ -256,6 +259,7 @@ func (j *ImportJobState) finishWithReason(status ImportJobStatus, reason ImportF
 	}
 	j.status = status
 	j.failureReason = reason
+	j.failureDetail = detail
 	j.updatedAt = time.Now().UTC()
 	cryptopkg.Zero(j.cek)
 	cryptopkg.Zero(j.stagingKey)
@@ -418,10 +422,11 @@ func (c *ImportCoordinator) run(parentCtx context.Context, deps Deps, sess Sessi
 	stopWatchdog()
 	if err != nil {
 		reason := classifyImportFailure(ctx, err)
+		detail := importFailureDetail(err, reason)
 		job.addError(importFailureMessage(reason))
 		snap := job.Snapshot()
-		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason)
-		job.fail(reason)
+		notifyImportFailed(ctx, deps, job.UserID, job.ID, job.Source, snap.Imported, snap.Failed, reason, detail)
+		job.fail(reason, detail)
 	} else {
 		job.finish(ImportJobCompleted)
 	}
