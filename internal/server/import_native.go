@@ -524,7 +524,7 @@ func runNativeBackupImport(ctx context.Context, deps Deps, sess Session, job *Im
 		}
 		_, outcome, err := restoreNativeEntity(ctx, deps, sess, cekB64, backup.manifest.SourceBackupID, "chat", chat.meta.SourceID, "", func(id string, marker importer.RestoreMarker) ([]byte, map[string]any, []string, error) {
 			payload, attachmentIDs, err := buildNativeChatPayload(ctx, deps, sess, arch, backup, job, id, projectID, marker, chat.payload)
-			metadata := map[string]any{"messageCount": len(chat.payload.Messages)}
+			metadata := map[string]any{}
 			if projectID != "" {
 				metadata["projectId"] = projectID
 			}

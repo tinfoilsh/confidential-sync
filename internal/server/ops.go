@@ -124,16 +124,13 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		return nil, err
 	}
 
-	// messageCount is metadata-only (the chat-list UI uses it for the
-	// "empty chat" predicate). It is NOT mixed into the op-hash: the
-	// controlplane is the authority on that column and could tamper
-	// with it post-write regardless. Mixing it in would only force
-	// retries to recompute the hash without changing the threat
-	// model. The same reasoning applies to projectId — it surfaces
-	// in list-status so cross-project moves propagate without
-	// decrypting the row. profile_sync_protocol is different because
-	// it controls whether an overwrite is accepted, so it is bound
-	// into the operation hash above.
+	// projectId is metadata-only: it surfaces in list-status so
+	// cross-project moves propagate without decrypting the row. It is
+	// NOT mixed into the op-hash — the controlplane is the authority
+	// on that column and could tamper with it post-write regardless.
+	// profile_sync_protocol is different because it controls whether
+	// an overwrite is accepted, so it is bound into the operation
+	// hash above.
 	projectIDSet, projectID := projectIDFromMetadata(req.Scope, req.Metadata)
 	// Chat pushes report which buckets-backed attachments the plaintext
 	// still references so the controlplane can mark the rest for
@@ -159,7 +156,6 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		RequestID:           requestIDFromContext(ctx),
 		ProfileSyncProtocol: profileSyncProtocol,
 		Ciphertext:          envBlob,
-		MessageCount:        messageCountFromMetadata(req.Scope, req.Metadata),
 		ProjectIDSet:        projectIDSet,
 		ProjectID:           projectID,
 		AttachmentRefs:      attachmentRefs,
@@ -1352,36 +1348,6 @@ func projectIDFromMetadata(scope string, metadata map[string]any) (set bool, val
 		return true, nil
 	default:
 		return false, nil
-	}
-}
-
-// messageCountFromMetadata pulls the optional `messageCount` field
-// out of a chat push's metadata map. Returns nil for non-chat scopes
-// or when the metadata is missing/malformed; the controlplane treats
-// a missing X-Message-Count as "don't change the column" on update
-// and "0" on insert.
-func messageCountFromMetadata(scope string, metadata map[string]any) *int {
-	if scope != string(envelope.ScopeChat) {
-		return nil
-	}
-	raw, ok := metadata["messageCount"]
-	if !ok {
-		return nil
-	}
-	switch v := raw.(type) {
-	case float64:
-		if v < 0 {
-			return nil
-		}
-		n := int(v)
-		return &n
-	case int:
-		if v < 0 {
-			return nil
-		}
-		return &v
-	default:
-		return nil
 	}
 }
 
