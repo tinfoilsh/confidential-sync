@@ -121,6 +121,10 @@ func TestImportJobFailsConversationWithoutUpdateTime(t *testing.T) {
 	if len(f.cp.blobs) != 1 {
 		t.Fatalf("expected only the dated chat to be sealed, got %d blobs", len(f.cp.blobs))
 	}
+	datedID := deterministicChatID(f.userSub, importer.SourceTinfoil, "dated", time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC))
+	if payload := decryptNativeTestBlob(t, f, "chat", datedID); payload["title"] != "Dated" {
+		t.Fatalf("sealed chat title=%v, want the dated conversation", payload["title"])
+	}
 }
 
 func TestImportJobSkipsPreReleaseDeterministicChat(t *testing.T) {
