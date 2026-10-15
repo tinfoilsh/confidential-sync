@@ -330,6 +330,29 @@ func TestParseTinfoilRoundTripShape(t *testing.T) {
 	}
 }
 
+func TestParseCarriesConversationTimestamps(t *testing.T) {
+	created := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	updated := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, tc := range []struct {
+		source Source
+		data   string
+	}{
+		{SourceChatGPT, `[{"id":"c","title":"T","create_time":1700000000,"update_time":1704164645,"mapping":{"root":{"id":"root","children":["u"]},"u":{"id":"u","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["hi"]}}}}}]`},
+		{SourceClaude, `[{"uuid":"c","name":"T","created_at":"2023-11-14T22:13:20Z","updated_at":"2024-01-02T03:04:05Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2023-11-14T22:13:21Z"}]}]`},
+		{SourceTinfoil, `[{"uuid":"c","name":"T","created_at":"2023-11-14T22:13:20.000Z","updated_at":"2024-01-02T03:04:05.000Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2023-11-14T22:13:21.000Z"}]}]`},
+	} {
+		t.Run(string(tc.source), func(t *testing.T) {
+			chats, _ := collect(t, tc.source, []byte(tc.data), nil)
+			if len(chats) != 1 {
+				t.Fatalf("expected 1 chat, got %d", len(chats))
+			}
+			if !chats[0].CreatedAt.Equal(created) || !chats[0].UpdatedAt.Equal(updated) {
+				t.Fatalf("createdAt=%v updatedAt=%v, want %v/%v", chats[0].CreatedAt.Time, chats[0].UpdatedAt.Time, created, updated)
+			}
+		})
+	}
+}
+
 // TestSealedJSONShape asserts the emitted chat serializes into the
 // camelCase shape the webapp StoredChat reader expects, with ISO-8601
 // timestamps and no parser-only fields leaking in.
@@ -338,6 +361,7 @@ func TestSealedJSONShape(t *testing.T) {
 		ID:        "abc",
 		Title:     "T",
 		CreatedAt: jsTime{time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)},
+		UpdatedAt: jsTime{time.Date(2023, 11, 15, 8, 0, 0, 0, time.UTC)},
 		StableKey: "should-not-serialize",
 		Messages: []Message{
 			{
@@ -360,6 +384,7 @@ func TestSealedJSONShape(t *testing.T) {
 	for _, want := range []string{
 		`"id":"abc"`,
 		`"createdAt":"2023-11-14T22:13:20.000Z"`,
+		`"updatedAt":"2023-11-15T08:00:00.000Z"`,
 		`"timestamp":"2023-11-14T22:13:21.000Z"`,
 		`"isLocalOnly":false`,
 		`"fileName":"p.png"`,

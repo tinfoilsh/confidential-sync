@@ -106,6 +106,7 @@ func buildTinfoilChat(conv *tinfoilConversation, opts Options) *Chat {
 		Title:       title,
 		Messages:    messages,
 		CreatedAt:   jsTime{createdAt},
+		UpdatedAt:   jsTime{parseISOTime(conv.UpdatedAt)},
 		IsLocalOnly: false,
 		ProjectID:   conv.ProjectID,
 		StableKey:   stableKey,

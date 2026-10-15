@@ -12,7 +12,7 @@ import (
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
-const retryTestArchive = `[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`
+const retryTestArchive = `[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`
 
 // stubImportSleep records requested backoff delays without waiting.
 func stubImportSleep(t *testing.T) *[]time.Duration {
