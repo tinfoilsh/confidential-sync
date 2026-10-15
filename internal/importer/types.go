@@ -80,6 +80,7 @@ type Chat struct {
 	Title       string         `json:"title"`
 	Messages    []Message      `json:"messages"`
 	CreatedAt   jsTime         `json:"createdAt"`
+	UpdatedAt   jsTime         `json:"updatedAt"`
 	IsLocalOnly bool           `json:"isLocalOnly"`
 	ProjectID   string         `json:"projectId,omitempty"`
 	Restore     *RestoreMarker `json:"_restore,omitempty"`

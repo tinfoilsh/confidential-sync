@@ -213,6 +213,12 @@ func (t *importChatTally) publishLocked() {
 // per-chat failure is tallied and returns nil so the rest of the
 // archive proceeds; only definitive errors abort the job.
 func importOneChat(ctx context.Context, deps Deps, sess Session, arch *importArchive, chat *importer.Chat, priorID, cekB64 string, job *ImportJobState, tally *importChatTally) error {
+	// Clients require both timestamps on every chat; iOS cannot open one
+	// sealed without them.
+	if chat.CreatedAt.IsZero() || chat.UpdatedAt.IsZero() {
+		tally.recordFailed("chat failed: conversation has no creation or update time")
+		return nil
+	}
 	// The probe looks up the pre-release id family, which differs
 	// from the id the push writes under, so the push's idempotency
 	// cannot dedupe against a legacy row. If the probe is still

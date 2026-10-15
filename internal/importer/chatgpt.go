@@ -157,6 +157,7 @@ func buildChatGPTChat(conv *chatgptConversation, opts Options) *Chat {
 		Title:       title,
 		Messages:    messages,
 		CreatedAt:   jsTime{createdAt},
+		UpdatedAt:   jsTime{unixSeconds(conv.UpdateTime)},
 		IsLocalOnly: false,
 		StableKey:   stableKey,
 	}

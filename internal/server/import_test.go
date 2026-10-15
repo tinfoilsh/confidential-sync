@@ -70,7 +70,7 @@ func TestImportJobPlainJSONRoundTrip(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-03-01T12:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
 
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.cek = append([]byte(nil), f.userKey...)
@@ -89,6 +89,42 @@ func TestImportJobPlainJSONRoundTrip(t *testing.T) {
 	if atomic.LoadInt32(&notified) != 1 {
 		t.Fatalf("expected one completion notification, got %d", notified)
 	}
+	chatID := deterministicChatID(f.userSub, importer.SourceTinfoil, "conv-1", time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC))
+	payload := decryptNativeTestBlob(t, f, "chat", chatID)
+	if payload["createdAt"] != "2024-01-01T00:00:00.000Z" || payload["updatedAt"] != "2024-03-01T12:00:00.000Z" {
+		t.Fatalf("createdAt=%v updatedAt=%v, want the conversation's export timestamps", payload["createdAt"], payload["updatedAt"])
+	}
+}
+
+func TestImportJobFailsConversationWithoutUpdateTime(t *testing.T) {
+	f := newFixture(t)
+	f.cp.currentKID = f.userKeyID
+	f.cp.mux.HandleFunc("POST /api/sync/notify-import-complete", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	archive := []byte(`[` +
+		`{"uuid":"dated","name":"Dated","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-02T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]},` +
+		`{"uuid":"undated","name":"Undated","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}` +
+		`]`)
+	job := stageArchive(t, f, "tinfoil", archive)
+	job.cek = append([]byte(nil), f.userKey...)
+
+	if err := runImportJob(context.Background(), f.handler.deps, importSession(f), job); err != nil {
+		t.Fatalf("runImportJob: %v", err)
+	}
+
+	snap := job.Snapshot()
+	if snap.Imported != 1 || snap.Failed != 1 {
+		t.Fatalf("imported=%d failed=%d, want 1/1 (errors=%v)", snap.Imported, snap.Failed, snap.Errors)
+	}
+	if len(f.cp.blobs) != 1 {
+		t.Fatalf("expected only the dated chat to be sealed, got %d blobs", len(f.cp.blobs))
+	}
+	datedID := deterministicChatID(f.userSub, importer.SourceTinfoil, "dated", time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC))
+	if payload := decryptNativeTestBlob(t, f, "chat", datedID); payload["title"] != "Dated" {
+		t.Fatalf("sealed chat title=%v, want the dated conversation", payload["title"])
+	}
 }
 
 func TestImportJobSkipsPreReleaseDeterministicChat(t *testing.T) {
@@ -105,7 +141,7 @@ func TestImportJobSkipsPreReleaseDeterministicChat(t *testing.T) {
 		t.Fatalf("seed prior import: %v", err)
 	}
 
-	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"conv-1","name":"Hello","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi there","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.cek = append([]byte(nil), f.userKey...)
 
@@ -141,7 +177,7 @@ func TestImportJobZipWithImage(t *testing.T) {
 	})
 
 	pngBytes := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x42}, 64)...)
-	conversations := []byte(`[{"uuid":"conv-img","name":"Pic","created_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"look","created_at":"2024-02-02T00:00:00Z","attachments":[{"type":"image","fileName":"file-1.png","mimeType":"image/png","exportPath":"attachments/file-1.png"}]}]}]`)
+	conversations := []byte(`[{"uuid":"conv-img","name":"Pic","created_at":"2024-02-02T00:00:00Z","updated_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"look","created_at":"2024-02-02T00:00:00Z","attachments":[{"type":"image","fileName":"file-1.png","mimeType":"image/png","exportPath":"attachments/file-1.png"}]}]}]`)
 
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -175,7 +211,7 @@ func TestImportJobSkipsUnsupportedBinaryDocument(t *testing.T) {
 	})
 
 	pdfBytes := []byte("%PDF-1.7\n")
-	conversations := []byte(`[{"id":"conv-doc","title":"Doc","create_time":1706832000,"mapping":{"root":{"id":"root","children":["msg"]},"msg":{"id":"msg","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["read this"]},"metadata":{"attachments":[{"id":"file-doc","name":"doc.pdf","mime_type":"application/pdf"}]}}}}}]`)
+	conversations := []byte(`[{"id":"conv-doc","title":"Doc","create_time":1706832000,"update_time":1706832000,"mapping":{"root":{"id":"root","children":["msg"]},"msg":{"id":"msg","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["read this"]},"metadata":{"attachments":[{"id":"file-doc","name":"doc.pdf","mime_type":"application/pdf"}]}}}}}]`)
 
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -205,7 +241,7 @@ func TestImportJobSkipsUnsupportedBinaryDocument(t *testing.T) {
 }
 
 func chatgptConversation(id string, createTime int64) string {
-	return fmt.Sprintf(`{"id":%q,"title":%q,"create_time":%d,"mapping":{"root":{"id":"root","children":["msg"]},"msg":{"id":"msg","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["hello"]}}}}}`, id, "Chat "+id, createTime)
+	return fmt.Sprintf(`{"id":%q,"title":%q,"create_time":%d,"update_time":%d,"mapping":{"root":{"id":"root","children":["msg"]},"msg":{"id":"msg","parent":"root","message":{"author":{"role":"user"},"content":{"content_type":"text","parts":["hello"]}}}}}`, id, "Chat "+id, createTime, createTime)
 }
 
 func zipArchive(t *testing.T, entries ...[2]string) []byte {
@@ -412,7 +448,7 @@ func TestImportJobSkipsUnresolvedTinfoilImages(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	archive := []byte(`[{"uuid":"conv-img-missing","name":"Pic","created_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"look","created_at":"2024-02-02T00:00:00Z","attachments":[{"id":"img-1","type":"image","fileName":"missing.png","mimeType":"image/png"}]}]}]`)
+	archive := []byte(`[{"uuid":"conv-img-missing","name":"Pic","created_at":"2024-02-02T00:00:00Z","updated_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"look","created_at":"2024-02-02T00:00:00Z","attachments":[{"id":"img-1","type":"image","fileName":"missing.png","mimeType":"image/png"}]}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.cek = append([]byte(nil), f.userKey...)
 
@@ -439,7 +475,7 @@ func TestImportJobSkipsTinfoilDocumentsWithoutContent(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	archive := []byte(`[{"uuid":"conv-doc-empty","name":"Doc","created_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"read this","created_at":"2024-02-02T00:00:00Z","attachments":[{"id":"doc-1","type":"document","fileName":"missing.pdf"}]}]}]`)
+	archive := []byte(`[{"uuid":"conv-doc-empty","name":"Doc","created_at":"2024-02-02T00:00:00Z","updated_at":"2024-02-02T00:00:00Z","chat_messages":[{"sender":"human","text":"read this","created_at":"2024-02-02T00:00:00Z","attachments":[{"id":"doc-1","type":"document","fileName":"missing.pdf"}]}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.cek = append([]byte(nil), f.userKey...)
 
@@ -469,7 +505,7 @@ func tinfoilArchiveWithChats(n int) []byte {
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		fmt.Fprintf(&sb, `{"uuid":"conv-%d","name":"Chat %d","created_at":"2024-01-01T00:00:%02dZ","chat_messages":[{"sender":"human","text":"hi %d","created_at":"2024-01-01T00:00:00Z"}]}`, i, i, i%60, i)
+		fmt.Fprintf(&sb, `{"uuid":"conv-%d","name":"Chat %d","created_at":"2024-01-01T00:00:%02dZ","updated_at":"2024-01-01T00:00:%02dZ","chat_messages":[{"sender":"human","text":"hi %d","created_at":"2024-01-01T00:00:00Z"}]}`, i, i, i%60, i%60, i)
 	}
 	sb.WriteString("]")
 	return []byte(sb.String())
@@ -568,7 +604,7 @@ func TestImportJobEnforcesMessageLimit(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 
-	archive := []byte(`[{"uuid":"conv-many","name":"Many","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"conv-many","name":"Many","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.cek = append([]byte(nil), f.userKey...)
 
@@ -593,7 +629,7 @@ func TestImportJobRejectsHashMismatch(t *testing.T) {
 	f := newFixture(t)
 	f.cp.currentKID = f.userKeyID
 
-	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	job.ArchiveSHA256 = hashOf([]byte("different"))
 	job.cek = append([]byte(nil), f.userKey...)
@@ -688,7 +724,7 @@ func TestImportJobStallReportsTimeout(t *testing.T) {
 	f.cp.currentKID = f.userKeyID
 	notified := captureImportNotifications(t, f)
 
-	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job := stageArchive(t, f, "tinfoil", archive)
 	coord := NewImportCoordinator()
 	coord.stallTimeout = 200 * time.Millisecond
@@ -760,7 +796,7 @@ func TestImportJobStaleKeyReportsKeyMismatch(t *testing.T) {
 func TestStageImportChunkDoesNotRecordFailedPut(t *testing.T) {
 	f := newFixture(t)
 	coord := NewImportCoordinator()
-	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 	job, err := coord.Create(f.userSub, ImportCreateRequest{
 		Source:        "tinfoil",
 		TotalBytes:    int64(len(archive)),
@@ -806,7 +842,7 @@ func TestImportStagingCleanupExpiresStaleJobs(t *testing.T) {
 	// is invoked directly below to make the test deterministic.
 	f.handler.importCoordinator.stagingRetention = time.Hour
 	tok := f.jwt()
-	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 
 	resp, body := f.post("/v1/import/create", ImportCreateRequest{
 		Source:        "tinfoil",
@@ -877,7 +913,7 @@ func TestImportStagingCleanupLeavesRunningJobs(t *testing.T) {
 func TestImportStatusRequiresMatchingJobID(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
-	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
+	archive := []byte(`[{"uuid":"c","name":"n","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"hi","created_at":"2024-01-01T00:00:00Z"}]}]`)
 
 	resp, body := f.post("/v1/import/create", ImportCreateRequest{
 		Source:        "tinfoil",

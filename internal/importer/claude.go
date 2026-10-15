@@ -115,6 +115,7 @@ func buildClaudeChat(conv *claudeConversation, opts Options) *Chat {
 		Title:       title,
 		Messages:    messages,
 		CreatedAt:   jsTime{createdAt},
+		UpdatedAt:   jsTime{parseISOTime(conv.UpdatedAt)},
 		IsLocalOnly: false,
 		StableKey:   stableKey,
 	}
