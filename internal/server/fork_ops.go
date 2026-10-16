@@ -117,7 +117,7 @@ func Fork(ctx context.Context, deps Deps, sess Session, req ForkRequest) (*ForkR
 		return nil, err
 	}
 
-	metadata := map[string]any{"messageCount": req.MessageCount}
+	metadata := map[string]any{}
 	if projectID != "" {
 		metadata["projectId"] = projectID
 	}
