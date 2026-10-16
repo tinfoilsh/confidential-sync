@@ -328,7 +328,7 @@ func sealImportedChat(
 		return fmt.Errorf("import: marshal chat: %w", err)
 	}
 
-	metadata := map[string]any{"messageCount": len(chat.Messages)}
+	metadata := map[string]any{}
 	if chat.ProjectID != "" {
 		metadata["projectId"] = chat.ProjectID
 	}

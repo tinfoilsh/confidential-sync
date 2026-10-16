@@ -30,7 +30,6 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"HeaderIdempotency":         {HeaderIdempotency, "X-Idempotency-Key"},
 			"HeaderOperationHash":       {HeaderOperationHash, "X-Operation-Hash"},
 			"HeaderProfileSyncProtocol": {HeaderProfileSyncProtocol, "X-Profile-Sync-Protocol"},
-			"HeaderMessageCount":        {HeaderMessageCount, "X-Message-Count"},
 			"HeaderProjectID":           {HeaderProjectID, "X-Project-Id"},
 			"HeaderProjectIDSet":        {HeaderProjectIDSet, "X-Project-Id-Set"},
 			"HeaderAttachmentRefs":      {HeaderAttachmentRefs, "X-Attachment-Refs"},

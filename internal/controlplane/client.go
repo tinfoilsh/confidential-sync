@@ -72,7 +72,6 @@ const (
 	HeaderOperationHash       = "X-Operation-Hash"
 	HeaderSyncProtocol        = "X-Sync-Protocol"
 	HeaderProfileSyncProtocol = "X-Profile-Sync-Protocol"
-	HeaderMessageCount        = "X-Message-Count"
 	HeaderProjectID           = "X-Project-Id"
 	HeaderProjectIDSet        = "X-Project-Id-Set"
 	HeaderAttachmentRefs      = "X-Attachment-Refs"
@@ -243,10 +242,6 @@ type PutBlobRequest struct {
 	ProfileSyncProtocol int
 	Rewrap              bool
 	Ciphertext          []byte
-	// MessageCount is forwarded as X-Message-Count for chat scope so
-	// the controlplane can persist the legacy column. Nil for scopes
-	// other than chat and for rewrap.
-	MessageCount *int
 	// ProjectIDSet means "overwrite the controlplane's project_id
 	// column with ProjectID". When ProjectIDSet is false the column
 	// is left untouched. Nil ProjectID + ProjectIDSet=true clears
@@ -434,9 +429,6 @@ func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobR
 	}
 	if req.ProfileSyncProtocol > 0 {
 		httpReq.Header.Set(HeaderProfileSyncProtocol, strconv.Itoa(req.ProfileSyncProtocol))
-	}
-	if req.MessageCount != nil {
-		httpReq.Header.Set(HeaderMessageCount, strconv.Itoa(*req.MessageCount))
 	}
 	if req.ProjectIDSet {
 		httpReq.Header.Set(HeaderProjectIDSet, "1")

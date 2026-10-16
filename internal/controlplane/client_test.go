@@ -226,7 +226,6 @@ func TestPutBlobReplaysExactRequestAfterDroppedCommittedResponse(t *testing.T) {
 		}, nil
 	})
 	c := NewClient("https://controlplane.test", &http.Client{Transport: transport})
-	messageCount := 4
 	projectID := "project-1"
 	resp, err := c.PutBlob(context.Background(), PutBlobRequest{
 		Scope:          "chat",
@@ -239,7 +238,6 @@ func TestPutBlobReplaysExactRequestAfterDroppedCommittedResponse(t *testing.T) {
 		OperationHash:  "hash-1",
 		RequestID:      "request-1",
 		Ciphertext:     []byte("exact-ciphertext"),
-		MessageCount:   &messageCount,
 		ProjectIDSet:   true,
 		ProjectID:      &projectID,
 	})
