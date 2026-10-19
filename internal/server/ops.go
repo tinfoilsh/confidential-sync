@@ -449,9 +449,7 @@ func pullOne(
 			return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: err.Error()}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
-		if scope == envelope.ScopeChat && blob.ActivityAt == nil {
-			backfillChatActivity(ctx, deps, sess, id, blob.ETag, dec.Plaintext)
-		}
+		backfillChatActivity(ctx, deps, sess, scope, id, blob, blob.ETag, dec.Plaintext)
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -469,6 +467,7 @@ func pullOne(
 		defer cryptopkg.Zero(dec.Plaintext)
 		if canRewrap {
 			if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
+				backfillChatActivity(ctx, deps, sess, scope, id, blob, newETag, dec.Plaintext)
 				return PullItem{
 					ID: id, OK: true,
 					Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -486,6 +485,7 @@ func pullOne(
 		// plaintext so the caller can still render the row. The
 		// /v1/blobs/migrate endpoint stays available for a backstop
 		// pass that retries failed rewraps.
+		backfillChatActivity(ctx, deps, sess, scope, id, blob, blob.ETag, dec.Plaintext)
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),

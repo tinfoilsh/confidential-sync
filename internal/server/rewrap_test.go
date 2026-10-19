@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"testing"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/buckets"
@@ -85,7 +86,7 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
 
-	chatJSON := []byte(`{"id":"c1","messages":[]}`)
+	chatJSON := []byte(`{"id":"c1","createdAt":"2025-02-03T04:05:06Z","messages":[]}`)
 	f.cp.mu.Lock()
 	f.cp.currentKID = f.userKeyID
 	f.cp.blobs["chat/c1"] = &cpBlob{ETag: 1, Body: sealLegacyChatBlob(t, f.userKey, chatJSON)}
@@ -125,6 +126,13 @@ func TestPullRewrapsLegacyBareChat(t *testing.T) {
 	f.cp.mu.Unlock()
 	if envelope.Detect(after) != envelope.VersionV2 {
 		t.Fatalf("blob still legacy after auto-rewrap: %s", after)
+	}
+	// The activity backfill targets the row as rewrapped, not as read.
+	f.cp.mu.Lock()
+	backfills := f.cp.activityBackfills
+	f.cp.mu.Unlock()
+	if want := []cpActivityBackfill{{ID: "c1", ETag: "2", ActivityAt: "2025-02-03T04:05:06Z"}}; !reflect.DeepEqual(backfills, want) {
+		t.Fatalf("backfills=%+v, want %+v", backfills, want)
 	}
 }
 
@@ -196,7 +204,7 @@ func TestPullSkipsRewrapWhenNoCurrentKey(t *testing.T) {
 	f := newFixture(t)
 	tok := f.jwt()
 
-	chatJSON := []byte(`{"id":"c1","messages":[]}`)
+	chatJSON := []byte(`{"id":"c1","createdAt":"2025-02-03T04:05:06Z","messages":[]}`)
 	f.cp.mu.Lock()
 	// currentKID stays "" — a legacy account whose user_keys row was
 	// never written.
@@ -234,6 +242,13 @@ func TestPullSkipsRewrapWhenNoCurrentKey(t *testing.T) {
 	f.cp.mu.Unlock()
 	if envelope.Detect(after) == envelope.VersionV2 {
 		t.Fatalf("blob was rewrapped despite no current key; rewrap must be skipped")
+	}
+	// A row that stays legacy still gets its activity time.
+	f.cp.mu.Lock()
+	backfills := f.cp.activityBackfills
+	f.cp.mu.Unlock()
+	if want := []cpActivityBackfill{{ID: "c1", ETag: "1", ActivityAt: "2025-02-03T04:05:06Z"}}; !reflect.DeepEqual(backfills, want) {
+		t.Fatalf("backfills=%+v, want %+v", backfills, want)
 	}
 }
 

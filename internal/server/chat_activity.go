@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/envelope"
 )
 
 // chatActivityAt returns a chat's last conversation activity: the later
@@ -46,10 +49,15 @@ func chatActivityAt(plaintext []byte) (activityAt time.Time, ok bool) {
 
 // backfillChatActivity records the activity time of a chat whose row
 // was written before the controlplane tracked it, using the plaintext
-// this pull just decrypted. It is best-effort: the controlplane only
-// applies it while the row is still at etag and has no value, and a
-// failure leaves the row sorting by its write time until the next pull.
-func backfillChatActivity(ctx context.Context, deps Deps, sess Session, id, etag string, plaintext []byte) {
+// this pull just decrypted. etag is the row's current etag, which
+// differs from the one read when the pull rewrapped the row. It is
+// best-effort: the controlplane only applies it while the row is still
+// at etag and has no value, and a failure leaves the row sorting by its
+// write time until the next pull.
+func backfillChatActivity(ctx context.Context, deps Deps, sess Session, scope envelope.Scope, id string, blob *controlplane.GetBlobResponse, etag string, plaintext []byte) {
+	if scope != envelope.ScopeChat || blob.ActivityAt != nil {
+		return
+	}
 	activityAt, ok := chatActivityAt(plaintext)
 	if !ok {
 		return
