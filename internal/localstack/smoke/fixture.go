@@ -9,8 +9,8 @@
 //
 //	go test -tags=smoke -v ./internal/localstack/smoke
 //
-// Each test file maps to one invariant; the bug-to-test mapping is in
-// LOCAL_TESTING.md and §16.26 of syncplan.md.
+// Each test file maps to one invariant; the comment above each test
+// states the invariant it guards and the regression it catches.
 package smoke
 
 import (

@@ -25,7 +25,7 @@ export SYNC_ENCLAVE_SECRET="your-shared-service-secret"
 go run .
 ```
 
-For development without real upstreams, `go run ./cmd/local-stack` starts an in-process control plane, JWKS issuer, and minted credentials. See [LOCAL_TESTING.md](LOCAL_TESTING.md) for the full runbook.
+For development without real upstreams, `go run ./cmd/local-stack` starts an in-process control plane, JWKS issuer, and minted credentials. See [DEVELOPMENT.md](DEVELOPMENT.md) for more.
 
 ## Architecture Overview
 
