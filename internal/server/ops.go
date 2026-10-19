@@ -255,11 +255,11 @@ func chatAttachmentRefs(plaintext []byte) []string {
 	return refs
 }
 
-// operationHashForBlob derives X-Operation-Hash for a blob mutation
-// according to syncplan.md §7.0. The MAC covers the logical plaintext
-// plus stable request metadata, not the randomized v2 envelope bytes,
-// so a retry with the same idempotency key can replay after a lost
-// response instead of tripping IDEMPOTENCY_CONFLICT on a fresh nonce.
+// operationHashForBlob derives X-Operation-Hash for a blob mutation.
+// The MAC covers the logical plaintext plus stable request metadata,
+// not the randomized v2 envelope bytes, so a retry with the same
+// idempotency key can replay after a lost response instead of
+// tripping IDEMPOTENCY_CONFLICT on a fresh nonce.
 func operationHashForBlob(cek []byte, method, scope, id, keyIDHex, ifMatch, idempotencyKey string, profileSyncProtocol int, aad, plaintext []byte) (string, error) {
 	path, err := controlplane.PathFor(scope, id)
 	if err != nil {

@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// T08: §16.6 — `Delete(if_match=null)` retries on a concurrent push.
+// T08: `Delete(if_match=null)` retries on a concurrent push.
 //
 // This regression-tests the P1 fix landed in commit `8cfbc8c`. Without
 // the retry loop, a one-shot delete from the UI can be silently
@@ -65,7 +65,7 @@ func TestT08_DeleteNullIfMatchRetriesOnRace(t *testing.T) {
 	status, body := f.deleteRow("chat", "D1", nil, "T08-del")
 	hookFired.Wait()
 	if status != http.StatusOK {
-		t.Fatalf("delete(if_match=null) was dropped by a single concurrent push (§16.6 retry regression). status=%d body=%s", status, body)
+		t.Fatalf("delete(if_match=null) was dropped by a single concurrent push (retry regression). status=%d body=%s", status, body)
 	}
 	var ok struct {
 		OK bool `json:"ok"`

@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// Per syncplan.md §7.0, both the enclave and the web client carry the
-// following test vector to guarantee canonical encoding + HMAC inputs
-// match byte-for-byte. The expected hash is computed once and pinned.
+// The following test vector pins the canonical encoding and HMAC inputs
+// byte-for-byte. The expected hash is computed once and pinned.
 
 const (
 	vectorCEKHex      = "4242424242424242424242424242424242424242424242424242424242424242"
@@ -117,15 +116,16 @@ func TestCanonical_ExtendedEncodingUsesFieldPresence(t *testing.T) {
 	}
 }
 
-// TestVector_Section7_0 pins the test vector from syncplan.md §7.0.
+// TestOperationHashVector pins the operation-hash test vector above.
 // If this test fails, either:
 //
 //	(a) the canonical encoding drifted, or
 //	(b) the HKDF/HMAC parameters drifted.
 //
-// Either way the web client will start rejecting our writes (or vice
-// versa) at runtime. Treat a failure as a protocol break.
-func TestVector_Section7_0(t *testing.T) {
+// Either way, a retry of a write made before the change no longer
+// matches the hash the controlplane stored for its idempotency key and
+// fails with IDEMPOTENCY_CONFLICT. Treat a failure as a protocol break.
+func TestOperationHashVector(t *testing.T) {
 	cek := mustHex(t, vectorCEKHex)
 	opKey, err := DeriveOpHashKey(cek)
 	if err != nil {
