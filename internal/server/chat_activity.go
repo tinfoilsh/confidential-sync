@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 )
@@ -41,4 +42,17 @@ func chatActivityAt(plaintext []byte) (activityAt time.Time, ok bool) {
 		}
 	}
 	return activityAt, !activityAt.IsZero()
+}
+
+// backfillChatActivity records the activity time of a chat whose row
+// was written before the controlplane tracked it, using the plaintext
+// this pull just decrypted. It is best-effort: the controlplane only
+// applies it while the row is still at etag and has no value, and a
+// failure leaves the row sorting by its write time until the next pull.
+func backfillChatActivity(ctx context.Context, deps Deps, sess Session, id, etag string, plaintext []byte) {
+	activityAt, ok := chatActivityAt(plaintext)
+	if !ok {
+		return
+	}
+	_ = deps.Controlplane.BackfillChatActivity(ctx, sess.RawJWT, sess.Claims.Subject, id, etag, activityAt)
 }

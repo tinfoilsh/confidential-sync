@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +98,14 @@ type cpStub struct {
 	purgeClaims    map[string]string // attachmentID → claim token
 	purgeRequests  int
 	bucketsDeletes map[string]int
+	// activityBackfills records every chat-activity backfill request.
+	activityBackfills []cpActivityBackfill
+}
+
+type cpActivityBackfill struct {
+	ID         string `json:"id"`
+	ETag       string `json:"etag"`
+	ActivityAt string `json:"activity_at"`
 }
 
 type cpNeedsMigration struct {
@@ -165,6 +174,7 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.handleDeleteAllProjects)
 	// rewrap (separate JSON endpoint; not the PUT blob path)
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
+	s.mux.HandleFunc("POST "+controlplane.ChatActivityPath, s.handleBackfillChatActivity)
 	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
 	s.mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.handleBackupInventory)
@@ -327,8 +337,27 @@ func (s *cpStub) handleGetBlob(scope string) http.HandlerFunc {
 				w.Header().Set("X-Project-Id", *blob.ProjectID)
 			}
 		}
+		if scope == "chat" && blob.ActivityAt != nil {
+			w.Header().Set(controlplane.HeaderActivityAt, blob.ActivityAt.Format(time.RFC3339Nano))
+		}
 		w.Write(blob.Body)
 	}
+}
+
+func (s *cpStub) handleBackfillChatActivity(w http.ResponseWriter, r *http.Request) {
+	var req cpActivityBackfill
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.activityBackfills = append(s.activityBackfills, req)
+	updated := false
+	activityAt, err := time.Parse(time.RFC3339Nano, req.ActivityAt)
+	if blob := s.blobs[s.putBlobKey("chat", req.ID)]; err == nil && blob != nil && blob.ActivityAt == nil && formatETag(blob.ETag) == req.ETag {
+		blob.ActivityAt = &activityAt
+		updated = true
+	}
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": updated})
 }
 
 func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
@@ -1140,6 +1169,47 @@ func TestPushReportsChatActivityFromPlaintext(t *testing.T) {
 	}
 	if got := f.cp.blobs["project/project-activity"].ActivityAt; got != nil {
 		t.Fatalf("project reported activity %s", got)
+	}
+}
+
+func TestPullBackfillsActivityOnlyForChatsWithoutIt(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "legacy-chat",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"createdAt":"2025-01-01T00:00:00Z","messages":[{"timestamp":"2025-06-07T08:09:10Z"}]}`)),
+		IdempotencyKey: "legacy-push",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("push: %d %s", resp.StatusCode, body)
+	}
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/legacy-chat"].ActivityAt = nil
+	etag := formatETag(f.cp.blobs["chat/legacy-chat"].ETag)
+	f.cp.mu.Unlock()
+
+	pull := func() {
+		t.Helper()
+		resp, body := f.post("/v1/sync/pull", PullRequest{
+			Scope: "chat",
+			IDs:   []string{"legacy-chat"},
+			Keys:  []PullKey{{Key: f.userKeyB64}},
+		}, tok)
+		var out PullResponse
+		if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &out) != nil || len(out.Items) != 1 || !out.Items[0].OK {
+			t.Fatalf("pull: %d %s", resp.StatusCode, body)
+		}
+	}
+	pull()
+	pull()
+
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	want := []cpActivityBackfill{{ID: "legacy-chat", ETag: etag, ActivityAt: "2025-06-07T08:09:10Z"}}
+	if !reflect.DeepEqual(f.cp.activityBackfills, want) {
+		t.Fatalf("backfills=%+v, want %+v", f.cp.activityBackfills, want)
 	}
 }
 

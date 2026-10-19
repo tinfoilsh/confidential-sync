@@ -38,7 +38,8 @@ type StubBlob struct {
 	ProjectID    *string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
-	// ActivityAt mirrors chats.activity_at: nil until a write reports one.
+	// ActivityAt mirrors chats.activity_at: nil until a write reports
+	// one or the enclave backfills it.
 	ActivityAt *time.Time
 }
 
@@ -139,6 +140,7 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.deleteAllProjects)
+	mux.HandleFunc("POST "+controlplane.ChatActivityPath, s.backfillChatActivity)
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
 	mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.backupInventory)
 	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
@@ -391,8 +393,42 @@ func (s *StubCP) getBlob(scope string) http.HandlerFunc {
 				w.Header().Set(controlplane.HeaderProjectID, *blob.ProjectID)
 			}
 		}
+		if scope == "chat" && blob.ActivityAt != nil {
+			w.Header().Set(controlplane.HeaderActivityAt, blob.ActivityAt.Format(time.RFC3339Nano))
+		}
 		_, _ = w.Write(blob.Body)
 	}
+}
+
+// backfillChatActivity mirrors the controlplane's chat-activity route:
+// it fills an unset activity time only for the revision the enclave
+// read, clamped to that revision's write time.
+func (s *StubCP) backfillChatActivity(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID         string `json:"id"`
+		ETag       string `json:"etag"`
+		ActivityAt string `json:"activity_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	activityAt, err := time.Parse(time.RFC3339Nano, req.ActivityAt)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	updated := false
+	if blob := s.blobs[blobKey("chat", req.ID)]; blob != nil && blob.ActivityAt == nil && formatETag(blob.ETag) == req.ETag {
+		if activityAt.After(blob.UpdatedAt) {
+			activityAt = blob.UpdatedAt
+		}
+		blob.ActivityAt = &activityAt
+		updated = true
+	}
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": updated})
 }
 
 func (s *StubCP) delBlob(scope string) http.HandlerFunc {

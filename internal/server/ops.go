@@ -449,6 +449,9 @@ func pullOne(
 			return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: err.Error()}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
+		if scope == envelope.ScopeChat && blob.ActivityAt == nil {
+			backfillChatActivity(ctx, deps, sess, id, blob.ETag, dec.Plaintext)
+		}
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),

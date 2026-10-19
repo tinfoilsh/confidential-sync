@@ -314,6 +314,9 @@ type GetBlobResponse struct {
 	KeyID        string
 	ProjectIDSet bool
 	ProjectID    *string
+	// ActivityAt is the chat row's recorded activity time. Nil means the
+	// row predates activity tracking and sorts by its write time.
+	ActivityAt *time.Time
 }
 
 func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
@@ -602,6 +605,11 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string
 		out.ProjectIDSet = true
 		if projectID := resp.Header.Get(HeaderProjectID); projectID != "" {
 			out.ProjectID = &projectID
+		}
+	}
+	if scope == "chat" {
+		if activityAt, err := time.Parse(time.RFC3339Nano, resp.Header.Get(HeaderActivityAt)); err == nil {
+			out.ActivityAt = &activityAt
 		}
 	}
 	return out, nil
@@ -996,6 +1004,41 @@ func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt, cle
 	endpoint := c.baseURL + "/api/sync/migration-failure"
 	body, _ := json.Marshal(map[string]string{"scope": scope, "id": id})
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return parseError(resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+// ChatActivityPath is the controlplane endpoint that fills in the
+// activity time of a chat row written before it was tracked.
+const ChatActivityPath = "/api/sync/chat-activity"
+
+// BackfillChatActivity records the activity time derived from a chat
+// whose row has none. The controlplane applies it only while the row is
+// still at etag and has no activity time, so losing that race is not an
+// error.
+func (c *Client) BackfillChatActivity(ctx context.Context, jwt, clerkUserID, id, etag string, activityAt time.Time) error {
+	body, err := json.Marshal(map[string]string{
+		"id":          id,
+		"etag":        etag,
+		"activity_at": activityAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+ChatActivityPath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
