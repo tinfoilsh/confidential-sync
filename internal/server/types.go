@@ -126,7 +126,10 @@ type ListStatusUpdate struct {
 	KeyID     string  `json:"key_id"`
 	ProjectID *string `json:"project_id,omitempty"`
 	UpdatedAt string  `json:"updated_at"`
-	Cursor    string  `json:"cursor,omitempty"`
+	// ActivityAt is a chat's list-ordering time: its last conversation
+	// activity, or UpdatedAt when none was recorded.
+	ActivityAt string `json:"activity_at,omitempty"`
+	Cursor     string `json:"cursor,omitempty"`
 }
 
 type ListStatusDelete struct {

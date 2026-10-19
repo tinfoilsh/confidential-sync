@@ -38,6 +38,18 @@ type StubBlob struct {
 	ProjectID    *string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// ActivityAt mirrors chats.activity_at: nil until a write reports
+	// one or the enclave backfills it.
+	ActivityAt *time.Time
+}
+
+// listOrderTime is the chat's newest-first ordering time, falling back
+// to the write time like COALESCE(activity_at, updated_at).
+func (b *StubBlob) listOrderTime() time.Time {
+	if b.ActivityAt != nil {
+		return *b.ActivityAt
+	}
+	return b.UpdatedAt
 }
 
 // StubCP is the in-memory controlplane. Its methods are safe for
@@ -128,6 +140,7 @@ func NewStubCP() *StubCP {
 	mux.HandleFunc("DELETE /api/sync/blob/project/{id}", s.delBlob("project"))
 	mux.HandleFunc("DELETE /api/sync/blob/project_document/{pid}/{did}", s.delBlob("project_document"))
 	mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.deleteAllProjects)
+	mux.HandleFunc("POST "+controlplane.ChatActivityPath, s.backfillChatActivity)
 	mux.HandleFunc("GET /api/sync/list-status", s.listStatus)
 	mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.backupInventory)
 	mux.HandleFunc("GET "+controlplane.RevisionSummaryPath, s.revisionSummary)
@@ -331,6 +344,14 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 				nextBlob.ProjectID = &projectID
 			}
 		}
+		if scope == "chat" {
+			if activityAt, err := time.Parse(time.RFC3339Nano, r.Header.Get(controlplane.HeaderActivityAt)); err == nil {
+				if activityAt.After(updatedAt) {
+					activityAt = updatedAt
+				}
+				nextBlob.ActivityAt = &activityAt
+			}
+		}
 		s.blobs[key] = nextBlob
 		if scope == "chat" {
 			s.sourceRev++
@@ -372,8 +393,42 @@ func (s *StubCP) getBlob(scope string) http.HandlerFunc {
 				w.Header().Set(controlplane.HeaderProjectID, *blob.ProjectID)
 			}
 		}
+		if scope == "chat" && blob.ActivityAt != nil {
+			w.Header().Set(controlplane.HeaderActivityAt, blob.ActivityAt.Format(time.RFC3339Nano))
+		}
 		_, _ = w.Write(blob.Body)
 	}
+}
+
+// backfillChatActivity mirrors the controlplane's chat-activity route:
+// it fills an unset activity time only for the revision the enclave
+// read, clamped to that revision's write time.
+func (s *StubCP) backfillChatActivity(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID         string `json:"id"`
+		ETag       string `json:"etag"`
+		ActivityAt string `json:"activity_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	activityAt, err := time.Parse(time.RFC3339Nano, req.ActivityAt)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	updated := false
+	if blob := s.blobs[blobKey("chat", req.ID)]; blob != nil && blob.ActivityAt == nil && formatETag(blob.ETag) == req.ETag {
+		if activityAt.After(blob.UpdatedAt) {
+			activityAt = blob.UpdatedAt
+		}
+		blob.ActivityAt = &activityAt
+		updated = true
+	}
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": updated})
 }
 
 func (s *StubCP) delBlob(scope string) http.HandlerFunc {
@@ -548,17 +603,24 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 		if projectID != "" && (blob.ProjectID == nil || *blob.ProjectID != projectID) {
 			continue
 		}
-		rows = append(rows, listStatusRow{
-			ts: blob.UpdatedAt,
-			id: parts[1],
-			update: &controlplane.BlobMeta{
-				ID:        parts[1],
-				ETag:      formatETag(blob.ETag),
-				KeyID:     blob.KeyID,
-				ProjectID: blob.ProjectID,
-				UpdatedAt: blob.UpdatedAt,
-			},
-		})
+		update := &controlplane.BlobMeta{
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt,
+		}
+		ts := blob.UpdatedAt
+		if scope == "chat" {
+			// The newest-first chat list orders by activity; the
+			// ascending change walk keeps write-time order.
+			orderTime := blob.listOrderTime()
+			update.ActivityAt = &orderTime
+			if direction == "desc" {
+				ts = orderTime
+			}
+		}
+		rows = append(rows, listStatusRow{ts: ts, id: parts[1], update: update})
 	}
 	// Tombstones carry the deleted row's project_id (production's
 	// tombstone-on-delete trigger copies it), so a project-scoped
@@ -757,11 +819,12 @@ func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		items = append(items, controlplane.RevisionSnapshotItem{
-			ID:        parts[1],
-			ETag:      formatETag(blob.ETag),
-			KeyID:     blob.KeyID,
-			ProjectID: blob.ProjectID,
-			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+			ID:         parts[1],
+			ETag:       formatETag(blob.ETag),
+			KeyID:      blob.KeyID,
+			ProjectID:  blob.ProjectID,
+			UpdatedAt:  blob.UpdatedAt.Format(time.RFC3339Nano),
+			ActivityAt: blob.listOrderTime().Format(time.RFC3339Nano),
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
@@ -971,6 +1034,7 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 		ProjectID:    blob.ProjectID,
 		CreatedAt:    blob.CreatedAt,
 		UpdatedAt:    blob.UpdatedAt,
+		ActivityAt:   blob.ActivityAt,
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "etag": formatETag(next), "key_id": req.KeyID})
 }

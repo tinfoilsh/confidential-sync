@@ -137,11 +137,19 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// purging. The ids come from the plaintext, but the controlplane
 	// only ever uses them to decide what to KEEP under this chat and
 	// user; a crafted id cannot make it delete anyone else's blob.
+	//
+	// The activity time orders the chat list. It is derived here from
+	// the plaintext, which the operation hash already covers, so every
+	// writer (clients, imports, forks) reports it the same way.
 	var attachmentRefs []string
+	var activityAt *time.Time
 	if scope == envelope.ScopeChat {
 		attachmentRefs = chatAttachmentRefs(plaintext)
 		if len(attachmentRefs) > maxAttachmentRefsPerChat {
 			return nil, badRequest(fmt.Sprintf("chat references more than %d attachments", maxAttachmentRefsPerChat))
+		}
+		if at, ok := chatActivityAt(plaintext); ok {
+			activityAt = &at
 		}
 	}
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
@@ -159,6 +167,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		ProjectIDSet:        projectIDSet,
 		ProjectID:           projectID,
 		AttachmentRefs:      attachmentRefs,
+		ActivityAt:          activityAt,
 	})
 	if err == nil {
 		committedAt := time.Now()
@@ -440,6 +449,7 @@ func pullOne(
 			return PullItem{ID: id, OK: false, Code: CodeBadRequest, Reason: err.Error()}
 		}
 		defer cryptopkg.Zero(dec.Plaintext)
+		backfillChatActivity(ctx, deps, sess, scope, id, blob, blob.ETag, dec.Plaintext)
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -457,6 +467,7 @@ func pullOne(
 		defer cryptopkg.Zero(dec.Plaintext)
 		if canRewrap {
 			if newETag, rewrapErr := rewrapBlob(ctx, deps, sess, scope, id, dec.Plaintext, blob.ETag, targetKey, targetKIDHex); rewrapErr == nil {
+				backfillChatActivity(ctx, deps, sess, scope, id, blob, newETag, dec.Plaintext)
 				return PullItem{
 					ID: id, OK: true,
 					Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -474,6 +485,7 @@ func pullOne(
 		// plaintext so the caller can still render the row. The
 		// /v1/blobs/migrate endpoint stays available for a backstop
 		// pass that retries failed rewraps.
+		backfillChatActivity(ctx, deps, sess, scope, id, blob, blob.ETag, dec.Plaintext)
 		return PullItem{
 			ID: id, OK: true,
 			Plaintext:    base64.StdEncoding.EncodeToString(dec.Plaintext),
@@ -517,6 +529,9 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 		if u.ProjectID != nil {
 			pid := *u.ProjectID
 			update.ProjectID = &pid
+		}
+		if u.ActivityAt != nil {
+			update.ActivityAt = u.ActivityAt.UTC().Format(time.RFC3339Nano)
 		}
 		out.Updates = append(out.Updates, update)
 	}

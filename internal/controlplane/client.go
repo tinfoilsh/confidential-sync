@@ -75,6 +75,7 @@ const (
 	HeaderProjectID           = "X-Project-Id"
 	HeaderProjectIDSet        = "X-Project-Id-Set"
 	HeaderAttachmentRefs      = "X-Attachment-Refs"
+	HeaderActivityAt          = "X-Activity-At"
 	HeaderETag                = "ETag"
 	HeaderRequestID           = "X-Request-ID"
 	HeaderSearchIndexFenced   = "X-Search-Index-Fenced"
@@ -168,7 +169,10 @@ type BlobMeta struct {
 	KeyID     string    `json:"key_id"`
 	ProjectID *string   `json:"project_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
-	Cursor    string    `json:"cursor,omitempty"`
+	// ActivityAt is a chat row's list-ordering time: its last
+	// conversation activity, or UpdatedAt when none was recorded.
+	ActivityAt *time.Time `json:"activity_at,omitempty"`
+	Cursor     string     `json:"cursor,omitempty"`
 }
 
 type BlobDelete struct {
@@ -217,6 +221,9 @@ type RevisionSnapshotItem struct {
 	KeyID     string  `json:"key_id"`
 	ProjectID *string `json:"project_id"`
 	UpdatedAt string  `json:"updated_at"`
+	// ActivityAt is the chat's list-ordering time: its last
+	// conversation activity, or UpdatedAt when none was recorded.
+	ActivityAt string `json:"activity_at,omitempty"`
 }
 
 type RevisionSnapshotResponse struct {
@@ -254,6 +261,10 @@ type PutBlobRequest struct {
 	// index rows are live and purge the rest. Nil means "do not send
 	// the header", which is only correct for non-chat scopes.
 	AttachmentRefs []string
+	// ActivityAt is the chat's last conversation activity derived from
+	// the plaintext, sent as X-Activity-At. Nil omits the header, which
+	// makes the controlplane order the row by its write time.
+	ActivityAt *time.Time
 }
 
 type PutBlobResponse struct {
@@ -303,6 +314,9 @@ type GetBlobResponse struct {
 	KeyID        string
 	ProjectIDSet bool
 	ProjectID    *string
+	// ActivityAt is the chat row's recorded activity time. Nil means the
+	// row predates activity tracking and sorts by its write time.
+	ActivityAt *time.Time
 }
 
 func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
@@ -438,6 +452,9 @@ func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobR
 	}
 	if req.AttachmentRefs != nil {
 		httpReq.Header.Set(HeaderAttachmentRefs, strings.Join(req.AttachmentRefs, ","))
+	}
+	if req.ActivityAt != nil {
+		httpReq.Header.Set(HeaderActivityAt, req.ActivityAt.UTC().Format(time.RFC3339Nano))
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {
@@ -588,6 +605,11 @@ func (c *Client) GetBlob(ctx context.Context, scope, id, jwt, clerkUserID string
 		out.ProjectIDSet = true
 		if projectID := resp.Header.Get(HeaderProjectID); projectID != "" {
 			out.ProjectID = &projectID
+		}
+	}
+	if scope == "chat" {
+		if activityAt, err := time.Parse(time.RFC3339Nano, resp.Header.Get(HeaderActivityAt)); err == nil {
+			out.ActivityAt = &activityAt
 		}
 	}
 	return out, nil
@@ -982,6 +1004,41 @@ func (c *Client) RecordMigrationFailure(ctx context.Context, scope, id, jwt, cle
 	endpoint := c.baseURL + "/api/sync/migration-failure"
 	body, _ := json.Marshal(map[string]string{"scope": scope, "id": id})
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	c.addAuth(httpReq, jwt, clerkUserID)
+	httpReq.Header.Set(HeaderContentType, "application/json")
+	resp, err := c.doRequest(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return parseError(resp.StatusCode, respBody)
+	}
+	return nil
+}
+
+// ChatActivityPath is the controlplane endpoint that fills in the
+// activity time of a chat row written before it was tracked.
+const ChatActivityPath = "/api/sync/chat-activity"
+
+// BackfillChatActivity records the activity time derived from a chat
+// whose row has none. The controlplane applies it only while the row is
+// still at etag and has no activity time, so losing that race is not an
+// error.
+func (c *Client) BackfillChatActivity(ctx context.Context, jwt, clerkUserID, id, etag string, activityAt time.Time) error {
+	body, err := json.Marshal(map[string]string{
+		"id":          id,
+		"etag":        etag,
+		"activity_at": activityAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+ChatActivityPath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

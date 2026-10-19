@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +98,14 @@ type cpStub struct {
 	purgeClaims    map[string]string // attachmentID → claim token
 	purgeRequests  int
 	bucketsDeletes map[string]int
+	// activityBackfills records every chat-activity backfill request.
+	activityBackfills []cpActivityBackfill
+}
+
+type cpActivityBackfill struct {
+	ID         string `json:"id"`
+	ETag       string `json:"etag"`
+	ActivityAt string `json:"activity_at"`
 }
 
 type cpNeedsMigration struct {
@@ -110,6 +119,7 @@ type cpBlob struct {
 	ProjectIDSet bool
 	ProjectID    *string
 	UpdatedAt    time.Time
+	ActivityAt   *time.Time
 }
 
 func newCPStub(t *testing.T) *cpStub {
@@ -164,6 +174,7 @@ func (s *cpStub) installHandlers() {
 	s.mux.HandleFunc("DELETE "+controlplane.DeleteAllProjectsPath, s.handleDeleteAllProjects)
 	// rewrap (separate JSON endpoint; not the PUT blob path)
 	s.mux.HandleFunc("POST /api/sync/rewrap", s.handleRewrap)
+	s.mux.HandleFunc("POST "+controlplane.ChatActivityPath, s.handleBackfillChatActivity)
 	// list-status + migration surface
 	s.mux.HandleFunc("GET /api/sync/list-status", s.handleListStatus)
 	s.mux.HandleFunc("GET "+controlplane.BackupInventoryPath, s.handleBackupInventory)
@@ -275,6 +286,9 @@ func (s *cpStub) handlePutBlob(scope string) http.HandlerFunc {
 				stored.ProjectID = &projectID
 			}
 		}
+		if activityAt, err := time.Parse(time.RFC3339Nano, r.Header.Get(controlplane.HeaderActivityAt)); err == nil {
+			stored.ActivityAt = &activityAt
+		}
 		s.blobs[key] = stored
 		if scope == "chat" {
 			s.sourceRevision++
@@ -323,8 +337,27 @@ func (s *cpStub) handleGetBlob(scope string) http.HandlerFunc {
 				w.Header().Set("X-Project-Id", *blob.ProjectID)
 			}
 		}
+		if scope == "chat" && blob.ActivityAt != nil {
+			w.Header().Set(controlplane.HeaderActivityAt, blob.ActivityAt.Format(time.RFC3339Nano))
+		}
 		w.Write(blob.Body)
 	}
+}
+
+func (s *cpStub) handleBackfillChatActivity(w http.ResponseWriter, r *http.Request) {
+	var req cpActivityBackfill
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.activityBackfills = append(s.activityBackfills, req)
+	updated := false
+	activityAt, err := time.Parse(time.RFC3339Nano, req.ActivityAt)
+	if blob := s.blobs[s.putBlobKey("chat", req.ID)]; err == nil && blob != nil && blob.ActivityAt == nil && formatETag(blob.ETag) == req.ETag {
+		blob.ActivityAt = &activityAt
+		updated = true
+	}
+	_ = json.NewEncoder(w).Encode(map[string]bool{"updated": updated})
 }
 
 func (s *cpStub) handleDeleteBlob(scope string) http.HandlerFunc {
@@ -413,11 +446,12 @@ func (s *cpStub) handleListStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		updates = append(updates, controlplane.BlobMeta{
-			ID:        parts[1],
-			ETag:      formatETag(blob.ETag),
-			KeyID:     blob.KeyID,
-			ProjectID: blob.ProjectID,
-			UpdatedAt: blob.UpdatedAt,
+			ID:         parts[1],
+			ETag:       formatETag(blob.ETag),
+			KeyID:      blob.KeyID,
+			ProjectID:  blob.ProjectID,
+			UpdatedAt:  blob.UpdatedAt,
+			ActivityAt: blob.ActivityAt,
 		})
 	}
 	json.NewEncoder(w).Encode(controlplane.ListStatusResponse{Updates: updates})
@@ -487,13 +521,17 @@ func (s *cpStub) handleRevisionSnapshot(w http.ResponseWriter, r *http.Request) 
 		if parts[0] != "chat" {
 			continue
 		}
-		items = append(items, controlplane.RevisionSnapshotItem{
+		item := controlplane.RevisionSnapshotItem{
 			ID:        parts[1],
 			ETag:      formatETag(blob.ETag),
 			KeyID:     blob.KeyID,
 			ProjectID: blob.ProjectID,
 			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
-		})
+		}
+		if blob.ActivityAt != nil {
+			item.ActivityAt = blob.ActivityAt.Format(time.RFC3339Nano)
+		}
+		items = append(items, item)
 	}
 	_ = json.NewEncoder(w).Encode(controlplane.RevisionSnapshotResponse{
 		Items:            items,
@@ -1099,6 +1137,82 @@ func TestPushAndPullRoundtrip(t *testing.T) {
 	}
 }
 
+func TestPushReportsChatActivityFromPlaintext(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	push := func(scope, id, plaintext string) {
+		t.Helper()
+		resp, body := f.post("/v1/sync/push", PushRequest{
+			Scope:          scope,
+			ID:             id,
+			Key:            f.userKeyB64,
+			Plaintext:      base64.StdEncoding.EncodeToString([]byte(plaintext)),
+			IdempotencyKey: "activity-" + id,
+		}, tok)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("push %s: %d %s", id, resp.StatusCode, body)
+		}
+	}
+	timestamped := `{"createdAt":"2025-01-01T00:00:00.000Z","messages":[{"role":"user","content":"hi","timestamp":"2025-02-03T04:05:06.789Z"}]}`
+	push("chat", "chat-activity", timestamped)
+	push("chat", "chat-untimed", `{"title":"no timestamps","messages":[]}`)
+	push("project", "project-activity", timestamped)
+
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	want := time.Date(2025, 2, 3, 4, 5, 6, 789_000_000, time.UTC)
+	if got := f.cp.blobs["chat/chat-activity"].ActivityAt; got == nil || !got.Equal(want) {
+		t.Fatalf("chat activity=%v, want %s", got, want)
+	}
+	if got := f.cp.blobs["chat/chat-untimed"].ActivityAt; got != nil {
+		t.Fatalf("chat without timestamps reported activity %s", got)
+	}
+	if got := f.cp.blobs["project/project-activity"].ActivityAt; got != nil {
+		t.Fatalf("project reported activity %s", got)
+	}
+}
+
+func TestPullBackfillsActivityOnlyForChatsWithoutIt(t *testing.T) {
+	f := newFixture(t)
+	tok := f.jwt()
+	resp, body := f.post("/v1/sync/push", PushRequest{
+		Scope:          "chat",
+		ID:             "legacy-chat",
+		Key:            f.userKeyB64,
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"createdAt":"2025-01-01T00:00:00Z","messages":[{"timestamp":"2025-06-07T08:09:10Z"}]}`)),
+		IdempotencyKey: "legacy-push",
+	}, tok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("push: %d %s", resp.StatusCode, body)
+	}
+	f.cp.mu.Lock()
+	f.cp.blobs["chat/legacy-chat"].ActivityAt = nil
+	etag := formatETag(f.cp.blobs["chat/legacy-chat"].ETag)
+	f.cp.mu.Unlock()
+
+	pull := func() {
+		t.Helper()
+		resp, body := f.post("/v1/sync/pull", PullRequest{
+			Scope: "chat",
+			IDs:   []string{"legacy-chat"},
+			Keys:  []PullKey{{Key: f.userKeyB64}},
+		}, tok)
+		var out PullResponse
+		if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &out) != nil || len(out.Items) != 1 || !out.Items[0].OK {
+			t.Fatalf("pull: %d %s", resp.StatusCode, body)
+		}
+	}
+	pull()
+	pull()
+
+	f.cp.mu.Lock()
+	defer f.cp.mu.Unlock()
+	want := []cpActivityBackfill{{ID: "legacy-chat", ETag: etag, ActivityAt: "2025-06-07T08:09:10Z"}}
+	if !reflect.DeepEqual(f.cp.activityBackfills, want) {
+		t.Fatalf("backfills=%+v, want %+v", f.cp.activityBackfills, want)
+	}
+}
+
 func TestPushPropagatesRequestIDAndReturnsOutcomeUnknown(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1487,7 +1601,7 @@ func TestRevisionSyncRoutesProxyReplayMetadata(t *testing.T) {
 		Scope:          "chat",
 		ID:             "revision-chat",
 		Key:            f.userKeyB64,
-		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"revision-chat"}`)),
+		Plaintext:      base64.StdEncoding.EncodeToString([]byte(`{"id":"revision-chat","createdAt":"2025-05-06T07:08:09Z"}`)),
 		IdempotencyKey: "revision-push",
 	}, tok)
 	if pushResponse.StatusCode != http.StatusOK {
@@ -1531,7 +1645,7 @@ func TestRevisionSyncRoutesProxyReplayMetadata(t *testing.T) {
 	if err := json.Unmarshal(snapshotBody, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.SnapshotRevision != "1" || len(snapshot.Items) != 1 || snapshot.Items[0].ID != "revision-chat" {
+	if snapshot.SnapshotRevision != "1" || len(snapshot.Items) != 1 || snapshot.Items[0].ID != "revision-chat" || snapshot.Items[0].ActivityAt != "2025-05-06T07:08:09Z" {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 	if revisionRequests != 3 {
@@ -1577,12 +1691,14 @@ func TestListStatusRemainsAvailableWithProtocolV2(t *testing.T) {
 	f := newFixture(t)
 	projectID := "project-1"
 	updatedAt := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+	activityAt := time.Date(2026, time.July, 1, 9, 30, 0, 0, time.UTC)
 	f.cp.mu.Lock()
 	f.cp.blobs["chat/listed-chat"] = &cpBlob{
-		ETag:      7,
-		KeyID:     f.userKeyID,
-		ProjectID: &projectID,
-		UpdatedAt: updatedAt,
+		ETag:       7,
+		KeyID:      f.userKeyID,
+		ProjectID:  &projectID,
+		UpdatedAt:  updatedAt,
+		ActivityAt: &activityAt,
 	}
 	f.cp.mu.Unlock()
 
@@ -1618,7 +1734,7 @@ func TestListStatusRemainsAvailableWithProtocolV2(t *testing.T) {
 	if err := json.Unmarshal(body, &list); err != nil {
 		t.Fatal(err)
 	}
-	if !proxied || len(list.Updates) != 1 || list.Updates[0].ID != "listed-chat" || list.Updates[0].ProjectID == nil || *list.Updates[0].ProjectID != projectID || list.Updates[0].UpdatedAt != updatedAt.Format(time.RFC3339Nano) {
+	if !proxied || len(list.Updates) != 1 || list.Updates[0].ID != "listed-chat" || list.Updates[0].ProjectID == nil || *list.Updates[0].ProjectID != projectID || list.Updates[0].UpdatedAt != updatedAt.Format(time.RFC3339Nano) || list.Updates[0].ActivityAt != "2026-07-01T09:30:00Z" {
 		t.Fatalf("proxied=%v response=%+v", proxied, list)
 	}
 }
