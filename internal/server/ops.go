@@ -137,11 +137,19 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 	// purging. The ids come from the plaintext, but the controlplane
 	// only ever uses them to decide what to KEEP under this chat and
 	// user; a crafted id cannot make it delete anyone else's blob.
+	//
+	// The activity time orders the chat list. It is derived here from
+	// the plaintext, which the operation hash already covers, so every
+	// writer (clients, imports, forks) reports it the same way.
 	var attachmentRefs []string
+	var activityAt *time.Time
 	if scope == envelope.ScopeChat {
 		attachmentRefs = chatAttachmentRefs(plaintext)
 		if len(attachmentRefs) > maxAttachmentRefsPerChat {
 			return nil, badRequest(fmt.Sprintf("chat references more than %d attachments", maxAttachmentRefsPerChat))
+		}
+		if at, ok := chatActivityAt(plaintext); ok {
+			activityAt = &at
 		}
 	}
 	resp, err := deps.Controlplane.PutBlob(ctx, controlplane.PutBlobRequest{
@@ -159,6 +167,7 @@ func Push(ctx context.Context, deps Deps, sess Session, req PushRequest) (*PushR
 		ProjectIDSet:        projectIDSet,
 		ProjectID:           projectID,
 		AttachmentRefs:      attachmentRefs,
+		ActivityAt:          activityAt,
 	})
 	if err == nil {
 		committedAt := time.Now()
@@ -517,6 +526,9 @@ func ListStatus(ctx context.Context, deps Deps, sess Session, req ListStatusRequ
 		if u.ProjectID != nil {
 			pid := *u.ProjectID
 			update.ProjectID = &pid
+		}
+		if u.ActivityAt != nil {
+			update.ActivityAt = u.ActivityAt.UTC().Format(time.RFC3339Nano)
 		}
 		out.Updates = append(out.Updates, update)
 	}

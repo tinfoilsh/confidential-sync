@@ -38,6 +38,17 @@ type StubBlob struct {
 	ProjectID    *string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// ActivityAt mirrors chats.activity_at: nil until a write reports one.
+	ActivityAt *time.Time
+}
+
+// listOrderTime is the chat's newest-first ordering time, falling back
+// to the write time like COALESCE(activity_at, updated_at).
+func (b *StubBlob) listOrderTime() time.Time {
+	if b.ActivityAt != nil {
+		return *b.ActivityAt
+	}
+	return b.UpdatedAt
 }
 
 // StubCP is the in-memory controlplane. Its methods are safe for
@@ -331,6 +342,14 @@ func (s *StubCP) putBlob(scope string) http.HandlerFunc {
 				nextBlob.ProjectID = &projectID
 			}
 		}
+		if scope == "chat" {
+			if activityAt, err := time.Parse(time.RFC3339Nano, r.Header.Get(controlplane.HeaderActivityAt)); err == nil {
+				if activityAt.After(updatedAt) {
+					activityAt = updatedAt
+				}
+				nextBlob.ActivityAt = &activityAt
+			}
+		}
 		s.blobs[key] = nextBlob
 		if scope == "chat" {
 			s.sourceRev++
@@ -548,17 +567,24 @@ func (s *StubCP) listStatus(w http.ResponseWriter, r *http.Request) {
 		if projectID != "" && (blob.ProjectID == nil || *blob.ProjectID != projectID) {
 			continue
 		}
-		rows = append(rows, listStatusRow{
-			ts: blob.UpdatedAt,
-			id: parts[1],
-			update: &controlplane.BlobMeta{
-				ID:        parts[1],
-				ETag:      formatETag(blob.ETag),
-				KeyID:     blob.KeyID,
-				ProjectID: blob.ProjectID,
-				UpdatedAt: blob.UpdatedAt,
-			},
-		})
+		update := &controlplane.BlobMeta{
+			ID:        parts[1],
+			ETag:      formatETag(blob.ETag),
+			KeyID:     blob.KeyID,
+			ProjectID: blob.ProjectID,
+			UpdatedAt: blob.UpdatedAt,
+		}
+		ts := blob.UpdatedAt
+		if scope == "chat" {
+			// The newest-first chat list orders by activity; the
+			// ascending change walk keeps write-time order.
+			orderTime := blob.listOrderTime()
+			update.ActivityAt = &orderTime
+			if direction == "desc" {
+				ts = orderTime
+			}
+		}
+		rows = append(rows, listStatusRow{ts: ts, id: parts[1], update: update})
 	}
 	// Tombstones carry the deleted row's project_id (production's
 	// tombstone-on-delete trigger copies it), so a project-scoped
@@ -757,11 +783,12 @@ func (s *StubCP) revisionSnapshot(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		items = append(items, controlplane.RevisionSnapshotItem{
-			ID:        parts[1],
-			ETag:      formatETag(blob.ETag),
-			KeyID:     blob.KeyID,
-			ProjectID: blob.ProjectID,
-			UpdatedAt: blob.UpdatedAt.Format(time.RFC3339Nano),
+			ID:         parts[1],
+			ETag:       formatETag(blob.ETag),
+			KeyID:      blob.KeyID,
+			ProjectID:  blob.ProjectID,
+			UpdatedAt:  blob.UpdatedAt.Format(time.RFC3339Nano),
+			ActivityAt: blob.listOrderTime().Format(time.RFC3339Nano),
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
@@ -971,6 +998,7 @@ func (s *StubCP) rewrap(w http.ResponseWriter, r *http.Request) {
 		ProjectID:    blob.ProjectID,
 		CreatedAt:    blob.CreatedAt,
 		UpdatedAt:    blob.UpdatedAt,
+		ActivityAt:   blob.ActivityAt,
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "etag": formatETag(next), "key_id": req.KeyID})
 }

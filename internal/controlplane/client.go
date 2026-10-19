@@ -75,6 +75,7 @@ const (
 	HeaderProjectID           = "X-Project-Id"
 	HeaderProjectIDSet        = "X-Project-Id-Set"
 	HeaderAttachmentRefs      = "X-Attachment-Refs"
+	HeaderActivityAt          = "X-Activity-At"
 	HeaderETag                = "ETag"
 	HeaderRequestID           = "X-Request-ID"
 	HeaderSearchIndexFenced   = "X-Search-Index-Fenced"
@@ -168,7 +169,10 @@ type BlobMeta struct {
 	KeyID     string    `json:"key_id"`
 	ProjectID *string   `json:"project_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
-	Cursor    string    `json:"cursor,omitempty"`
+	// ActivityAt is a chat row's list-ordering time: its last
+	// conversation activity, or UpdatedAt when none was recorded.
+	ActivityAt *time.Time `json:"activity_at,omitempty"`
+	Cursor     string     `json:"cursor,omitempty"`
 }
 
 type BlobDelete struct {
@@ -217,6 +221,9 @@ type RevisionSnapshotItem struct {
 	KeyID     string  `json:"key_id"`
 	ProjectID *string `json:"project_id"`
 	UpdatedAt string  `json:"updated_at"`
+	// ActivityAt is the chat's list-ordering time: its last
+	// conversation activity, or UpdatedAt when none was recorded.
+	ActivityAt string `json:"activity_at,omitempty"`
 }
 
 type RevisionSnapshotResponse struct {
@@ -254,6 +261,10 @@ type PutBlobRequest struct {
 	// index rows are live and purge the rest. Nil means "do not send
 	// the header", which is only correct for non-chat scopes.
 	AttachmentRefs []string
+	// ActivityAt is the chat's last conversation activity derived from
+	// the plaintext, sent as X-Activity-At. Nil omits the header, which
+	// makes the controlplane order the row by its write time.
+	ActivityAt *time.Time
 }
 
 type PutBlobResponse struct {
@@ -438,6 +449,9 @@ func (c *Client) putBlobOnce(ctx context.Context, req PutBlobRequest) (*PutBlobR
 	}
 	if req.AttachmentRefs != nil {
 		httpReq.Header.Set(HeaderAttachmentRefs, strings.Join(req.AttachmentRefs, ","))
+	}
+	if req.ActivityAt != nil {
+		httpReq.Header.Set(HeaderActivityAt, req.ActivityAt.UTC().Format(time.RFC3339Nano))
 	}
 	resp, err := c.doRequest(httpReq)
 	if err != nil {

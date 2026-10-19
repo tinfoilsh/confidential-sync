@@ -33,6 +33,7 @@ func TestWireContractMirrorsControlplane(t *testing.T) {
 			"HeaderProjectID":           {HeaderProjectID, "X-Project-Id"},
 			"HeaderProjectIDSet":        {HeaderProjectIDSet, "X-Project-Id-Set"},
 			"HeaderAttachmentRefs":      {HeaderAttachmentRefs, "X-Attachment-Refs"},
+			"HeaderActivityAt":          {HeaderActivityAt, "X-Activity-At"},
 			"HeaderETag":                {HeaderETag, "ETag"},
 			"HeaderRequestID":           {HeaderRequestID, "X-Request-ID"},
 			"HeaderSearchIndexFenced":   {HeaderSearchIndexFenced, "X-Search-Index-Fenced"},
