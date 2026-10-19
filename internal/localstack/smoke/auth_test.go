@@ -48,16 +48,14 @@ func TestT10_AuthExpiredJWTRejected(t *testing.T) {
 // because HMAC-SHA256(public_key, payload) is computable by anyone
 // who can read the JWKS.
 //
-// The well-known mitigation is to PIN the allowed signing methods
-// on the verifier side (the enclave's auth/jwt.go uses
-// jwt.WithValidMethods([]{RS256, RS384, RS512, ES256, ES384, ES512})).
-// This test confirms the pin is still in place.
+// This test proves the running server rejects that forged token end
+// to end. It does not pin the signing-method allowlist in auth/jwt.go
+// (jwt.WithValidMethods): with HS256 allowed, the forgery still fails
+// because the key lookup can only yield the RSA public key, which
+// golang-jwt refuses to use as an HMAC secret.
 //
-// Reference: CVE-2015-2992-class JWT vulnerability; see also
+// Reference:
 // https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/
-//
-// Regression caught: someone widens the WithValidMethods list to
-// include HSXXX, opening the alg-confusion door.
 func TestT11_AuthAlgConfusionRejected(t *testing.T) {
 	t.Helper()
 	f := newFixture(t)
