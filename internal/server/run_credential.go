@@ -148,6 +148,10 @@ func (h *Handler) authorizeRun(w http.ResponseWriter, r *http.Request, sess Sess
 			in.ProjectID = chat.ProjectID
 		}
 	}
+	if in.ProjectID != "" && !runIDValid(in.ProjectID) {
+		writeError(w, badRequest("invalid project id"))
+		return
+	}
 	h.writeStorageCredential(w, runCredential{RegisteredClaims: jwt.RegisteredClaims{Subject: sess.Claims.Subject}, ChatID: in.ThreadID, ProjectID: in.ProjectID, KeyID: kid})
 }
 
@@ -273,5 +277,7 @@ func (grant *runCredential) permitsPush(req PushRequest) bool {
 	if grant.Operation == "project-upload" {
 		return req.Scope == "project_document" && grant.ownsDocument(req.ID) && req.IfMatch == nil && req.Metadata["projectId"] == grant.ProjectID
 	}
+	// The grant owns the chat, including its metadata. ProjectID limits
+	// context reads; the user can move the chat while a reply is running.
 	return grant.Operation == "" && req.Scope == "chat" && req.ID == grant.ChatID
 }

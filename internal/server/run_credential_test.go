@@ -199,6 +199,12 @@ func TestArchiveCredentialsSeparateReadsFromImportWrites(t *testing.T) {
 	if snapshot := job.Snapshot(); snapshot.Imported != 1 || snapshot.Failed != 0 {
 		t.Fatalf("import result: %+v", snapshot)
 	}
+	chatID := mappedRestoreID(f.userSub, "delegated", "chat", "source", 0)
+	chat := decryptNativeTestBlob(t, f, "chat", chatID)
+	messages, _ := chat["messages"].([]any)
+	if chat["title"] != "Imported with scoped access" || len(messages) != 1 || messages[0].(map[string]any)["content"] != "Archive content" {
+		t.Fatalf("stored import: %v", chat)
+	}
 }
 
 func TestProjectUploadCredentialCanOnlyAddDocumentsToItsProject(t *testing.T) {
