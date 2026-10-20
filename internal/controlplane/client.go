@@ -1124,7 +1124,7 @@ type RegisterKeyBundle struct {
 
 // RegisterKeyBody returns the JSON body bytes that will be sent for the
 // given RegisterKey request. Exported so callers can hash the exact
-// bytes that go on the wire as part of the §7.0 canonical tuple.
+// bytes that go on the wire as part of the operation-hash canonical tuple.
 func RegisterKeyBody(req RegisterKeyRequest) ([]byte, error) {
 	payload := map[string]any{
 		"key_id":      req.KeyIDHex,

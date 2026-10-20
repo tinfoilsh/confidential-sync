@@ -82,7 +82,7 @@ type StubCP struct {
 	// that bumps the etag). The DELETE that triggered the hook
 	// then proceeds — if the hook bumped the etag, the caller's
 	// if_match is stale and STALE_BLOB is returned. Used by T08
-	// to drive the §16.6 retry loop test.
+	// to drive the delete retry loop test.
 	onFirstDelete map[string]func()
 }
 
@@ -270,7 +270,7 @@ func (s *StubCP) SetLegacyAttachment(id string, body []byte) {
 // make its own stub-mutating calls (e.g. a PUT that bumps the etag).
 // After the callback returns, the DELETE proceeds against the
 // (possibly mutated) state. This is precisely the race window
-// §16.6's retry loop is designed to absorb.
+// the delete retry loop is designed to absorb.
 func (s *StubCP) OnFirstDelete(scope, id string, fn func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

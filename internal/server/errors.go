@@ -11,9 +11,8 @@ import (
 )
 
 // Application error codes returned in JSON envelopes. These match the
-// reference table in syncplan.md Appendix B and the controlplane's own
-// codes so the client sees a consistent vocabulary regardless of which
-// service rejected the request.
+// controlplane's own codes so the client sees a consistent vocabulary
+// regardless of which service rejected the request.
 const (
 	CodeStaleKey                   = controlplane.StatusStaleKey
 	CodeStaleBlob                  = controlplane.StatusStaleBlob

@@ -11,7 +11,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// Operation-hash construction. See syncplan.md §7.0.
+// Operation-hash construction.
 //
 // X-Operation-Hash is a keyed MAC, not a plaintext digest. The
 // controlplane stores the value in sync_idempotency_keys to detect
@@ -55,7 +55,7 @@ func DeriveOpHashKey(cek []byte) ([]byte, error) {
 }
 
 // CanonicalInput describes the fields that go into the canonical tuple
-// the MAC is computed over. Field semantics match syncplan.md §7.0:
+// the MAC is computed over:
 //
 //	Method:         "PUT" | "POST" | "DELETE" (uppercase ASCII)
 //	Path:           request path incl. query, exactly as sent on the wire
@@ -95,7 +95,7 @@ type CanonicalInput struct {
 // AppendCanonical writes the canonical encoding of the tuple to dst and
 // returns the extended slice. Each field is preceded by its length as a
 // big-endian uint32. This is the exact byte string the MAC is computed
-// over and the same encoding the web client uses.
+// over.
 //
 // AAD and Envelope are only appended when at least one is present or
 // ProfileSyncProtocol is set.
