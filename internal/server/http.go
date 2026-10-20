@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
@@ -71,6 +73,7 @@ type routeSpec struct {
 
 func (h *Handler) routeSpecs() []routeSpec {
 	return []routeSpec{
+		{"POST", "/v1/runs/authorize", func(h *Handler) http.Handler { return h.authMiddleware(h.authorizeRun) }},
 		{"POST", "/v1/sync/push", func(h *Handler) http.Handler {
 			return h.pushRequestIDMiddleware(h.authMiddlewareWithTimeout(h.push, SyncPushRequestTimeout))
 		}},
@@ -204,7 +207,16 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			writeError(w, unauthorized("missing bearer token"))
 			return
 		}
-		claims, err := h.verifier.Verify(r.Context(), tok)
+		var sess Session
+		if strings.HasPrefix(tok, runCredentialPrefix) {
+			sess, err = h.verifyRunCredential(tok)
+			if err == nil && !runRouteAllowed(r.URL.Path) {
+				err = runScopeRefused()
+			}
+		} else {
+			sess.RawJWT = tok
+			sess.Claims, err = h.verifier.Verify(r.Context(), tok)
+		}
 		if err != nil {
 			writeError(w, unauthorized("invalid token"))
 			return
@@ -219,7 +231,7 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 			})
 			return
 		}
-		fn(w, r, Session{RawJWT: tok, Claims: claims})
+		fn(w, r, sess)
 	}), timeout)
 }
 
@@ -325,6 +337,10 @@ func (h *Handler) push(w http.ResponseWriter, r *http.Request, sess Session) {
 		writeError(w, err)
 		return
 	}
+	if grant := sess.Run; grant != nil && (req.Scope != "chat" || req.ID != grant.ChatID || !grant.keyMatches(req.Key)) {
+		writeError(w, runScopeRefused())
+		return
+	}
 	resp, err := Push(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
@@ -337,6 +353,10 @@ func (h *Handler) pull(w http.ResponseWriter, r *http.Request, sess Session) {
 	var req PullRequest
 	if err := decode(r, &req); err != nil {
 		writeError(w, err)
+		return
+	}
+	if grant := sess.Run; grant != nil && !grant.permitsPull(req) {
+		writeError(w, runScopeRefused())
 		return
 	}
 	resp, err := Pull(r.Context(), h.deps, sess, req)
@@ -368,10 +388,19 @@ func (h *Handler) listStatus(w http.ResponseWriter, r *http.Request, sess Sessio
 		writeError(w, err)
 		return
 	}
+	if grant := sess.Run; grant != nil && (req.Scope != "project_document" || grant.ProjectID == "") {
+		writeError(w, runScopeRefused())
+		return
+	}
 	resp, err := ListStatus(r.Context(), h.deps, sess, req)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if grant := sess.Run; grant != nil {
+		prefix := grant.ProjectID + "/"
+		resp.Updates = slices.DeleteFunc(resp.Updates, func(u ListStatusUpdate) bool { return !strings.HasPrefix(u.ID, prefix) })
+		resp.Deletes = slices.DeleteFunc(resp.Deletes, func(d ListStatusDelete) bool { return !strings.HasPrefix(d.ID, prefix) })
 	}
 	encode(w, http.StatusOK, resp)
 }
@@ -580,6 +609,10 @@ func (h *Handler) attachmentPut(w http.ResponseWriter, r *http.Request, sess Ses
 	var req AttachmentPutRequest
 	if err := decode(r, &req); err != nil {
 		writeError(w, err)
+		return
+	}
+	if grant := sess.Run; grant != nil && req.ChatID != grant.ChatID {
+		writeError(w, runScopeRefused())
 		return
 	}
 	resp, err := AttachmentPut(r.Context(), h.deps, sess, req)
