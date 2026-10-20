@@ -12,6 +12,11 @@ func TestChatActivityAt(t *testing.T) {
 		want      string
 	}{
 		{
+			name:      "harness messages and existing messages share activity ordering",
+			plaintext: `{"createdAt":"2025-01-01T00:00:00Z","updatedAt":"2030-01-01T00:00:00Z","messages":[{"createdAt":"2026-03-01T00:00:00Z","timestamp":"2031-01-01T00:00:00Z"},{"timestamp":"2026-02-01T00:00:00Z"}]}`,
+			want:      "2026-03-01T00:00:00Z",
+		},
+		{
 			name:      "newest message wins over creation",
 			plaintext: `{"createdAt":"2025-01-01T00:00:00.000Z","messages":[{"timestamp":"2025-03-01T10:00:00.000Z"},{"timestamp":"2025-02-01T10:00:00.000Z"}]}`,
 			want:      "2025-03-01T10:00:00Z",

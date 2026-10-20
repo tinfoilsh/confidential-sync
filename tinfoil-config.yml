@@ -48,6 +48,8 @@ shim:
   listen-port: 443
   upstream-port: 8089
   paths:
+    - /v1/operations/authorize
+    - /v1/runs/authorize
     - /health
     - /v1/health
     - /v1/sync/push

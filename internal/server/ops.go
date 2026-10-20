@@ -49,6 +49,7 @@ type Deps struct {
 type Session struct {
 	RawJWT string
 	Claims auth.Claims
+	Run    *runCredential
 }
 
 const (
