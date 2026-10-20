@@ -249,18 +249,40 @@ func TestVerifierRequiresSubject(t *testing.T) {
 	}
 }
 
-func TestVerifierRejectsHS256(t *testing.T) {
+// The key lookup returns RSA keys as *rsa.PublicKey, which golang-jwt
+// refuses as an HMAC secret, so signing with the RSA public key bytes
+// fails whatever algorithms the verifier allows. A symmetric (oct) key
+// in the JWKS is different: the lookup returns its raw bytes, and since
+// the JWKS is public, anyone can sign with them. The allowed signing
+// methods are the only thing that rejects such a token.
+func TestVerifierRejectsHMAC(t *testing.T) {
 	ti := newTestIssuer(t)
-	v := ti.verifier(t)
-	c := validClaims(ti.issuer)
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, c)
-	tok.Header["kid"] = ti.signKID
-	s, err := tok.SignedString([]byte("hmac-key"))
+	const hmacKID = "published-hmac-key"
+	secret := []byte("symmetric key anyone can read from the JWKS")
+	jwksJSON, err := json.Marshal(map[string]any{"keys": []any{
+		buildJWK(t, ti.signKey, ti.signKID),
+		map[string]any{
+			"kty": "oct",
+			"kid": hmacKID,
+			"k":   base64.RawURLEncoding.EncodeToString(secret),
+		},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := v.Verify(context.Background(), s); err == nil {
-		t.Fatalf("expected rejection of HS256 token")
+	ti.jwksJSON = jwksJSON
+	v := ti.verifier(t)
+
+	for _, method := range []jwt.SigningMethod{jwt.SigningMethodHS256, jwt.SigningMethodHS384, jwt.SigningMethodHS512} {
+		tok := jwt.NewWithClaims(method, validClaims(ti.issuer))
+		tok.Header["kid"] = hmacKID
+		s, err := tok.SignedString(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := v.Verify(context.Background(), s); !errors.Is(err, ErrTokenInvalid) {
+			t.Fatalf("%s: expected ErrTokenInvalid, got %v", method.Alg(), err)
+		}
 	}
 }
 
