@@ -22,26 +22,30 @@ func chatActivityAt(plaintext []byte) (activityAt time.Time, ok bool) {
 	if err := json.Unmarshal(plaintext, &chat); err != nil {
 		return time.Time{}, false
 	}
-	consider := func(raw json.RawMessage) {
+	consider := func(raw json.RawMessage) bool {
 		var value string
 		if json.Unmarshal(raw, &value) != nil {
-			return
+			return false
 		}
 		parsed, err := time.Parse(time.RFC3339Nano, value)
 		if err != nil {
-			return
+			return false
 		}
 		if parsed.After(activityAt) {
 			activityAt = parsed
 		}
+		return true
 	}
 	consider(chat.CreatedAt)
 	for _, rawMessage := range chat.Messages {
 		var message struct {
 			Timestamp json.RawMessage `json:"timestamp"`
+			CreatedAt json.RawMessage `json:"createdAt"`
 		}
 		if json.Unmarshal(rawMessage, &message) == nil {
-			consider(message.Timestamp)
+			if !consider(message.CreatedAt) {
+				consider(message.Timestamp)
+			}
 		}
 	}
 	return activityAt, !activityAt.IsZero()
