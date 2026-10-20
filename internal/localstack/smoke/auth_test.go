@@ -52,7 +52,8 @@ func TestT10_AuthExpiredJWTRejected(t *testing.T) {
 // to end. It does not pin the signing-method allowlist in auth/jwt.go
 // (jwt.WithValidMethods): with HS256 allowed, the forgery still fails
 // because the key lookup can only yield the RSA public key, which
-// golang-jwt refuses to use as an HMAC secret.
+// golang-jwt refuses to use as an HMAC secret. TestVerifierRejectsHMAC
+// in internal/auth pins the allowlist.
 //
 // Reference:
 // https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/
