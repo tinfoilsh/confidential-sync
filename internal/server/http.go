@@ -16,6 +16,7 @@ import (
 
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/auth"
 	"github.com/tinfoilsh/confidential-sync-enclave/internal/controlplane"
+	"github.com/tinfoilsh/confidential-sync-enclave/internal/importer"
 )
 
 // MaxRequestBytes caps decoded JSON bodies. Plaintext blobs upload via the
@@ -73,6 +74,7 @@ type routeSpec struct {
 
 func (h *Handler) routeSpecs() []routeSpec {
 	return []routeSpec{
+		{"POST", "/v1/operations/authorize", func(h *Handler) http.Handler { return h.authMiddleware(h.authorizeOperation) }},
 		{"POST", "/v1/runs/authorize", func(h *Handler) http.Handler { return h.authMiddleware(h.authorizeRun) }},
 		{"POST", "/v1/sync/push", func(h *Handler) http.Handler {
 			return h.pushRequestIDMiddleware(h.authMiddlewareWithTimeout(h.push, SyncPushRequestTimeout))
@@ -210,7 +212,7 @@ func (h *Handler) authMiddlewareWithTimeout(fn func(http.ResponseWriter, *http.R
 		var sess Session
 		if strings.HasPrefix(tok, runCredentialPrefix) {
 			sess, err = h.verifyRunCredential(tok)
-			if err == nil && !runRouteAllowed(r.URL.Path) {
+			if err == nil && !sess.Run.routeAllowed(r.URL.Path) {
 				err = runScopeRefused()
 			}
 		} else {
@@ -337,7 +339,7 @@ func (h *Handler) push(w http.ResponseWriter, r *http.Request, sess Session) {
 		writeError(w, err)
 		return
 	}
-	if grant := sess.Run; grant != nil && (req.Scope != "chat" || req.ID != grant.ChatID || !grant.keyMatches(req.Key)) {
+	if grant := sess.Run; grant != nil && !grant.permitsPush(req) {
 		writeError(w, runScopeRefused())
 		return
 	}
@@ -388,7 +390,7 @@ func (h *Handler) listStatus(w http.ResponseWriter, r *http.Request, sess Sessio
 		writeError(w, err)
 		return
 	}
-	if grant := sess.Run; grant != nil && (req.Scope != "project_document" || grant.ProjectID == "") {
+	if grant := sess.Run; grant != nil && grant.Operation == "" && (req.Scope != "project_document" || grant.ProjectID == "") {
 		writeError(w, runScopeRefused())
 		return
 	}
@@ -397,7 +399,7 @@ func (h *Handler) listStatus(w http.ResponseWriter, r *http.Request, sess Sessio
 		writeError(w, err)
 		return
 	}
-	if grant := sess.Run; grant != nil {
+	if grant := sess.Run; grant != nil && grant.Operation == "" {
 		prefix := grant.ProjectID + "/"
 		resp.Updates = slices.DeleteFunc(resp.Updates, func(u ListStatusUpdate) bool { return !strings.HasPrefix(u.ID, prefix) })
 		resp.Deletes = slices.DeleteFunc(resp.Deletes, func(d ListStatusDelete) bool { return !strings.HasPrefix(d.ID, prefix) })
@@ -672,6 +674,10 @@ func (h *Handler) importCreate(w http.ResponseWriter, r *http.Request, sess Sess
 		writeError(w, err)
 		return
 	}
+	if sess.Run != nil && req.Source != string(importer.SourceTinfoilBackup) {
+		writeError(w, runScopeRefused())
+		return
+	}
 	job, err := h.importCoordinator.Create(sess.Claims.Subject, req)
 	if err != nil {
 		writeError(w, err)
@@ -703,6 +709,10 @@ func (h *Handler) importStart(w http.ResponseWriter, r *http.Request, sess Sessi
 	var req ImportStartRequest
 	if err := decode(r, &req); err != nil {
 		writeError(w, err)
+		return
+	}
+	if grant := sess.Run; grant != nil && !grant.keyMatches(req.Key) {
+		writeError(w, runScopeRefused())
 		return
 	}
 	job := h.importCoordinator.Get(sess.Claims.Subject)
