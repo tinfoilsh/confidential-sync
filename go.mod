@@ -1,6 +1,6 @@
 module github.com/tinfoilsh/confidential-sync-enclave
 
-go 1.26.6
+go 1.27.3
 
 require (
 	github.com/MicahParks/jwkset v0.11.0
